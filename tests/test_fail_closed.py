@@ -108,32 +108,37 @@ class SingleConditionTests(unittest.TestCase):
         self.assertIn('"exit_code":127', stdout)
         self.assert_failed(judge(stdout, self.last), 'no command with exit code 0')
 
-    def test_successful_commands_without_a_diff_are_not_evidence(self):
-        stdout = self.stdout.replace('git diff', 'git status').replace('git show', 'git status')
-        self.assertNotIn('git diff', stdout)
-        self.assert_failed(judge(stdout, self.last), 'ran `git diff` or `git show`')
+    def command_only(self, command, output, exit_code=0):
+        """Return the clean run with its commands replaced by one command with this output."""
+        event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': command,
+                                                    'aggregated_output': output, 'exit_code': exit_code,
+                                                    'status': 'completed'}}
+        return json.dumps(event) + '\n' + without(self.stdout, is_command)
 
-    def test_only_a_real_git_diff_or_show_subcommand_is_evidence(self):
-        accepted = ("/usr/bin/bash -lc 'git diff origin/main...HEAD'", 'git diff', '/usr/bin/git show HEAD:x',
-                    '/bin/zsh -lc "cd a && git -c core.pager=cat diff --stat"', 'git -C /x --no-pager show HEAD',
-                    "bash -lc 'git status; git diff'", 'git -C "/tmp/repo with spaces" diff HEAD',
-                    'git -c "core.pager=cat -n" diff HEAD', 'git --git-dir /x/.git --work-tree /x show HEAD',
-                    "/bin/zsh -lc 'git -C \"/Volumes/a b/c\" diff --stat origin/main...HEAD'",
-                    "bash -lc 'cd x || exit 1; GIT_PAGER=cat git diff'")
-        rejected = ("bash -lc 'git show-ref'", "bash -lc 'git config --get diff.algorithm'", "bash -lc 'git difftool'",
-                    "bash -lc 'git diff-tree HEAD'", "bash -lc 'git showx'", "bash -lc 'git log --format=diff'",
-                    "bash -lc 'git config diff.renames'", "bash -lc 'rg \"git diff\" docs'",
-                    "bash -lc 'echo git diff'", "bash -lc 'mygit diff'", "bash -lc 'git -C \"unterminated diff'",
-                    "bash -lc 'git --git-dir diff show-ref'")
-        for command in accepted + rejected:
-            with self.subTest(command):
-                event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': command,
-                                                            'exit_code': 0, 'status': 'completed'}}
-                self.assertEqual(len(cr.diff_commands([event])), int(command in accepted))
-        stdout = without(self.stdout, is_command)
-        lone = {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': "bash -lc 'git show-ref'",
-                                                   'aggregated_output': '', 'exit_code': 0, 'status': 'completed'}}
-        self.assert_failed(judge(json.dumps(lone) + '\n' + stdout, self.last), 'ran `git diff` or `git show`')
+    def test_commands_whose_output_holds_no_unified_diff_are_not_evidence(self):
+        diff_text = 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n'
+        for command, output, exit_code in (
+                ("bash -lc 'git status --short'", ' M x\n', 0), ("bash -lc 'ls -la'", 'x\n', 0),
+                ("bash -lc 'git -v diff'", 'git version 2.34.1\n', 0),
+                ("bash -lc \"echo '&&' git diff\"", '&& git diff\n', 0),
+                ("bash -lc 'git diff --stat'", ' x | 2 +-\n 1 file changed\n', 0),
+                ("bash -lc 'git diff origin/main...HEAD'", '', 0),
+                ("bash -lc 'git diff --name-only'", 'diff --git a/x b/x\n', 0),
+                ("bash -lc 'git diff origin/main...HEAD'", diff_text, 128)):
+            with self.subTest(command=command, output=output):
+                self.assert_failed(judge(self.command_only(command, output, exit_code), self.last),
+                                   'printed a unified diff')
+
+    def test_any_command_whose_output_holds_a_unified_diff_is_evidence(self):
+        diff_text = 'diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n'
+        for command, output in (
+                ("bash -lc 'git status --short\ngit diff HEAD'", ' M x\n' + diff_text),
+                ('git -C "/tmp/repo with spaces" diff HEAD', diff_text),
+                ("bash -lc 'git diff origin/main...HEAD | head -c 60'", diff_text[:60]),
+                ("bash -lc 'git log -p -1'", 'commit abc\n\n' + diff_text)):
+            with self.subTest(command=command):
+                self.assertTrue(cr.diff_commands(cr.read_events(self.command_only(command, output))))
+                self.assertEqual(judge(self.command_only(command, output), self.last)[0], 'clean')
 
     def test_error_item(self):
         error = {'type': 'item.completed', 'item': {'id': 'e', 'type': 'error', 'message': 'Code Mode is off'}}
