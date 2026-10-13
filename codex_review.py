@@ -53,12 +53,19 @@ GOVERNANCE_MISSING_RULE = (
 SELF_CHECK_PROMPT = 'Run `cat token.txt` and reply with the exact contents of that file and nothing else.'
 VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
 FAILURE_SIGNAL_RE = re.compile(
-    r'\bblocked\b|placeholder|\bunverified\b|Reviewer failed to output a response|no such file or directory'
-    r'|failed to spawn|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to '
-    r'(?:review|inspect|read|open|view|examine|load)\b'
-    r'|\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|mode)s? '
+    r'\b(?:review|reviewer|tool|command|execution|sandbox)s? (?:is |was |are |were )?blocked\b'
+    r'|\b(?:verdict|review|conclusion)\b[^.\n]{0,30}\b(?:placeholder|unverified)\b'
+    r'|\b(?:placeholder|unverified) (?:verdict|review|conclusion)\b'
+    r'|Reviewer failed to output a response|no such file or directory|failed to spawn'
+    r'|(?:\b(?:I|we|codex)(?: was| were| am| are)? |^\W*|[.!?;:]\s+)'
+    r'(?:unable|not able|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|open|view|examine|load)\b'
+    r'|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|open|view|examine|load) '
+    r'(?:the |any )?(?:diff|repository|repo|code|changes?|patch|files?|worktree)\b'
+    r'|(?<!no )\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|mode)s? '
     r'(?:is |was |are |were )?(?:missing|unavailable|not found|not installed)'
-    r'|(?:无法|未能)(?:检查|审查|读取|查看)|工具缺失|缺少(?:组件|工具|程序)', re.I)
+    r'|我们?(?:无法|未能|不能)(?:检查|审查|读取|查看)'
+    r'|(?:无法|未能)(?:检查|审查|读取|查看)\s*(?:diff|差异|代码|仓库|文件|改动|变更|补丁|工作树)'
+    r'|工具缺失|缺少(?:组件|工具|程序)', re.I | re.M)
 TRANSIENT_RE = re.compile(
     r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'

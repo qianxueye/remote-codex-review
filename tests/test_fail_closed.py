@@ -126,6 +126,25 @@ class SingleConditionTests(unittest.TestCase):
             with self.subTest(text):
                 self.assert_failed(judge(self.stdout, text + '\nVERDICT: CLEAN'), 'reports a failure')
 
+    def test_review_failure_phrasings_still_fail(self):
+        for text in ('Review blocked: the execution tool failed.',
+                     'The correctness verdict is an unverified placeholder.',
+                     'Unable to review or verify correctness.', 'The sandbox was blocked.',
+                     'Codex failed to read the diff.', '审查中断：未能读取 diff。', '我无法读取仓库。'):
+            with self.subTest(text):
+                self.assert_failed(judge(self.stdout, text + '\nVERDICT: CLEAN'), 'reports a failure')
+
+    def test_business_descriptions_and_negations_stay_clean(self):
+        for text in ('No defects found. Requests are blocked for untrusted authors as intended.',
+                     'The fixture keeps placeholder credentials, which the loader rejects at startup.',
+                     'Unverified webhook signatures are refused with 401.',
+                     'Non-admin users cannot view the settings page, as the spec requires.',
+                     'The client is unable to read the body after a timeout and retries; that path is covered.',
+                     'No tool is missing and the review was not blocked.',
+                     '普通用户无法查看他人订单，与设计一致。', '没有无法读取的文件。'):
+            with self.subTest(text):
+                self.assertEqual(judge(self.stdout, text + '\nVERDICT: CLEAN')[:1], ('clean',))
+
     def test_missing_verdict_line(self):
         message = self.last.replace('VERDICT: CLEAN', '')
         self.assert_failed(judge(self.stdout, message), 'no single `VERDICT: CLEAN`')
@@ -518,6 +537,33 @@ class InstallScriptTests(unittest.TestCase):
                     (root / name).chmod(0o755)
             (root / 'codex-package.json').write_text('{"version": "0.159.0"}')
             self.assertNotEqual(self.package_ok(root).returncode, 0)
+
+    def drop_tests_tier(self, path):
+        script = (ROOT / 'deploy' / 'install.sh').read_text()
+        start = script.index('drop_tests_tier() {')
+        function = script[start:script.index('\n}\n', start) + 3]
+        return subprocess.run(['bash', '-c', f'{function}\ndrop_tests_tier "$1"', 'x', str(path)],
+                              capture_output=True, text=True)
+
+    def test_upgrade_drops_the_retired_tests_tier_so_the_service_starts(self):
+        rules = {'default': {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**'],
+                             'tests': ['**/migrations/**', 'deploy/**']},
+                 'repos': {'o/r': {'medium': ['docs/**'], 'tests': ['x/**']}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'effort-rules.json'
+            path.write_text(json.dumps(rules))
+            path.chmod(0o640)
+            with self.assertRaises(cr.ConfigError):
+                cr.load_effort_rules(str(path))
+            result = self.drop_tests_tier(path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('removed 2 retired tests table(s)', result.stdout)
+            self.assertEqual(cr.load_effort_rules(str(path)), {
+                'default': {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**']},
+                'repos': {'o/r': {'medium': ['docs/**']}}})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+            before = path.read_text()
+            self.assertEqual((self.drop_tests_tier(path).stdout, path.read_text()), ('', before))
 
 
 if __name__ == '__main__':

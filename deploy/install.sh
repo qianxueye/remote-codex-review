@@ -80,9 +80,30 @@ install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 "$SRC/codex-config.toml" "
 if [ ! -e "$ETC/codex-review.env" ]; then
   install -o root -g "$SERVICE_USER" -m 0640 "$SRC/codex-review.env.example" "$ETC/codex-review.env"
 fi
+drop_tests_tier() {  # rules file; removes the retired `tests` tables, keeps medium/high and owner/mode
+  python3 -I - "$1" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as handle:
+    data = json.load(handle)
+tables = [data.get('default')] + list((data.get('repos') or {}).values())
+changed = [table.pop('tests') for table in tables if isinstance(table, dict) and 'tests' in table]
+if changed:
+    info = os.stat(path)
+    with open(path + '.new', 'w', encoding='utf-8') as handle:
+        json.dump(data, handle, indent=2)
+        handle.write('\n')
+    os.chown(path + '.new', info.st_uid, info.st_gid)
+    os.chmod(path + '.new', info.st_mode & 0o7777)
+    os.replace(path + '.new', path)
+    print(f'removed {len(changed)} retired tests table(s) from {path}')
+PY
+}
+
 if [ ! -e "$ETC/effort-rules.json" ]; then
   install -o root -g "$SERVICE_USER" -m 0640 "$SRC/effort-rules.json" "$ETC/effort-rules.json"
 fi
+drop_tests_tier "$ETC/effort-rules.json"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
