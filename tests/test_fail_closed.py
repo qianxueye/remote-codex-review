@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -107,6 +108,11 @@ class SingleConditionTests(unittest.TestCase):
         self.assertIn('"exit_code":127', stdout)
         self.assert_failed(judge(stdout, self.last), 'no command with exit code 0')
 
+    def test_successful_commands_without_a_diff_are_not_evidence(self):
+        stdout = self.stdout.replace('git diff', 'git status').replace('git show', 'git status')
+        self.assertNotIn('git diff', stdout)
+        self.assert_failed(judge(stdout, self.last), 'ran `git diff` or `git show`')
+
     def test_error_item(self):
         error = {'type': 'item.completed', 'item': {'id': 'e', 'type': 'error', 'message': 'Code Mode is off'}}
         self.assert_failed(judge(json.dumps(error) + '\n' + self.stdout, self.last), 'error item: Code Mode is off')
@@ -141,7 +147,9 @@ class SingleConditionTests(unittest.TestCase):
                      'Non-admin users cannot view the settings page, as the spec requires.',
                      'The client is unable to read the body after a timeout and retries; that path is covered.',
                      'No tool is missing and the review was not blocked.',
-                     '普通用户无法查看他人订单，与设计一致。', '没有无法读取的文件。'):
+                     'The handler correctly returns no such file or directory for absent paths.',
+                     'The installer fails if the helper binary is missing, which is intended.',
+                     '普通用户无法查看他人订单，与设计一致。', '没有无法读取的文件。', '没有工具缺失。'):
             with self.subTest(text):
                 self.assertEqual(judge(self.stdout, text + '\nVERDICT: CLEAN')[:1], ('clean',))
 
@@ -417,6 +425,15 @@ class EnqueueTests(Harness):
         self.assertEqual(cr.enqueue_command(self.config, github, self.store, f'{REPO}#7@{HEAD}'), 0)
         self.assertEqual([(j.head, j.base, j.installation) for j in self.store.queued()], [(HEAD, 'release', 99)])
 
+    def test_enqueue_command_with_a_stale_sha_queues_the_live_head(self):
+        self.finished_job(HEAD)
+        self.store.enqueue(REPO, 7, NEW_HEAD, 'main', 99)
+        github = mock.Mock()
+        github.repo_installation.return_value = 99
+        github.pull.return_value = dict(pull_payload(head=NEW_HEAD)['pull_request'])
+        self.assertEqual(cr.enqueue_command(self.config, github, self.store, f'{REPO}#7@{HEAD}'), 0)
+        self.assertEqual([(j.head, j.status) for j in self.store.queued()], [(NEW_HEAD, 'queued')])
+
     def test_enqueue_command_refuses_a_pr_that_fails_admission(self):
         github = mock.Mock()
         github.repo_installation.return_value = 99
@@ -538,12 +555,38 @@ class InstallScriptTests(unittest.TestCase):
             (root / 'codex-package.json').write_text('{"version": "0.159.0"}')
             self.assertNotEqual(self.package_ok(root).returncode, 0)
 
-    def drop_tests_tier(self, path):
+    def shell_function(self, name, call, *args):
         script = (ROOT / 'deploy' / 'install.sh').read_text()
-        start = script.index('drop_tests_tier() {')
+        start = script.index(f'{name}() {{')
         function = script[start:script.index('\n}\n', start) + 3]
-        return subprocess.run(['bash', '-c', f'{function}\ndrop_tests_tier "$1"', 'x', str(path)],
+        return subprocess.run(['bash', '-c', f'{function}\n{call}', 'x', *map(str, args)],
                               capture_output=True, text=True)
+
+    def drop_tests_tier(self, path):
+        return self.shell_function('drop_tests_tier', 'drop_tests_tier "$1"', path)
+
+    def test_configured_rules_path_is_read_from_the_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / 'codex-review.env'
+            for line, expected in (('CODEX_REVIEW_EFFORT_RULES=/srv/rules.json', '/srv/rules.json'),
+                                   ('CODEX_REVIEW_EFFORT_RULES = "/srv/my rules.json"  ', '/srv/my rules.json'),
+                                   ("CODEX_REVIEW_EFFORT_RULES='/srv/q.json'", '/srv/q.json'),
+                                   ('# CODEX_REVIEW_EFFORT_RULES=/x', '')):
+                with self.subTest(line):
+                    env.write_text(f'CODEX_REVIEW_APP_ID=1\n{line}\n')
+                    result = self.shell_function('configured_rules', 'configured_rules "$1"', env)
+                    self.assertEqual(result.stdout.strip('\n'), expected)
+
+    def test_package_modes_do_not_depend_on_the_umask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'pkg'
+            result = self.shell_function(
+                'fix_package_modes', 'umask 077; mkdir -p "$1/bin"; : > "$1/bin/codex"; : > "$1/data.json"; '
+                'chmod 700 "$1/bin/codex"; chmod 600 "$1/data.json"; fix_package_modes "$1"', root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            modes = {name: stat.S_IMODE((root / name).stat().st_mode)
+                     for name in ('.', 'bin', 'bin/codex', 'data.json')}
+            self.assertEqual(modes, {'.': 0o755, 'bin': 0o755, 'bin/codex': 0o755, 'data.json': 0o644})
 
     def test_upgrade_drops_the_retired_tests_tier_so_the_service_starts(self):
         rules = {'default': {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**'],

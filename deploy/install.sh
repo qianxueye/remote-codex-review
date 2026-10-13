@@ -103,10 +103,23 @@ PY
 if [ ! -e "$ETC/effort-rules.json" ]; then
   install -o root -g "$SERVICE_USER" -m 0640 "$SRC/effort-rules.json" "$ETC/effort-rules.json"
 fi
+configured_rules() {  # env file; prints the CODEX_REVIEW_EFFORT_RULES value without quotes
+  sed -n 's/^[[:space:]]*CODEX_REVIEW_EFFORT_RULES[[:space:]]*=[[:space:]]*//p' "$1" | tail -n 1 \
+    | sed -e 's/[[:space:]]*$//' -e "s/^\"\(.*\)\"$/\1/" -e "s/^'\(.*\)'$/\1/"
+}
+
 drop_tests_tier "$ETC/effort-rules.json"
+rules=$(configured_rules "$ETC/codex-review.env")
+if [ -n "$rules" ] && [ "$rules" != "$ETC/effort-rules.json" ] && [ -f "$rules" ]; then
+  drop_tests_tier "$rules"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+
+fix_package_modes() {  # directory; independent of the caller's umask
+  chmod -R u+rwX,go+rX,go-w "$1"
+}
 
 package_ok() {  # directory
   grep -q "\"version\": \"$CODEX_VERSION\"" "$1/codex-package.json" 2>/dev/null || return 1
@@ -122,7 +135,7 @@ if ! package_ok "$CODEX_DIR" 2>/dev/null; then
   install -d -o root -g root -m 0755 "$CODEX_DIR.new"
   tar -xzf "$tmp/$CODEX_ASSET" -C "$CODEX_DIR.new" --no-same-owner --no-same-permissions
   chown -R root:root "$CODEX_DIR.new"
-  chmod -R go-w "$CODEX_DIR.new"
+  fix_package_modes "$CODEX_DIR.new"
   package_ok "$CODEX_DIR.new" || die "$CODEX_ASSET lacks a required file"
   rm -rf "$CODEX_DIR.old"
   if [ -e "$CODEX_DIR" ]; then mv "$CODEX_DIR" "$CODEX_DIR.old"; fi

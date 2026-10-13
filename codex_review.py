@@ -47,19 +47,18 @@ VERDICT_RULE = (
 SELF_CHECK_PROMPT = 'Run `cat token.txt` and reply with the exact contents of that file and nothing else.'
 VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
 FAILURE_SIGNAL_RE = re.compile(
-    r'\b(?:review|reviewer|tool|command|execution|sandbox)s? (?:is |was |are |were )?blocked\b'
+    r'Reviewer failed to output a response'
+    r'|\b(?:review|reviewer|sandbox|execution)s? (?:is |was |were )?blocked\b'
     r'|\b(?:verdict|review|conclusion)\b[^.\n]{0,30}\b(?:placeholder|unverified)\b'
     r'|\b(?:placeholder|unverified) (?:verdict|review|conclusion)\b'
-    r'|Reviewer failed to output a response|no such file or directory|failed to spawn'
     r'|(?:\b(?:I|we|codex)(?: was| were| am| are)? |^\W*|[.!?;:]\s+)'
     r'(?:unable|not able|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|open|view|examine|load)\b'
     r'|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|open|view|examine|load) '
-    r'(?:the |any )?(?:diff|repository|repo|code|changes?|patch|files?|worktree)\b'
-    r'|(?<!no )\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|mode)s? '
-    r'(?:is |was |are |were )?(?:missing|unavailable|not found|not installed)'
+    r'(?:the |any )?(?:diff|repository|repo|code|changes?|patch|worktree)\b'
+    r'|(?:codex-)?code-mode[ -]host\b[^.\n]{0,20}\b(?:missing|unavailable|not found|not installed)'
     r'|我们?(?:无法|未能|不能)(?:检查|审查|读取|查看)'
-    r'|(?:无法|未能)(?:检查|审查|读取|查看)\s*(?:diff|差异|代码|仓库|文件|改动|变更|补丁|工作树)'
-    r'|工具缺失|缺少(?:组件|工具|程序)', re.I | re.M)
+    r'|(?:无法|未能)(?:检查|审查|读取|查看)\s*(?:diff|差异|代码|仓库|改动|变更|补丁|工作树)', re.I | re.M)
+DIFF_COMMAND_RE = re.compile(r'\bgit\b[^\n|;&]*?\b(?:diff|show)\b')
 TRANSIENT_RE = re.compile(
     r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
@@ -485,6 +484,11 @@ def ran_commands(events):
             if item.get('status') == 'completed' and item.get('exit_code') == 0]
 
 
+def diff_commands(events):
+    """Return the successful commands that ran `git diff` or `git show`; clean requires at least one."""
+    return [item for item in ran_commands(events) if DIFF_COMMAND_RE.search(str(item.get('command') or ''))]
+
+
 def turn_completed(events):
     return (any(event.get('type') == 'turn.completed' for event in events)
             and not any(event.get('type') == 'turn.failed' for event in events))
@@ -516,8 +520,9 @@ def failure_reasons(rc, events, message):
             reasons.append(f'codex reported {event["type"]}: {json.dumps(event, ensure_ascii=False)[:300]}')
     reasons += [f'codex reported an error item: {str(item.get("message"))[:300]}'
                 for item in completed_items(events, 'error')]
-    if not ran_commands(events):
-        reasons.append('codex completed no command with exit code 0, so nothing shows it read the diff')
+    if not diff_commands(events):
+        reasons.append('codex completed no command with exit code 0 that ran `git diff` or `git show`, '
+                       'so nothing shows it read the diff')
     if not message:
         reasons.append('codex wrote no final message')
     signal = FAILURE_SIGNAL_RE.search(message)
@@ -1346,10 +1351,11 @@ def enqueue_command(config, github, store, target):
     if reason:
         print(f'not queued: {reason}', file=sys.stderr)
         return 1
+    if pull['head']['sha'] != head:
+        print(f'note: {head[:12]} is no longer the head; queueing the current head {pull["head"]["sha"][:12]}')
+        head = pull['head']['sha']
     queued = store.force_enqueue(full_name, number, head, pull['base']['ref'], installation)
     print(f'{"queued" if queued else "already queued"} {full_name}#{number}@{head[:12]}')
-    if pull['head']['sha'] != head:
-        print(f'note: the current head is {pull["head"]["sha"][:12]}; the worker will review that head instead')
     return 0
 
 
