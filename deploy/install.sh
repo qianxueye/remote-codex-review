@@ -4,9 +4,12 @@
 set -euo pipefail
 
 CODEX_VERSION=0.160.1
-CODEX_ASSET=codex-x86_64-unknown-linux-musl.tar.gz
+CODEX_ASSET=codex-package-x86_64-unknown-linux-musl.tar.gz
 CODEX_URL="https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${CODEX_ASSET}"
-CODEX_SHA256=9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c84bba33f
+CODEX_SHA256=340801565906a7028f6baaa9ab6853addaef221f0016a1417a7c1ffdd96c21f0
+CODEX_DIR=/opt/codex
+# codex finds its helpers through the package layout of the resolved executable (docs/runbook.zh.md §9).
+CODEX_REQUIRED="bin/codex bin/codex-code-mode-host codex-resources/bwrap codex-resources/zsh/bin/zsh codex-path/rg"
 CLOUDFLARED_VERSION=2026.10.0
 CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
 CLOUDFLARED_SHA256=d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db
@@ -84,15 +87,31 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-say "codex-cli $CODEX_VERSION"
-if [ "$(/usr/local/bin/codex --version 2>/dev/null || true)" != "codex-cli $CODEX_VERSION" ]; then
+package_ok() {  # directory
+  grep -q "\"version\": \"$CODEX_VERSION\"" "$1/codex-package.json" 2>/dev/null || return 1
+  for file in $CODEX_REQUIRED; do
+    [ -f "$1/$file" ] && [ -x "$1/$file" ] || { echo "missing or not executable: $1/$file" >&2; return 1; }
+  done
+}
+
+say "codex-cli $CODEX_VERSION package"
+if ! package_ok "$CODEX_DIR" 2>/dev/null; then
   download "$CODEX_URL" "$CODEX_SHA256" "$tmp/$CODEX_ASSET"
-  mkdir "$tmp/codex"
-  tar -xzf "$tmp/$CODEX_ASSET" -C "$tmp/codex" --no-same-owner
-  binaries=$(find "$tmp/codex" -type f -perm -u+x)
-  [ "$(printf '%s\n' "$binaries" | grep -c .)" -eq 1 ] || die "expected one executable in $CODEX_ASSET"
-  install -o root -g root -m 0755 "$binaries" /usr/local/bin/codex
+  rm -rf "$CODEX_DIR.new"
+  install -d -o root -g root -m 0755 "$CODEX_DIR.new"
+  tar -xzf "$tmp/$CODEX_ASSET" -C "$CODEX_DIR.new" --no-same-owner --no-same-permissions
+  chown -R root:root "$CODEX_DIR.new"
+  chmod -R go-w "$CODEX_DIR.new"
+  package_ok "$CODEX_DIR.new" || die "$CODEX_ASSET lacks a required file"
+  rm -rf "$CODEX_DIR.old"
+  if [ -e "$CODEX_DIR" ]; then mv "$CODEX_DIR" "$CODEX_DIR.old"; fi
+  mv "$CODEX_DIR.new" "$CODEX_DIR"
+  rm -rf "$CODEX_DIR.old"
 fi
+ln -sfn "$CODEX_DIR/bin/codex" /usr/local/bin/codex.new
+mv -Tf /usr/local/bin/codex.new /usr/local/bin/codex
+package_ok "$CODEX_DIR" || die "codex package check failed"
+[ "$(readlink -f /usr/local/bin/codex)" = "$CODEX_DIR/bin/codex" ] || die "/usr/local/bin/codex does not resolve into $CODEX_DIR"
 [ "$(/usr/local/bin/codex --version)" = "codex-cli $CODEX_VERSION" ] || die "codex version check failed"
 
 say "cloudflared $CLOUDFLARED_VERSION"

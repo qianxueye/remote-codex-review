@@ -23,7 +23,19 @@ SECRET = b'webhook-secret'
 REPO = 'Example-Org/Example-Repo'
 WORKTREE = '/var/lib/codex-review/work/7/tree'
 
-CLEAN = 'The change is consistent with its callers; no defects found.'
+CLEAN = 'The change is consistent with its callers; no defects found.\nVERDICT: CLEAN'
+
+
+def events_jsonl(message, read=True):
+    """Return a minimal `codex exec --json` stream: one successful command, the message, a completed turn."""
+    events = [{'type': 'thread.started', 'thread_id': 't-1'}, {'type': 'turn.started'}]
+    if read:
+        events.append({'type': 'item.completed', 'item': {
+            'id': 'item_0', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff origin/main...HEAD'",
+            'aggregated_output': 'diff --git a/x b/x\n', 'exit_code': 0, 'status': 'completed'}})
+    events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
+    events.append({'type': 'turn.completed', 'usage': {}})
+    return '\n'.join(json.dumps(event) for event in events) + '\n'
 FINDINGS = f"""Two defects remain.
 
 Full review comments:
@@ -125,17 +137,19 @@ class FakeGit:
 class FakeCodex:
     def __init__(self, message='', rc=0, timed_out=False, during=None):
         self.message, self.rc, self.timed_out, self.during = message, rc, timed_out, during
+        self.events = None
         self.calls = []
         self.cancelled = []
 
     def __call__(self, job_id, worktree, base, effort, tier, timeout, scratch, proceed):
         if not proceed():
-            return None, '', '', False
+            return None, '', '', '', False
         self.calls.append((job_id, worktree, base, effort, tier))
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))
-        return self.rc, 'progress\ncodex\n' + message, message, self.timed_out
+        events = self.events if self.events is not None else events_jsonl(message)
+        return self.rc, events, 'progress\n', message, self.timed_out
 
     def cancel(self, job_ids):
         self.cancelled.extend(job_ids)
@@ -194,10 +208,11 @@ class ParseTests(unittest.TestCase):
         body = cr.review_body(HEAD, verdict, '', findings, raw='One issue: [P2] the retry loop never ends.')
         self.assertIn('[P2] the retry loop never ends.', body)
 
-    def test_final_message_prefers_output_file_then_last_codex_line(self):
-        self.assertEqual(cr.final_message('codex\nold\ncodex\nnew', ''), 'new')
-        self.assertEqual(cr.final_message('codex\nfrom stdout', 'from -o file\n'), 'from -o file')
-        self.assertEqual(cr.final_message('no marker here', ''), '')
+    def test_final_message_prefers_output_file_then_last_agent_message(self):
+        events = cr.read_events(events_jsonl('old') + events_jsonl('new'))
+        self.assertEqual(cr.final_message(events, ''), 'new')
+        self.assertEqual(cr.final_message(events, 'from -o file\n'), 'from -o file')
+        self.assertEqual(cr.final_message(cr.read_events('codex\nnot json'), ''), '')
 
     def test_inline_comments_only_for_lines_in_the_diff(self):
         _, _, findings = cr.parse_review(FINDINGS, (WORKTREE,))
@@ -663,11 +678,12 @@ class TestTierTests(unittest.TestCase):
     def test_read_only_command_drops_base_and_forbids_tests(self):
         command = cr.CodexRunner('codex').command('main', '/w/last.txt', 'high', 'read-only')
         self.assertNotIn('--base', command)
-        self.assertEqual(command[2:4], ['--sandbox', 'read-only'])
+        self.assertEqual(command[2:5], ['--json', '--sandbox', 'read-only'])
         prompt = command[command.index('review') + 1]
         self.assertIn('git diff origin/main...HEAD', prompt)
         self.assertIn('do not run pytest, vitest or any other test suite', prompt)
         self.assertIn('本次为只读审查，未运行测试', prompt)
+        self.assertIn('`VERDICT: CLEAN`', prompt)
         self.assertEqual(command[-2:], ['-o', '/w/last.txt'])
 
 
@@ -867,10 +883,14 @@ class ConfigTests(unittest.TestCase):
 
     def test_codex_command_pins_sandbox_network_and_approval(self):
         command = cr.CodexRunner('codex').command('main', '/w/last.txt', 'high')
-        self.assertEqual(command, ['codex', 'exec', '--sandbox', 'workspace-write',
+        self.assertEqual(command, ['codex', 'exec', '--json', '--sandbox', 'workspace-write',
                                    '-c', 'sandbox_workspace_write.network_access=false',
                                    '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
-                                   'review', '--base', 'origin/main', '-o', '/w/last.txt'])
+                                   'review', cr.review_prompt('main', 'tests'), '-o', '/w/last.txt'])
+        prompt = command[-3]
+        self.assertIn('git diff origin/main...HEAD', prompt)
+        self.assertIn('`VERDICT: CLEAN`', prompt)
+        self.assertNotIn('read-only review', prompt)
 
 
 if __name__ == '__main__':

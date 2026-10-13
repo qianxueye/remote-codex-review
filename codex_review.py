@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -28,23 +29,37 @@ WEBHOOK_PATH = '/webhook'
 ACTIONS = frozenset({'opened', 'synchronize', 'reopened', 'ready_for_review'})
 TRUSTED_ASSOCIATIONS = frozenset({'OWNER', 'MEMBER', 'COLLABORATOR'})
 MARKER = '<!-- remote-codex-review head={head} verdict={verdict}{effort}{tests} -->'
-MARKER_RE = re.compile(r'<!-- remote-codex-review head=([0-9a-f]{40}) verdict=(clean|findings|failed)'
+MARKER_RE = re.compile(r'<!-- remote-codex-review head=([0-9a-f]{40}) verdict=(clean|findings|failed|invalid)'
                        r'(?: effort=[a-z]+)?(?: tests=[a-z-]+)? -->')
 DEFAULT_EFFORT_RULES = {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**'],
                         'tests': ['**/migrations/**', 'deploy/**', '.github/workflows/**', '**/*secret*',
                                   '**/*credential*']}
 RULE_KEYS = frozenset({'medium', 'high', 'tests'})
-READ_ONLY_PROMPT = (
+BASE_PROMPT = (
     "Review the code changes against the base branch 'origin/{base}'. Run `git diff origin/{base}...HEAD` to "
-    "inspect the changes relative to origin/{base}. Provide prioritized, actionable findings.\n\n"
+    "inspect the changes relative to origin/{base}. Provide prioritized, actionable findings.")
+READ_ONLY_RULE = (
     'This is a read-only review: do not run pytest, vitest or any other test suite, and do not start a database '
     'or any other service. Read the code; use grep and git to view context. State in your conclusion: '
     '本次为只读审查，未运行测试 (read-only review; no tests were run).')
+VERDICT_RULE = (
+    'End overall_explanation with a line that reads exactly `VERDICT: CLEAN` when you report no findings, or '
+    '`VERDICT: FINDINGS` when you report at least one. If you could not run commands or read the diff, end it '
+    'with `VERDICT: BLOCKED` instead and say what failed.')
+SELF_CHECK_PROMPT = 'Run `cat token.txt` and reply with the exact contents of that file and nothing else.'
+VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
+FAILURE_SIGNAL_RE = re.compile(
+    r'\bblocked\b|placeholder|\bunverified\b|Reviewer failed to output a response|no such file or directory'
+    r'|failed to spawn|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|access|run|'
+    r'execute|open|view|examine|load)\b|\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|'
+    r'mode)s? (?:is |was |are |were )?(?:missing|unavailable|not found|not installed)'
+    r'|(?:无法|未能)(?:检查|审查|读取|运行|执行|查看|访问)|工具缺失|缺少(?:组件|工具|程序)', re.I)
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
 FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
+SELF_CHECK_FAILED = 3
 REDELIVER_INTERVAL = 3600
 ACTIVE = ('queued', 'running')
 
@@ -373,9 +388,26 @@ class GitHub:
             if not same_name((review.get('user') or {}).get('login', ''), bot):
                 continue
             for found_head, verdict in MARKER_RE.findall(review.get('body') or ''):
-                if found_head == head:
+                if found_head == head and verdict != 'invalid':
                     return verdict, review.get('id')
         return None
+
+    def repo_installation(self, full_name):
+        return self.call('GET', f'/repos/{full_name}/installation', self.jwt_factory())['id']
+
+    def invalidate_review(self, full_name, number, review_id, note):
+        """Rewrite one of this App's marked reviews to note, with its marker verdict set to invalid."""
+        token = self.token(self.repo_installation(full_name))
+        path = f'/repos/{full_name}/pulls/{number}/reviews/{review_id}'
+        review = self.call('GET', path, token)
+        if not same_name((review.get('user') or {}).get('login', ''), self.bot_login()):
+            raise ValueError(f'review {review_id} was not posted by {self.bot_login()}')
+        match = MARKER_RE.search(review.get('body') or '')
+        if not match:
+            raise ValueError(f'review {review_id} carries no remote-codex-review marker')
+        marker = match.group(0).replace(f'verdict={match.group(2)}', 'verdict=invalid', 1)
+        self.call('PUT', path, token, {'body': f'{marker}\n\n{note}'})
+        return match.group(1), match.group(2)
 
     def post_review(self, full_name, number, head, body, comments, token):
         """Post one COMMENT review; when GitHub rejects the inline comments, repost body-only."""
@@ -416,13 +448,70 @@ class Finding:
         return f'{self.path}:{self.start}' + (f'-{self.end}' if self.end != self.start else '')
 
 
-def final_message(output, last_message=''):
-    """Prefer codex's -o file; otherwise take the text after the last bare `codex` line."""
+def read_events(output):
+    """Parse `codex exec --json` stdout into event dicts, skipping lines that are not JSON objects."""
+    events = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def completed_items(events, kind):
+    return [event['item'] for event in events if event.get('type') == 'item.completed'
+            and isinstance(event.get('item'), dict) and event['item'].get('type') == kind]
+
+
+def final_message(events, last_message=''):
+    """Prefer codex's -o file; otherwise take the last agent message among the events."""
     if last_message.strip():
         return last_message.strip()
-    lines = output.splitlines()
-    marks = [index for index, line in enumerate(lines) if line.strip() == 'codex']
-    return '\n'.join(lines[marks[-1] + 1:]).strip() if marks else ''
+    messages = completed_items(events, 'agent_message')
+    return str(messages[-1].get('text') or '').strip() if messages else ''
+
+
+def ran_commands(events):
+    """Return the completed commands that exited 0; their output is the evidence codex read the repository."""
+    return [item for item in completed_items(events, 'command_execution')
+            if item.get('status') == 'completed' and item.get('exit_code') == 0]
+
+
+def failure_reasons(rc, events, message):
+    """List every reason a finished codex run cannot count as a review; empty means all checks passed."""
+    reasons = [] if rc == 0 else [f'codex exited {rc}']
+    if not any(event.get('type') == 'turn.completed' for event in events):
+        reasons.append('codex reported no completed turn')
+    for event in events:
+        if event.get('type') in ('turn.failed', 'error'):
+            reasons.append(f'codex reported {event["type"]}: {json.dumps(event, ensure_ascii=False)[:300]}')
+    reasons += [f'codex reported an error item: {str(item.get("message"))[:300]}'
+                for item in completed_items(events, 'error')]
+    if not ran_commands(events):
+        reasons.append('codex completed no command with exit code 0, so nothing shows it read the diff')
+    if not message:
+        reasons.append('codex wrote no final message')
+    signal = FAILURE_SIGNAL_RE.search(message)
+    if signal:
+        reasons.append(f'the final message reports a failure ("{signal.group(0)}")')
+    return reasons
+
+
+def assess(rc, events, message, worktree_roots=()):
+    """Return (verdict, summary, findings, reasons); clean needs every check to pass and `VERDICT: CLEAN`."""
+    verdict, summary, findings = parse_review(message, worktree_roots)
+    declared = VERDICT_RE.findall(message)
+    summary = VERDICT_RE.sub('', summary).strip()
+    if rc == 0 and message and (verdict == 'findings' or 'FINDINGS' in declared):
+        return 'findings', summary, findings, []
+    reasons = failure_reasons(rc, events, message)
+    if declared != ['CLEAN']:
+        reasons.append('the final message carries no single `VERDICT: CLEAN` line'
+                       + (f' (found {", ".join(declared)})' if declared else ''))
+    return ('failed' if reasons else 'clean'), summary, [], reasons
 
 
 def strip_prefix(path, worktree_roots):
@@ -488,7 +577,8 @@ def inline_comments(findings, diff):
     return comments
 
 
-def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, tests=None):
+def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, tests=None,
+                reasons=()):
     """Render the review body; it always carries the marker and every finding in full.
 
     kept names where the full codex output is preserved; failed and truncated bodies point to it.
@@ -497,6 +587,7 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
                            tests=f' tests={tests}' if tests else '')]
     if verdict == 'failed':
         parts.append(f'**Remote codex review failed** for `{head}`: {reason}. This is not a pass.'
+                     + ''.join(f'\n- {item}' for item in reasons)
                      + (f'\n\nFull codex output is kept on the review host at `{kept}`.' if kept else ''))
     elif verdict == 'clean':
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
@@ -630,6 +721,14 @@ class Store:
     def reset_running(self):
         with self.lock:
             return self.db.execute("UPDATE jobs SET status = 'queued' WHERE status = 'running'").rowcount
+
+    def force_enqueue(self, repo, pr, head, base, installation):
+        """Queue head even when it already finished; returns whether a job was queued."""
+        def work():
+            self.db.execute("UPDATE jobs SET status = 'superseded' WHERE repo = ? AND pr = ? AND head_sha = ? "
+                            "AND status NOT IN ('queued', 'running')", (repo, pr, head))
+            return self._enqueue(repo, pr, head, base, installation)[0]
+        return self._transaction(work)
 
     def requeue(self, repo, pr, head):
         with self.lock:
@@ -835,6 +934,12 @@ class Git:
                 self.run(['-C', str(mirror), 'worktree', 'prune'])
 
 
+def review_prompt(base, tier):
+    """Both tiers pass a prompt so it can demand the verdict line; codex rejects --base with a prompt."""
+    rules = [READ_ONLY_RULE] if tier == 'read-only' else []
+    return '\n\n'.join([BASE_PROMPT.format(base=base), *rules, VERDICT_RULE])
+
+
 class CodexRunner:
     """Run `codex exec review` in its own process group; the group is killed on timeout or cancel."""
 
@@ -844,26 +949,24 @@ class CodexRunner:
         self.groups = {}
 
     def command(self, base, last_message, effort, tier='tests'):
-        """Build the codex argv; codex rejects --base together with a prompt, so read-only names the base in it."""
-        target = ['--base', f'origin/{base}'] if tier == 'tests' else [READ_ONLY_PROMPT.format(base=base)]
         sandbox = 'workspace-write' if tier == 'tests' else 'read-only'
-        return [self.codex, 'exec', '--sandbox', sandbox,
+        return [self.codex, 'exec', '--json', '--sandbox', sandbox,
                 '-c', 'sandbox_workspace_write.network_access=false', '-c', 'approval_policy="never"',
                 '-c', f'model_reasoning_effort={effort}',
-                'review', *target, '-o', str(last_message)]
+                'review', review_prompt(base, tier), '-o', str(last_message)]
 
     def __call__(self, job_id, worktree, base, effort, tier, timeout, scratch, proceed):
-        """Return (rc, output, last message, timed out); rc is None when proceed() refused the start.
+        """Return (rc, JSONL stdout, stderr, last message, timed out); rc is None when proceed() refused the start.
 
         proceed() runs under the lock that cancel() takes, so a cancel issued before registration is not lost.
         """
-        last_message, output = scratch / 'last-message.txt', scratch / 'codex.log'
-        with open(output, 'wb') as sink:
+        last_message, output, errors = scratch / 'last-message.txt', scratch / 'events.jsonl', scratch / 'stderr.log'
+        with open(output, 'wb') as sink, open(errors, 'wb') as error_sink:
             with self.lock:
                 if not proceed():
-                    return None, '', '', False
+                    return None, '', '', '', False
                 process = subprocess.Popen(self.command(base, last_message, effort, tier), cwd=str(worktree),
-                                           stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL, stdout=sink, stderr=error_sink,
                                            start_new_session=True)
                 self.groups[job_id] = process.pid
             timed_out = False
@@ -877,8 +980,9 @@ class CodexRunner:
                 with self.lock:
                     self.groups.pop(job_id, None)
         text = output.read_text(encoding='utf-8', errors='replace')
+        stderr = errors.read_text(encoding='utf-8', errors='replace')
         last = last_message.read_text(encoding='utf-8', errors='replace') if last_message.exists() else ''
-        return process.returncode, text, last, timed_out
+        return process.returncode, text, stderr, last, timed_out
 
     @staticmethod
     def kill(pgid, grace=5.0):
@@ -903,6 +1007,45 @@ class CodexRunner:
             groups = list(self.groups.values())
         for pgid in groups:
             self.kill(pgid)
+
+
+def self_check(codex, work_dir, timeout=300):
+    """Have codex read a random token from a throwaway git repository; return None, or why it failed."""
+    token = secrets.token_hex(16)
+    scratch = work_dir / f'self-check-{token[:12]}'
+    repo, last = scratch / 'repo', scratch / 'last-message.txt'
+    try:
+        repo.mkdir(parents=True)
+        (repo / 'token.txt').write_text(token + '\n', encoding='utf-8')
+        subprocess.run(['git', 'init', '--quiet', str(repo)], check=True, capture_output=True, timeout=60)
+        process = subprocess.Popen(
+            [codex, 'exec', '--json', '--ephemeral', '--sandbox', 'read-only', '-c', 'approval_policy="never"',
+             '-c', 'model_reasoning_effort=low', '-o', str(last), SELF_CHECK_PROMPT],
+            cwd=str(repo), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            CodexRunner.kill(process.pid)
+            process.communicate()
+            return f'codex did not finish within {timeout} s'
+        last_text = last.read_text(encoding='utf-8', errors='replace') if last.exists() else ''
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f'could not run codex: {exc}'
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    events = read_events(stdout)
+    tail = ' | '.join(stderr.strip().splitlines()[-3:])
+    if process.returncode:
+        return f'codex exited {process.returncode}: {tail}'
+    errors = [str(item.get('message'))[:300] for item in completed_items(events, 'error')]
+    if errors:
+        return f'codex reported an error: {errors[0]}'
+    if not any(token in str(item.get('aggregated_output', '')) for item in ran_commands(events)):
+        return 'no command codex ran printed the token, so codex cannot read repository files'
+    if token not in final_message(events, last_text):
+        return 'the final message does not contain the token'
+    return None
 
 
 # ---- review worker ---------------------------------------------------------
@@ -947,14 +1090,15 @@ class Reviewer:
             return 'skipped'
         return None
 
-    def keep_output(self, job, output, last):
+    def keep_output(self, job, output, stderr, last):
         """Write codex output to state_dir/output/<job id>.log with mode 0600."""
         path = self.config.state_dir / 'output' / f'{job.id}.log'
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             os.fchmod(handle.fileno(), 0o600)
-            handle.write(output + ('\n--- last message ---\n' + last if last else ''))
+            handle.write(output + ('\n--- stderr ---\n' + stderr if stderr else '')
+                         + ('\n--- last message ---\n' + last if last else ''))
 
     def work_forever(self):
         while not self.stop.is_set():
@@ -1036,7 +1180,7 @@ class Reviewer:
         try:
             log(f'{job}: codex review started against origin/{base} effort={effort} tests={tier}')
             started = time.time()
-            rc, output, last, timed_out = self.codex(job.id, worktree, base, effort, tier,
+            rc, output, stderr, last, timed_out = self.codex(job.id, worktree, base, effort, tier,
                                                      self.config.timeout_seconds, scratch,
                                                      lambda: self.store.status(job.id) == 'running')
             log(f'{job}: codex finished rc={rc} timed_out={timed_out} after {int(time.time() - started)} s')
@@ -1062,29 +1206,29 @@ class Reviewer:
             log(f'{job}: base changed to {pull["base"]["ref"]} during review; requeued')
             self.store.retry(job.id, 0, count_attempt=False)
             return None
-        message = final_message(output, last)
+        events = read_events(output)
+        message = final_message(events, last)
         comments = []
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
         if timed_out:
             verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, tests=tier,
                                                   kept=kept, reason=(
                 f'codex timed out after {self.config.timeout_seconds} s'))
-        elif rc != 0 or not message:
-            tail = '\n'.join(output.strip().splitlines()[-5:])
-            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, tests=tier,
-                                                  kept=kept, reason=(
-                f'codex exited {rc}' + (' with no final message' if rc == 0 else '')
-                + (f'\n\n```\n{tail}\n```' if tail else '')))
         else:
             roots = (str(worktree), os.path.realpath(worktree))
-            verdict, summary, findings = parse_review(message, roots)
-            body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort, tests=tier,
-                               kept=kept)
+            verdict, summary, findings, reasons = assess(rc, events, message, roots)
+            if verdict == 'failed':
+                log(f'{job}: codex output rejected: {"; ".join(reasons)}')
+                body = review_body(job.head, 'failed', '', [], effort=effort, tests=tier, kept=kept,
+                                   reason='codex output did not pass the review checks', reasons=reasons)
+            else:
+                body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort, tests=tier,
+                                   kept=kept)
             if findings:
                 comments = inline_comments(findings, diff_lines(
                     self.github.pull_files(job.full_name, job.number, token)))
         if verdict == 'failed' or len(body) > BODY_LIMIT:
-            self.keep_output(job, output, last)
+            self.keep_output(job, output, stderr, last)
         return self.publish(job, verdict, body, comments, token)
 
 
@@ -1121,6 +1265,30 @@ def serve(config, reviewer, secret):
         worker.join(timeout=60)
 
 
+def enqueue_command(config, github, store, target):
+    """Queue OWNER/REPO#PR@SHA after checking the installation and the live PR against admission."""
+    match = re.fullmatch(r'([^#]+)#(\d+)@([0-9a-f]{40})', target)
+    if not match:
+        print('expected OWNER/REPO#PR@<40-hex sha>', file=sys.stderr)
+        return 2
+    full_name, number, head = match.group(1), int(match.group(2)), match.group(3)
+    try:
+        installation = github.repo_installation(full_name)
+        pull = github.pull(full_name, number, github.token(installation))
+    except (GitHubError, InstallationRejected) as exc:
+        print(f'not queued: {exc}', file=sys.stderr)
+        return 1
+    reason = admission(config, pull['base']['repo'], pull)
+    if reason:
+        print(f'not queued: {reason}', file=sys.stderr)
+        return 1
+    queued = store.force_enqueue(full_name, number, head, pull['base']['ref'], installation)
+    print(f'{"queued" if queued else "already queued"} {full_name}#{number}@{head[:12]}')
+    if pull['head']['sha'] != head:
+        print(f'note: the current head is {pull["head"]["sha"][:12]}; the worker will review that head instead')
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=DEFAULT_CONFIG)
@@ -1128,7 +1296,14 @@ def main(argv=None):
     mode.add_argument('--dry-run', action='store_true',
                       help='print queued jobs and the deliveries that would be redelivered; change nothing')
     mode.add_argument('--requeue', metavar='OWNER/REPO#PR@SHA', help='queue one recorded head for review again')
+    mode.add_argument('--enqueue', metavar='OWNER/REPO#PR@SHA',
+                      help='queue any head of an open, admitted PR, including one that was already reviewed')
+    mode.add_argument('--invalidate', metavar='OWNER/REPO#PR:REVIEW_ID',
+                      help="rewrite one of this App's reviews to --note and mark its verdict invalid")
+    parser.add_argument('--note', help='replacement review text for --invalidate')
     args = parser.parse_args(argv)
+    if args.invalidate and not (args.note or '').strip():
+        parser.error('--invalidate needs --note')
     try:
         config = Config(read_env_file(args.config))
         secret = read_private(config.webhook_secret_file).strip()
@@ -1144,6 +1319,21 @@ def main(argv=None):
         print(f'requeued {store.requeue(match.group(1), int(match.group(2)), match.group(3))} job(s)')
         return 0
     github = GitHub(config)
+    if args.enqueue:
+        return enqueue_command(config, github, store, args.enqueue)
+    if args.invalidate:
+        match = re.fullmatch(r'([^#]+)#(\d+):(\d+)', args.invalidate)
+        if not match:
+            print('expected OWNER/REPO#PR:REVIEW_ID', file=sys.stderr)
+            return 2
+        try:
+            head, verdict = github.invalidate_review(match.group(1), int(match.group(2)), int(match.group(3)),
+                                                     args.note.strip())
+        except (ValueError, GitHubError, InstallationRejected) as exc:
+            print(f'not invalidated: {exc}', file=sys.stderr)
+            return 1
+        print(f'review {match.group(3)} for {head} changed from verdict={verdict} to verdict=invalid')
+        return 0
     if args.dry_run:
         for job in store.queued():
             print(f'would review {job} base=origin/{job.base} status={job.status}', flush=True)
@@ -1152,6 +1342,11 @@ def main(argv=None):
     git = Git(config.state_dir)
     log(f'startup: {store.reset_running()} interrupted job(s) requeued')
     git.sweep()
+    reason = self_check(config.codex, git.work)
+    if reason:
+        log(f'startup self-check failed, refusing to start: {reason}')
+        return SELF_CHECK_FAILED
+    log('startup self-check passed: codex read a repository file')
     reviewer = Reviewer(config, github, store, git, CodexRunner(config.codex))
     serve(config, reviewer, secret)
     return 0
