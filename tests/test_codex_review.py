@@ -43,9 +43,11 @@ Full review comments:
 - [P1] Close the gate after the control pass — {WORKTREE}/src/service.py:5388-5389
   The resume command opens the gate.
   A later tick treats it as known.
+  Confidence: 90
 
 - [P3] Keep the cancel obligation — {WORKTREE}/src/worker.py:45
   Closing the incident drops the order. See [AGENTS.md:56](AGENTS.md#L56).
+  Confidence: 60
 """
 
 
@@ -97,6 +99,9 @@ class FakeGitHub:
         self.comments = {}
         self.issue_calls = []
 
+    def review(self, full_name, number, review_id, token):
+        return {'id': review_id, 'body': self.posted[review_id - 1]['body']}
+
     def token(self, installation):
         return 'installation-token'
 
@@ -136,10 +141,19 @@ class FakeGit:
 
     def fetch(self, full_name, number, base, token):
         self.fetched.append((full_name, number, base))
-        return HEAD
+        return getattr(self, 'head', HEAD)
 
     def changed_files(self, full_name, base, head):
         return getattr(self, 'files', ['src/app.py'])
+
+    def delta_tree(self, full_name, base, prev, head, scratch):
+        self.delta_calls = getattr(self, 'delta_calls', []) + [(prev, head)]
+        if getattr(self, 'during_delta', None):
+            self.during_delta()
+        return getattr(self, 'delta', ('c' * 40, f'delta from reviewed head {prev[:12]}'))
+
+    def diff_files(self, full_name, tree, head):
+        return getattr(self, 'delta_files', ['src/fix.py'])
 
     def add_worktree(self, full_name, path, head):
         path.mkdir(parents=True)
@@ -153,15 +167,20 @@ class FakeGit:
 class FakeCodex:
     def __init__(self, message='', rc=0, timed_out=False, during=None):
         self.message, self.rc, self.timed_out, self.during = message, rc, timed_out, during
+        self.messages = []
         self.events = None
         self.calls = []
         self.cancelled = []
         self.governance = None
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed, governance=()):
+    def __call__(self, job_id, worktree, sections, effort, timeout, scratch, proceed, governance=()):
+        if getattr(self, 'before_proceed', None):
+            self.before_proceed()
         if not proceed():
             return None, '', '', '', False
-        self.calls.append((job_id, worktree, base, effort))
+        self.calls.append((job_id, worktree, cr.review_prompt(sections, governance), effort))
+        if self.messages:
+            self.message = self.messages.pop(0)
         self.governance = [(doc.ref, doc.path, doc.path.read_text() if doc.path else None, doc.error)
                            for doc in governance]
         if self.during:
@@ -205,26 +224,28 @@ class Harness(unittest.TestCase):
 
 class ParseTests(unittest.TestCase):
     def test_no_findings_is_clean(self):
-        verdict, summary, findings = cr.parse_review(CLEAN)
-        self.assertEqual((verdict, summary, findings), ('clean', CLEAN, []))
+        review = cr.read_review(CLEAN)
+        self.assertEqual((review.text, review.findings, review.unparsed), (CLEAN.replace('\nVERDICT: CLEAN', ''), [], []))
 
     def test_multiple_findings_with_range_and_prefix_stripped(self):
-        verdict, summary, findings = cr.parse_review(FINDINGS, (WORKTREE,))
-        self.assertEqual(verdict, 'findings')
-        self.assertEqual(summary, 'Two defects remain.')
+        review = cr.read_review(FINDINGS, (WORKTREE,))
+        findings = review.findings
+        self.assertEqual(review.text, 'Two defects remain.')
         self.assertEqual([(f.priority, f.path, f.start, f.end) for f in findings],
                          [('P1', 'src/service.py', 5388, 5389), ('P3', 'src/worker.py', 45, 45)])
         self.assertEqual(findings[0].text, 'The resume command opens the gate.\nA later tick treats it as known.')
         self.assertIn('[AGENTS.md:56](AGENTS.md#L56)', findings[1].text)
 
     def test_repeated_final_block_is_deduplicated(self):
-        _, _, findings = cr.parse_review(FINDINGS + '\n' + FINDINGS, (WORKTREE,))
-        self.assertEqual(len(findings), 2)
+        review = cr.read_review(FINDINGS + '\n' + FINDINGS, (WORKTREE,))
+        self.assertEqual(len(review.findings), 2)
+        self.assertEqual(review.findings[0].text, 'The resume command opens the gate.\nA later tick treats it as known.')
 
     def test_priority_tag_without_location_still_counts_as_findings(self):
-        verdict, _, findings = cr.parse_review('One issue: [P2] the retry loop never ends.')
-        self.assertEqual((verdict, findings), ('findings', []))
-        body = cr.review_body(HEAD, verdict, '', findings, raw='One issue: [P2] the retry loop never ends.')
+        message = 'One issue: [P2] the retry loop never ends.'
+        verdict, review, _ = cr.assess(0, cr.read_events(events_jsonl(message)), message)
+        self.assertEqual((verdict, review.findings), ('findings', []))
+        body = cr.review_body(HEAD, verdict, review.text, review.findings)
         self.assertIn('[P2] the retry loop never ends.', body)
 
     def test_final_message_prefers_output_file_then_last_agent_message(self):
@@ -234,7 +255,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(cr.final_message(cr.read_events('codex\nnot json'), ''), '')
 
     def test_inline_comments_only_for_lines_in_the_diff(self):
-        _, _, findings = cr.parse_review(FINDINGS, (WORKTREE,))
+        findings = cr.read_review(FINDINGS, (WORKTREE,)).findings
         files = [{'filename': 'src/service.py', 'patch': '@@ -5380,4 +5385,6 @@\n ctx\n ctx\n+a\n+b\n+c\n ctx'}]
         comments = cr.inline_comments(findings, cr.diff_lines(files))
         self.assertEqual(comments, [{'path': 'src/service.py', 'line': 5389, 'side': 'RIGHT',
@@ -350,10 +371,10 @@ class ReviewTests(Harness):
         job, status = self.run_next()
         self.assertEqual(status, 'clean')
         post = self.github.posted[0]
-        self.assertIn(f'<!-- remote-codex-review head={HEAD} verdict=clean effort=high tests=read-only -->',
+        self.assertIn(f'<!-- remote-codex-review head={HEAD} verdict=clean effort=xhigh tests=read-only mode=full -->',
                       post['body'])
-        self.assertEqual(self.codex.calls[0][3], 'high')
-        self.assertEqual(self.codex.calls[0][2], 'main')
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh', 'xhigh'])
+        self.assertIn('git diff origin/main...HEAD', self.codex.calls[0][2])
         self.assertEqual(self.git.removed, [self.git.work / str(job.id) / 'tree'])
 
     def test_existing_marker_on_github_skips_codex(self):
@@ -432,7 +453,8 @@ class ReviewTests(Harness):
         self.github.base = 'develop'
         _, status = self.run_next()
         self.assertEqual(status, 'clean')
-        self.assertEqual((self.git.fetched[0][2], self.codex.calls[0][2]), ('develop', 'develop'))
+        self.assertEqual(self.git.fetched[0][2], 'develop')
+        self.assertIn('git diff origin/develop...HEAD', self.codex.calls[0][2])
 
     def test_base_changed_during_review_requeues_without_posting(self):
         self.deliver(pull_payload())
@@ -466,7 +488,7 @@ class ReviewTests(Harness):
             self.github.draft = True
         self.codex.during = to_draft
         _, status = self.run_next()
-        self.assertEqual((status, len(self.codex.calls), self.github.posted), ('skipped', 1, []))
+        self.assertEqual((status, len(self.codex.calls), self.github.posted), ('skipped', 2, []))
 
     def test_findings_posted_inline_and_in_body(self):
         self.codex.message = FINDINGS
@@ -485,7 +507,9 @@ class ReviewTests(Harness):
         self.deliver(pull_payload())
         _, status = self.run_next()
         self.assertEqual(status, 'failed')
-        self.assertIn(f'head={HEAD} verdict=failed effort=high', self.github.posted[0]['body'])
+        self.assertIn(f'head={HEAD} verdict=failed effort=xhigh tests=read-only mode=full -->',
+                      self.github.posted[0]['body'])
+        self.assertEqual(len(self.codex.calls), 1)
         self.assertIn('not a pass', self.github.posted[0]['body'])
 
     def test_codex_timeout_posts_failed_marker(self):
@@ -505,7 +529,7 @@ class ReviewTests(Harness):
         self.assertIn(f'`$CODEX_REVIEW_STATE_DIR/output/{job.id}.log`', self.github.posted[0]['body'])
 
     def test_truncated_body_points_to_kept_full_text(self):
-        self.codex.message = ('Summary.\n\n- [P2] Long finding — src/app.py:1\n'
+        self.codex.message = ('Summary.\n\n- [P2] Long finding — src/app.py:1\n  Confidence: 90\n'
                               + '  detail\n' * 10000 + '  END-OF-TEXT')
         self.deliver(pull_payload())
         job, status = self.run_next()
@@ -620,8 +644,14 @@ class EffortTests(unittest.TestCase):
             harness.git.files = ['docs/wiki/a.md']
             harness.deliver(pull_payload())
             harness.run_next()
-            self.assertEqual(harness.codex.calls[0][3], 'medium')
-            self.assertIn('verdict=clean effort=medium tests=read-only -->', harness.github.posted[0]['body'])
+            harness.github.heads[7] = NEW_HEAD
+            harness.git.head = NEW_HEAD
+            harness.git.delta_files = ['docs/wiki/a.md']
+            harness.deliver(pull_payload(head=NEW_HEAD), guid='d-2')
+            harness.run_next()
+            self.assertEqual([call[3] for call in harness.codex.calls], ['xhigh', 'xhigh', 'medium'])
+            self.assertIn('verdict=clean effort=medium tests=read-only mode=delta -->',
+                          harness.github.posted[1]['body'])
         finally:
             harness.tearDown()
 
@@ -653,15 +683,16 @@ class ReadOnlyTests(unittest.TestCase):
             body = harness.github.posted[0]['body']
         finally:
             harness.tearDown()
-        self.assertIn('verdict=clean effort=high tests=read-only -->', body)
+        self.assertIn('verdict=clean effort=xhigh tests=read-only mode=full -->', body)
         self.assertIn('Read-only review', body)
         self.assertEqual(cr.MARKER_RE.search(body).group(1), HEAD)
 
     def test_command_is_read_only_and_forbids_tests(self):
-        command = cr.CodexRunner('codex').command('main', '/w/last.txt', 'high')
+        sections = cr.first_prompt('main', cr.LENSES[0][1])
+        command = cr.CodexRunner('codex').command(sections, '/w/last.txt', 'high')
         self.assertEqual(command, ['codex', 'exec', '--json', '--sandbox', 'read-only',
                                    '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
-                                   'review', cr.review_prompt('main'), '-o', '/w/last.txt'])
+                                   'review', cr.review_prompt(sections), '-o', '/w/last.txt'])
         self.assertNotIn('--base', command)
         prompt = command[-3]
         self.assertIn('git diff origin/main...HEAD', prompt)
@@ -680,7 +711,7 @@ class GitHubClientTests(unittest.TestCase):
                 raise cr.GitHubError(422, 'Line could not be resolved')
             return 200, {'id': 11}, ''
         github = cr.GitHub(config(), transport=transport, jwt_factory=lambda: 'jwt')
-        body = cr.review_body(HEAD, 'findings', '', cr.parse_review(FINDINGS, (WORKTREE,))[2])
+        body = cr.review_body(HEAD, 'findings', '', cr.read_review(FINDINGS, (WORKTREE,)).findings)
         result = github.post_review(REPO, 7, HEAD, body, [{'path': 'x', 'line': 1, 'body': 'b'}], 't')
         self.assertEqual(result, (11, 0))
         self.assertEqual(len(calls), 2)
@@ -690,12 +721,12 @@ class GitHubClientTests(unittest.TestCase):
 
     def test_marker_only_counts_from_this_app(self):
         reviews = [{'user': {'login': 'someone'}, 'id': 1,
-                    'body': cr.MARKER.format(head=HEAD, verdict='clean', effort='', tests='')},
+                    'body': cr.MARKER.format(head=HEAD, verdict='clean', effort='', tests='', mode='')},
                    {'user': {'login': 'Remote-Review[bot]'}, 'id': 2,
-                    'body': cr.MARKER.format(head=NEW_HEAD, verdict='clean', effort=' effort=high', tests='')},
+                    'body': cr.MARKER.format(head=NEW_HEAD, verdict='clean', effort=' effort=high', tests='', mode='')},
                    {'user': {'login': 'remote-review[bot]'}, 'id': 3,
                     'body': cr.MARKER.format(head=HEAD, verdict='findings', effort=' effort=medium',
-                                             tests=' tests=read-only')}]
+                                             tests=' tests=read-only', mode=' mode=delta')}]
 
         def transport(method, url, token, body):
             return 200, ({'slug': 'remote-review'} if url.endswith('/app') else reviews), ''

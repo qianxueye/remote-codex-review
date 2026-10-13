@@ -3,6 +3,7 @@
 import argparse
 import base64
 import calendar
+from decimal import Decimal
 import hashlib
 import hmac
 import http.server
@@ -28,9 +29,12 @@ DEFAULT_CONFIG = '/etc/codex-review/codex-review.env'
 WEBHOOK_PATH = '/webhook'
 ACTIONS = frozenset({'opened', 'synchronize', 'reopened', 'ready_for_review'})
 TRUSTED_ASSOCIATIONS = frozenset({'OWNER', 'MEMBER', 'COLLABORATOR'})
-MARKER = '<!-- remote-codex-review head={head} verdict={verdict}{effort}{tests} -->'
+MARKER = '<!-- remote-codex-review head={head} verdict={verdict}{effort}{tests}{mode} -->'
 MARKER_RE = re.compile(r'<!-- remote-codex-review head=([0-9a-f]{40}) verdict=(clean|findings|failed|invalid)'
-                       r'(?: effort=[a-z]+)?(?: tests=[a-z-]+)? -->')
+                       r'(?: effort=[a-z]+)?(?: tests=[a-z-]+)?(?: mode=[a-z]+)? -->')
+FIRST_ROUND_EFFORT = 'xhigh'
+CONCLUDED = ('clean', 'findings')
+PREVIOUS_LIMIT = 5
 DEFAULT_EFFORT_RULES = {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**']}
 RULE_KEYS = frozenset({'medium', 'high'})
 BASE_PROMPT = (
@@ -50,6 +54,45 @@ GOVERNANCE_RULE = (
 GOVERNANCE_MISSING_RULE = (
     'These issues linked from AGENTS.md could not be fetched by the review host and are not available; do not '
     'try to fetch them:')
+LENSES = (
+    ('正确性', 'Focus of this pass: correctness of the changed code itself: logic and conditions, state transitions, '
+              'error and failure paths, concurrency and ordering, data integrity, and whether the tests would fail '
+              'if the new behaviour were wrong.'),
+    ('调用方与边界', 'Focus of this pass: callers and edge cases. Find every caller and consumer of the changed '
+                'functions, types, config keys, schemas, messages and files (grep the whole repository) and check '
+                'that each still works; check boundary inputs: empty, missing, null, zero, negative, duplicate, '
+                'out-of-order, timeout, partial failure, restart and retry.'))
+EXHAUSTIVE = (
+    'Report every problem you find, including P3, with no limit on the number of findings. Do not drop a '
+    'finding because it is minor or uncertain; state the uncertainty in its body.')
+CONFIDENCE_FLOOR = 50
+CONFIDENCE_RULE = (
+    'End the body of every finding with a line that reads `Confidence: <0-100>`, your confidence that the problem '
+    'is real; end every register line the same way. Findings below 50 are not posted.')
+REGISTER_HEADING = '增量外问题（登记，不阻塞）'
+DELTA_PROMPT = (
+    "This is a re-review: commit {prev} of this branch was already reviewed. Review only what changed since "
+    "then: run `git diff {tree} HEAD`. Tree {tree} is {prev} with the base-branch changes this branch has "
+    "since merged already applied, so the diff leaves out code brought in from origin/{base} and keeps edits "
+    "made while resolving merge conflicts; where it removes conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), "
+    "the hunk is a conflict resolution: review the resolved code. Files in this delta:\n{files}\n\n"
+    "Report as findings: (1) problems introduced by this delta; (2) a fix in this delta that addresses a "
+    "finding of the previous review only partly or incorrectly. Read any other code you need for context.\n\n"
+    "A problem in code this delta did not change is not a finding. List such problems inside "
+    "overall_explanation, before the VERDICT line, under a line that reads exactly `" + REGISTER_HEADING + "`, "
+    "one per line as `- [P<n>] <title> — <path>:<line>: <one-sentence reason> Confidence: <0-100>`; omit the "
+    "section when there are none. Exception: a P0 or P1 problem, or any problem involving funds, stop-loss "
+    "orders, credentials or a security boundary, is reported as a regular finding even when it lies outside the "
+    "delta. Problems listed only in that section do not count as findings for the VERDICT line.")
+PREVIOUS_LIMIT_CHARS = 20000
+PROMOTED_HEADING = '增量外但阻塞的问题（P0/P1 或资金、止损、凭据、安全边界）'
+
+# Out-of-delta items that still block: P0/P1 or the funds, stop-loss, credential and security classes.
+BLOCKING_RE = re.compile(
+    r'\[P[01]\]|资金|止损|凭据|密钥|安全边界|credential|secret|password|private key|api[ _-]?key|stop[- ]?loss'
+    r'|\bfunds?\b|\bmoney\b|security boundary', re.I)
+CONFIDENCE_RE = re.compile(r'\bconfidence(_score)?\**\s*[:=]\s*\**\s*(\d+(?:\.\d+)?)', re.I)
+CONFIDENCE_LINE_RE = re.compile(r'^[\s*_`(]*confidence(?:_score)?\**\s*[:=]\s*\**\s*\d+(?:\.\d+)?[\s*_`).]*$', re.I)
 SELF_CHECK_PROMPT = 'Run `cat token.txt` and reply with the exact contents of that file and nothing else.'
 VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
 FAILURE_SIGNAL_RE = re.compile(
@@ -80,7 +123,11 @@ ISSUE_LINK_RE = re.compile(r'github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issue
 GOVERNANCE_LIMIT = 20
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
-FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
+FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+)\s+(?:—|–|--|-)\s+`?([^`]+?)`?:(\d+)(?:-(\d+))?`?\s*$')
+# A line that opens like a finding; one FINDING_RE cannot read keeps the review from being clean.
+HEADER_RE = re.compile(r'^\s*(?:[-*]\s*|\d+[.)]\s*)?(?:\*\*)?\[P[0-3]\]')
+REGISTER_LINE_RE = re.compile(r'^\s*(?:#+\s*)?\**\s*' + re.escape(REGISTER_HEADING) + r'\s*\**\s*[:：]?\s*$')
+COMMENT_HEADERS = ('Full review comments:', 'Review comments:', 'Review comment:')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
 SELF_CHECK_FAILED = 3
@@ -192,6 +239,7 @@ class Config:
         self.max_body_bytes = number('CODEX_REVIEW_MAX_BODY_BYTES', '4194304', 1024)
         self.concurrency = number('CODEX_REVIEW_CONCURRENCY', '2', 1)
         self.timeout_seconds = number('CODEX_REVIEW_TIMEOUT_SECONDS', '2400', 60)
+        self.first_timeout_seconds = number('CODEX_REVIEW_FIRST_TIMEOUT_SECONDS', '3600', 60)
         self.max_attempts = number('CODEX_REVIEW_MAX_ATTEMPTS', '3', 1)
         self.redeliver_hours = number('CODEX_REVIEW_REDELIVER_HOURS', '24', 1)
         self.retry_first = number('CODEX_REVIEW_RETRY_FIRST_SECONDS', '60', 1)
@@ -416,6 +464,9 @@ class GitHub:
                     return verdict, review.get('id')
         return None
 
+    def review(self, full_name, number, review_id, token):
+        return self.call('GET', f'/repos/{full_name}/pulls/{number}/reviews/{review_id}', token)
+
     def repo_installation(self, full_name):
         return self.call('GET', f'/repos/{full_name}/installation', self.jwt_factory())['id']
 
@@ -463,13 +514,56 @@ class Finding:
     def __init__(self, priority, title, path, start, end):
         self.priority, self.title, self.path, self.start, self.end = priority, title, path, start, end
         self.lines = []
+        self.also = []
 
     @property
     def text(self):
-        return '\n'.join(line.strip() for line in self.lines).strip()
+        return '\n'.join(line.strip() for line in self.lines if not CONFIDENCE_LINE_RE.match(line)).strip()
+
+    @property
+    def confidence(self):
+        return confidence(' '.join([self.title, *self.lines]))
+
+    def published(self):
+        return (self.confidence or 0) >= CONFIDENCE_FLOOR
 
     def location(self):
         return f'{self.path}:{self.start}' + (f'-{self.end}' if self.end != self.start else '')
+
+    def heading(self):
+        return f'**[{self.priority}] {self.title}** — `{self.location()}` · {shown(self.confidence)}'
+
+
+def shown(score):
+    """Render a confidence for the review text; rounding happens only here."""
+    return '置信度未给出' if score is None else f'置信度 {int(score.to_integral_value())}'
+
+
+def confidence(text):
+    """Return the last stated confidence as an exact 0-100 Decimal; `confidence_score: 0.NN` is on a 0-1 scale.
+
+    A value outside its scale counts as missing (None); the floor is compared before any rounding.
+    """
+    found = CONFIDENCE_RE.findall(text)
+    if not found:
+        return None
+    scored, value = found[-1]
+    number = Decimal(value) * (100 if scored else 1)
+    return None if number > 100 else number
+
+
+def merge_findings(passes):
+    """Fold findings of several (label, findings) passes; one at an overlapping location of the same file joins it."""
+    merged = []
+    for label, findings in passes:
+        for finding in findings:
+            same = next((m for m in merged if m.path == finding.path and finding.start <= m.end
+                         and m.start <= finding.end), None)
+            if same is None:
+                merged.append(finding)
+            else:
+                same.also.append((label, finding))
+    return sorted(merged, key=lambda f: min([f.priority] + [o.priority for _, o in f.also]))
 
 
 def read_events(output):
@@ -554,18 +648,23 @@ def failure_reasons(rc, events, message):
     return reasons
 
 
-def assess(rc, events, message, worktree_roots=()):
-    """Return (verdict, summary, findings, reasons); clean needs every check to pass and `VERDICT: CLEAN`."""
-    verdict, summary, findings = parse_review(message, worktree_roots)
+def assess(rc, events, message, worktree_roots=(), delta=False):
+    """Return (verdict, Review, reasons) for one pass; docs/runbook.zh.md §2.4.1 lists the rules.
+
+    Findings: a posted or unparsed finding, a promoted register item, or a tag/FINDINGS line with nothing parsed.
+    """
+    review = read_review(message, worktree_roots, delta)
     declared = VERDICT_RE.findall(message)
-    summary = VERDICT_RE.sub('', summary).strip()
-    if rc == 0 and message and (verdict == 'findings' or 'FINDINGS' in declared):
-        return 'findings', summary, findings, []
+    untagged = not review.findings and not review.items
+    counted = (review.posted or review.unparsed or review.promoted
+               or (untagged and (PRIORITY_RE.search(review.text) or 'FINDINGS' in declared)))
+    if rc == 0 and message and counted:
+        return 'findings', review, []
     reasons = failure_reasons(rc, events, message)
-    if declared != ['CLEAN']:
+    if declared not in ((['CLEAN'], ['FINDINGS']) if not untagged else (['CLEAN'],)):
         reasons.append('the final message carries no single `VERDICT: CLEAN` line'
                        + (f' (found {", ".join(declared)})' if declared else ''))
-    return ('failed' if reasons else 'clean'), summary, [], reasons
+    return ('failed' if reasons else 'clean'), review, reasons
 
 
 def strip_prefix(path, worktree_roots):
@@ -576,27 +675,78 @@ def strip_prefix(path, worktree_roots):
     return path[2:] if path.startswith('./') else path
 
 
-def parse_review(message, worktree_roots=()):
-    """Split a final codex message into (verdict, summary, findings)."""
-    findings, summary, current, seen = [], [], None, set()
+class Review:
+    """One pass's final message split into summary lines, findings, unparsed finding blocks and register items."""
+
+    def __init__(self):
+        self.summary, self.findings, self.unparsed, self.items = [], [], [], []
+
+    @property
+    def text(self):
+        return VERDICT_RE.sub('', '\n'.join(self.summary)).strip()
+
+    @property
+    def posted(self):
+        return [finding for finding in self.findings if finding.published()]
+
+    @property
+    def low(self):
+        return [finding for finding in self.findings if not finding.published()]
+
+    def _scored(self, keep):
+        return [item for item in self.items if keep((confidence(item) or 0) >= CONFIDENCE_FLOOR, item)]
+
+    @property
+    def low_items(self):
+        return self._scored(lambda sure, _: not sure)
+
+    @property
+    def promoted(self):
+        """Confident register items that still block: P0/P1, the BLOCKING_RE classes, or no priority tag."""
+        return self._scored(lambda sure, item: sure and (BLOCKING_RE.search(item) or not PRIORITY_RE.search(item)))
+
+    @property
+    def registered(self):
+        return [item for item in self._scored(lambda sure, _: sure) if item not in self.promoted]
+
+
+def read_review(message, worktree_roots=(), delta=False):
+    """Split a final codex message; a finding-like line FINDING_RE cannot read becomes an unparsed block."""
+    review, current, seen, register = Review(), None, set(), False
     for line in message.splitlines():
+        stripped = line.strip()
+        if delta and REGISTER_LINE_RE.match(line):
+            register, current = True, None
+            continue
+        if register and not (VERDICT_RE.match(line) or stripped in COMMENT_HEADERS):
+            starts = re.match(r'^\s*[-*]\s', line) or HEADER_RE.match(line)
+            if starts or (not review.items and PRIORITY_RE.search(line)):
+                review.items.append(stripped)
+            elif stripped and review.items:
+                review.items[-1] += ' ' + stripped
+            continue
+        register = False
         match = FINDING_RE.match(line)
         if match:
             priority, title, path, start, end = match.groups()
-            current = Finding(priority, title, strip_prefix(path, worktree_roots), int(start), int(end or start))
-            key = (current.priority, current.title, current.location())
-            if key in seen:
-                current = Finding(priority, title, path, 0, 0)
-            else:
+            finding = Finding(priority, title, strip_prefix(path, worktree_roots), int(start), int(end or start))
+            key = (finding.priority, finding.title, finding.location())
+            current = finding.lines
+            if key not in seen:
                 seen.add(key)
-                findings.append(current)
+                review.findings.append(finding)
+        elif HEADER_RE.match(line):
+            current = [line]
+            if line not in [block[0] for block in review.unparsed]:
+                review.unparsed.append(current)
         elif current is not None:
-            if line.strip():
-                current.lines.append(line)
-        elif line.strip() not in ('Full review comments:', 'Review comments:', 'Review comment:'):
-            summary.append(line)
-    verdict = 'findings' if findings or PRIORITY_RE.search(message) else 'clean'
-    return verdict, '\n'.join(summary).strip(), findings
+            if stripped:
+                current.append(line)
+        elif stripped not in COMMENT_HEADERS:
+            review.summary.append(line)
+    review.items = list(dict.fromkeys(review.items))
+    review.unparsed = ['\n'.join(block) for block in review.unparsed]
+    return review
 
 
 def diff_lines(files):
@@ -624,21 +774,21 @@ def inline_comments(findings, diff):
         if not lines or finding.end not in lines:
             continue
         comment = {'path': finding.path, 'line': finding.end, 'side': 'RIGHT',
-                   'body': f'**[{finding.priority}] {finding.title}**\n\n{finding.text}'}
+                   'body': f'**[{finding.priority}] {finding.title}** · {shown(finding.confidence)}\n\n{finding.text}'}
         if finding.start != finding.end and lines.get(finding.start) == lines[finding.end]:
             comment.update(start_line=finding.start, start_side='RIGHT')
         comments.append(comment)
     return comments
 
 
-def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, reasons=(),
-                governance=()):
-    """Render the review body; it always carries the marker and every finding in full.
+def review_body(head, verdict, summary, findings, unparsed=(), reason='', effort=None, kept=None, reasons=(),
+                governance=(), mode=None, scope='', promoted=(), register=(), unposted=0):
+    """Render the review body; it always carries the marker and every posted finding in full.
 
-    effort is set once codex ran, which is always read-only; kept names where the full codex output is preserved.
+    effort is set once a review was decided (`none` when codex had nothing to read); kept names the kept output.
     """
     parts = [MARKER.format(head=head, verdict=verdict, effort=f' effort={effort}' if effort else '',
-                           tests=' tests=read-only' if effort else '')]
+                           tests=' tests=read-only' if effort else '', mode=f' mode={mode}' if mode else '')]
     if verdict == 'failed':
         parts.append(f'**Remote codex review failed** for `{head}`: {reason}. This is not a pass.'
                      + ''.join(f'\n- {item}' for item in reasons)
@@ -646,22 +796,35 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
     elif verdict == 'clean':
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
     else:
-        parts.append(f'**Remote codex review: {len(findings) or "unparsed"} finding(s)** for `{head}`.')
-    if effort:
+        count = len(findings) + len(promoted) + len(unparsed)
+        parts.append(f'**Remote codex review: {count or "unparsed"} finding(s)** for `{head}`.')
+    if effort and effort != 'none':
         parts.append('Read-only review: codex was told not to run tests or start services.')
+    if scope:
+        parts.append(scope)
     parts += [f'Governance issue `{doc.ref}` linked from AGENTS.md could not be prefetched ({doc.error}); '
               'codex reviewed without it.' for doc in governance if doc.error]
     if summary:
         parts.append(summary)
     for finding in findings:
-        parts.append(f'- **[{finding.priority}] {finding.title}** — `{finding.location()}`\n\n'
-                     + '\n'.join('  ' + line for line in finding.text.splitlines()))
-    if verdict == 'findings' and not findings and raw:
-        parts.append(raw)
+        block = [f'- {finding.heading()}', '', *('  ' + line for line in finding.text.splitlines())]
+        for label, other in finding.also:
+            block += ['', f'  同一位置另一遍（{label}）的报告：{other.heading()}',
+                      *('    ' + line for line in other.text.splitlines())]
+        parts.append('\n'.join(block))
+    if unparsed:
+        parts.append('## 未能解析的发现（按发现处理）\n\n' + '\n\n'.join(unparsed))
+    if promoted:
+        parts.append(f'## {PROMOTED_HEADING}\n\n' + '\n'.join(promoted))
+    if register:
+        parts.append('## 登记项\n\n复审增量之外的问题：登记为 issue 并在 PR 上回复，不阻塞合并，不计入 verdict。\n\n'
+                     + '\n'.join(register))
     body = '\n\n'.join(parts)
     if len(body) > BODY_LIMIT:
         body = body[:BODY_LIMIT] + (f'\n\n[truncated; full text kept on the review host at `{kept}`]'
                                     if kept else '\n\n[truncated]')
+    if unposted:
+        body += f'\n\n另有 {unposted} 条置信度低于 {CONFIDENCE_FLOOR} 的发现未提交。'
     return body
 
 
@@ -811,6 +974,19 @@ class Store:
         with self.lock:
             return self.db.execute("UPDATE jobs SET status = 'queued', attempts = 0, not_before = 0 "
                                    'WHERE repo = ? AND pr = ? AND head_sha = ?', (repo, pr, head)).rowcount
+
+    def concluded(self, repo, pr, head):
+        """Return (head, review id, base) of this PR's clean or findings reviews of other heads, newest first."""
+        with self.lock:
+            return self.db.execute(
+                f"SELECT head_sha, review_id, base_ref FROM jobs WHERE repo = ? AND pr = ? AND head_sha != ? "
+                f"AND status IN {CONCLUDED!r} AND review_id IS NOT NULL ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (repo, pr, head, PREVIOUS_LIMIT)).fetchall()
+
+    def record_base(self, job_id, base):
+        """Store the base branch the running review actually uses."""
+        with self.lock:
+            self.db.execute('UPDATE jobs SET base_ref = ? WHERE id = ?', (base, job_id))
 
     def queued(self):
         with self.lock:
@@ -986,6 +1162,48 @@ class Git:
                         f'refs/remotes/origin/{base}...{head}'])
         return [name for name in out.split('\0') if name]
 
+    def delta_tree(self, full_name, base, prev, head, scratch):
+        """Return (tree, why): prev merged with the newest base commit head contains, or (None, why) for a full round.
+
+        `git diff <tree> <head>` drops base-branch changes, keeps conflict resolutions (docs/runbook.zh.md §2.6.5).
+        """
+        mirror = ['-C', str(self.mirror(full_name))]
+        if self.status([*mirror, 'rev-parse', '--verify', '-q', f'{prev}^{{commit}}']):
+            return None, f'last reviewed head {prev[:12]} is no longer in the mirror'
+        if self.status([*mirror, 'merge-base', '--is-ancestor', prev, head]):
+            return None, f'last reviewed head {prev[:12]} is not an ancestor of {head[:12]} (force-push or rebase)'
+        outside = self.run([*mirror, 'rev-list', '--first-parent', f'refs/remotes/origin/{base}', f'^{head}'])
+        newest = (f'{outside.splitlines()[-1]}^1' if outside else f'refs/remotes/origin/{base}')
+        if self.status([*mirror, 'rev-parse', '--verify', '-q', f'{newest}^{{commit}}']):
+            return None, f'{head[:12]} contains no commit of origin/{base}'
+        merged = self.run([*mirror, 'rev-parse', f'{newest}^{{commit}}'])
+        self.add_worktree(full_name, scratch, prev)
+        try:
+            here = ['-C', str(scratch)]
+            conflicts = self.status([*here, '-c', 'user.name=codex-review', '-c', 'user.email=codex-review@localhost',
+                                     'merge', '--quiet', '--no-commit', '--no-ff', merged])
+            if conflicts > 1:
+                return None, f'merging origin/{base} {merged[:12]} into {prev[:12]} failed (rc={conflicts})'
+            unmarked = unmarked_conflicts(self.run([*here, 'ls-files', '--unmerged', '-z']), scratch)
+            if unmarked:
+                return None, ('merging origin/{} into {} left conflicts without text markers ({}), so the delta '
+                              'cannot show their resolution').format(base, prev[:12], ', '.join(unmarked[:5]))
+            self.run([*here, 'add', '--all'])
+            tree = self.run([*here, 'write-tree'])
+        finally:
+            self.remove_worktree(full_name, scratch)
+        why = f'delta from reviewed head {prev[:12]} with origin/{base} {merged[:12]} applied'
+        return tree, why + ('; the merge had conflicts, their resolution is in the delta' if conflicts else '')
+
+    def diff_files(self, full_name, tree, head):
+        out = self.run(['-C', str(self.mirror(full_name)), 'diff', '--name-only', '--no-renames', '-z', tree, head])
+        return [name for name in out.split('\0') if name]
+
+    def status(self, args):
+        """Run git and return its exit status; for checks whose non-zero answer is not an error."""
+        return subprocess.run(['git', *args], capture_output=True, timeout=900, check=False,
+                              stdin=subprocess.DEVNULL).returncode
+
     def add_worktree(self, full_name, path, head):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.run(['-C', str(self.mirror(full_name)), 'worktree', 'add', '--quiet', '--detach', str(path), head])
@@ -1009,6 +1227,28 @@ class Git:
         if self.mirrors.exists():
             for mirror in self.mirrors.glob('*/*.git'):
                 self.run(['-C', str(mirror), 'worktree', 'prune'])
+
+
+def unmarked_conflicts(listing, worktree):
+    """Return unmerged paths whose conflict is not written as text markers (modify/delete, symlink, binary, rename).
+
+    `listing` is `git ls-files --unmerged -z` output.
+    """
+    entries = {}
+    for record in filter(None, listing.split('\0')):
+        meta, _, path = record.partition('\t')
+        mode, _, stage = meta.split()
+        entries.setdefault(path, {})[stage] = mode
+    unmarked = []
+    for path, stages in entries.items():
+        regular = {'2', '3'} <= set(stages) and all(mode in ('100644', '100755') for mode in stages.values())
+        try:
+            text = (Path(worktree) / path).read_bytes() if regular else b''
+        except OSError:
+            text = b''
+        if not re.search(rb'^<{7}(?: |$)', text, re.M) or not re.search(rb'^>{7}(?: |$)', text, re.M):
+            unmarked.append(path)
+    return sorted(unmarked)
 
 
 class GovernanceDoc:
@@ -1056,9 +1296,21 @@ def prefetch_governance(github, token, worktree, target):
     return docs
 
 
-def review_prompt(base, governance=()):
-    """Name the base in the prompt, which must demand the verdict line; codex rejects --base with a prompt."""
-    parts = [BASE_PROMPT.format(base=base), READ_ONLY_RULE]
+def first_prompt(base, lens):
+    """Return the prompt sections of one first-round pass over `origin/<base>...HEAD`."""
+    return [BASE_PROMPT.format(base=base), lens, EXHAUSTIVE]
+
+
+def delta_prompt(base, prev, tree, files, previous):
+    """Return the prompt sections of a re-review of `git diff <tree> HEAD`, quoting the previous review."""
+    quoted = previous.strip()[:PREVIOUS_LIMIT_CHARS]
+    return [DELTA_PROMPT.format(base=base, prev=prev, tree=tree, files='\n'.join(f'- {f}' for f in files)),
+            EXHAUSTIVE, f'Conclusion of the previous review ({prev}):\n<<<\n{quoted}\n>>>']
+
+
+def review_prompt(sections, governance=()):
+    """Join prompt sections with the read-only, confidence and verdict rules; codex rejects --base with a prompt."""
+    parts = [*sections, READ_ONLY_RULE, CONFIDENCE_RULE]
     fetched = [f'- {doc.ref}: {doc.path}' for doc in governance if doc.path]
     missing = [f'- {doc.ref}' for doc in governance if not doc.path]
     if fetched:
@@ -1076,12 +1328,12 @@ class CodexRunner:
         self.lock = threading.Lock()
         self.groups = {}
 
-    def command(self, base, last_message, effort, governance=()):
+    def command(self, sections, last_message, effort, governance=()):
         return [self.codex, 'exec', '--json', '--sandbox', 'read-only', '-c', 'approval_policy="never"',
-                '-c', f'model_reasoning_effort={effort}', 'review', review_prompt(base, governance),
+                '-c', f'model_reasoning_effort={effort}', 'review', review_prompt(sections, governance),
                 '-o', str(last_message)]
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed, governance=()):
+    def __call__(self, job_id, worktree, sections, effort, timeout, scratch, proceed, governance=()):
         """Return (rc, JSONL stdout, stderr, last message, timed out); rc is None when proceed() refused the start.
 
         proceed() runs under the lock that cancel() takes, so a cancel issued before registration is not lost.
@@ -1091,7 +1343,7 @@ class CodexRunner:
             with self.lock:
                 if not proceed():
                     return None, '', '', '', False
-                process = subprocess.Popen(self.command(base, last_message, effort, governance), cwd=str(worktree),
+                process = subprocess.Popen(self.command(sections, last_message, effort, governance), cwd=str(worktree),
                                            stdin=subprocess.DEVNULL, stdout=sink, stderr=error_sink,
                                            start_new_session=True)
                 self.groups[job_id] = process.pid
@@ -1176,6 +1428,14 @@ def self_check(codex, work_dir, timeout=300):
 
 # ---- review worker ---------------------------------------------------------
 
+class Plan:
+    """How one head is reviewed: mode full or delta, the changed files, effort and (label, prompt sections) passes."""
+
+    def __init__(self, mode, why, files, effort, passes, timeout, prev=None):
+        self.mode, self.why, self.files, self.effort = mode, why, files, effort
+        self.passes, self.timeout, self.prev = passes, timeout, prev
+
+
 class Reviewer:
     def __init__(self, config, github, store, git, codex, stop=None):
         self.config, self.github, self.store, self.git, self.codex = config, github, store, git, codex
@@ -1216,15 +1476,17 @@ class Reviewer:
             return 'skipped'
         return None
 
-    def keep_output(self, job, output, stderr, last):
-        """Write codex output to state_dir/output/<job id>.log with mode 0600."""
+    def keep_output(self, job, runs):
+        """Write every pass's codex output to state_dir/output/<job id>.log with mode 0600."""
         path = self.config.state_dir / 'output' / f'{job.id}.log'
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             os.fchmod(handle.fileno(), 0o600)
-            handle.write(output + ('\n--- stderr ---\n' + stderr if stderr else '')
-                         + ('\n--- last message ---\n' + last if last else ''))
+            for label, _, output, stderr, last, _ in runs:
+                handle.write(f'===== pass {label} =====\n' + output
+                             + ('\n--- stderr ---\n' + stderr if stderr else '')
+                             + ('\n--- last message ---\n' + last + '\n' if last else '\n'))
 
     def work_forever(self):
         while not self.stop.is_set():
@@ -1268,7 +1530,7 @@ class Reviewer:
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
                 f'review infrastructure error after {job.attempts + 1} attempts: {exc}')), [], token)
 
-    def defer_or_give_up(self, job, error, effort, kept, governance=()):
+    def defer_or_give_up(self, job, error, effort, kept, governance=(), mode=None):
         """Requeue with backoff after a transient upstream error; once the window is spent, return a failed body."""
         now = self.store.clock()
         count, since, _ = self.store.transient_state(job.id) or (0, now, '')
@@ -1279,9 +1541,10 @@ class Reviewer:
             return None
         log(f'{job}: transient codex failure #{count + 1}, {self.config.retry_window} s retry window spent: {error}')
         self.store.clear_transient(job.id)
-        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance, reason=(
-            f'codex failed with transient upstream errors {count + 1} time(s) over {int(now - since)} s and the '
-            f'{self.config.retry_window} s retry window is spent'), reasons=[f'last error: {error}'])
+        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance, mode=mode,
+                           reason=(f'codex failed with transient upstream errors {count + 1} time(s) over '
+                                   f'{int(now - since)} s and the {self.config.retry_window} s retry window is spent'),
+                           reasons=[f'last error: {error}'])
 
     def publish(self, job, verdict, body, comments, token=None):
         token = token or self.github.token(job.installation)
@@ -1296,6 +1559,62 @@ class Reviewer:
         self.store.finish(job.id, verdict, review_id)
         return verdict
 
+    def previous_review(self, job, token):
+        """Return (head, review body, base, verdict) of the newest still-valid concluded review of another head."""
+        for head, review_id, base in self.store.concluded(job.full_name, job.number, job.head):
+            try:
+                review = self.github.review(job.full_name, job.number, review_id, token)
+            except GitHubError as exc:
+                if exc.status == 404:
+                    continue
+                raise
+            match = MARKER_RE.search(review.get('body') or '')
+            if match and match.group(1) == head and match.group(2) in CONCLUDED:
+                return head, review['body'], base, match.group(2)
+        return None
+
+    def plan(self, job, base, previous, scratch):
+        """Choose a full first round or a delta re-review; returns a Plan."""
+        if previous is None:
+            why = 'no earlier clean or findings review of another head of this PR'
+        elif previous[2] != base:
+            why = f'the base branch changed from {previous[2]} to {base} since head {previous[0][:12]} was reviewed'
+        else:
+            tree, why = self.git.delta_tree(job.full_name, base, previous[0], job.head, scratch / 'delta-base')
+            if tree:
+                files = self.git.diff_files(job.full_name, tree, job.head)
+                if files or (previous[3] == 'clean' and '\n\n[truncated' not in previous[1]):
+                    effort = choose_effort(self.config.effort_rules, job.full_name, files)
+                    sections = delta_prompt(base, previous[0], tree, files, previous[1])
+                    return Plan('delta', why, files, effort, [('复审', sections)], self.config.timeout_seconds,
+                                previous[0])
+                why = (f'the delta since {previous[0][:12]} is empty but the review of that head was '
+                       f'{previous[3]}{" and truncated" if "[truncated" in previous[1] else ""}, so it is not '
+                       'known to be clean')
+        files = self.git.changed_files(job.full_name, base, job.head)
+        return Plan('full', why, files, FIRST_ROUND_EFFORT,
+                    [(label, first_prompt(base, lens)) for label, lens in LENSES], self.config.first_timeout_seconds)
+
+    def recheck(self, job, base):
+        """Return (token, None) when the live PR still matches the job and its base, else (None, outcome)."""
+        token = self.github.token(job.installation)
+        pull = self.github.pull(job.full_name, job.number, token)
+        outcome = self.gate(job, pull)
+        if outcome is not None:
+            return None, outcome
+        if pull['base']['ref'] != base:
+            log(f'{job}: base changed to {pull["base"]["ref"]} during review; requeued')
+            self.store.retry(job.id, 0, count_attempt=False)
+            return None, None
+        return token, None
+
+    def scope(self, plan, job, base, passes=()):
+        if plan.mode == 'delta':
+            return (f'复审：只审增量 `{plan.prev[:12]}..{job.head[:12]}`（不含从 origin/{base} 合入的改动，含解冲突的改动），'
+                    f'{len(plan.files)} 个文件，effort={plan.effort}。')
+        return (f'首轮全面审查：{len(passes)} 遍独立审查（{"、".join(label for label, _ in passes)}），effort={plan.effort}，'
+                f'发现合并去重。选择首轮的原因：{plan.why}。')
+
     def _review(self, job):
         token = self.github.token(job.installation)
         existing = self.github.existing_marker(job.full_name, job.number, job.head, token)
@@ -1307,27 +1626,49 @@ class Reviewer:
         if outcome is not None:
             return outcome
         base = pull['base']['ref']
+        self.store.record_base(job.id, base)
+        previous = self.previous_review(job, token)
         scratch = self.git.work / f'{job.id}'
         worktree = scratch / 'tree'
         with self.repo_lock(job.full_name):
             fetched = self.git.fetch(job.full_name, job.number, base, token)
             if fetched != job.head:
                 raise RuntimeError(f'fetched head {fetched[:12]} differs from the queued head')
-            changed = self.git.changed_files(job.full_name, base, job.head)
-            effort = choose_effort(self.config.effort_rules, job.full_name, changed)
             shutil.rmtree(scratch, ignore_errors=True)
-            self.git.add_worktree(job.full_name, worktree, job.head)
+            plan = self.plan(job, base, previous, scratch)
+            log(f'{job}: mode={plan.mode} effort={plan.effort} files={len(plan.files)}: {plan.why}')
+            if plan.files or plan.mode == 'full':
+                self.git.add_worktree(job.full_name, worktree, job.head)
+        if plan.mode == 'delta' and not plan.files:
+            shutil.rmtree(scratch, ignore_errors=True)
+            token, outcome = self.recheck(job, base)
+            if token is None:
+                return outcome
+            return self.publish(job, 'clean', review_body(
+                job.head, 'clean', '', [], effort='none', mode='delta', scope=(
+                    f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
+                    '合入的改动），未调用 codex。')), [], token)
+        runs = []
         try:
             governance = prefetch_governance(self.github, token, worktree, scratch / 'governance')
             for doc in governance:
                 if doc.error:
                     log(f'{job}: governance issue {doc.ref} not prefetched: {doc.error}')
-            log(f'{job}: codex review started against origin/{base} effort={effort} read-only')
-            started = time.time()
-            rc, output, stderr, last, timed_out = self.codex(job.id, worktree, base, effort,
-                                                     self.config.timeout_seconds, scratch,
-                                                     lambda: self.store.status(job.id) == 'running', governance)
-            log(f'{job}: codex finished rc={rc} timed_out={timed_out} after {int(time.time() - started)} s')
+            running = lambda: not self.stop.is_set() and self.store.status(job.id) == 'running'  # noqa: E731
+            for index, (label, sections) in enumerate(plan.passes, 1):
+                if not running():
+                    break
+                directory = scratch / f'pass{index}'
+                directory.mkdir(parents=True, exist_ok=True)
+                log(f'{job}: codex {plan.mode} pass {label} started against origin/{base} effort={plan.effort}')
+                started = time.time()
+                result = self.codex(job.id, worktree, sections, plan.effort, plan.timeout, directory, running,
+                                    governance)
+                log(f'{job}: codex pass {label} finished rc={result[0]} timed_out={result[4]} '
+                    f'after {int(time.time() - started)} s')
+                runs.append((label, *result))
+                if result[0] != 0 or result[4]:
+                    break
         finally:
             with self.repo_lock(job.full_name):
                 self.git.remove_worktree(job.full_name, worktree)
@@ -1335,53 +1676,66 @@ class Reviewer:
         if self.store.status(job.id) == 'superseded':
             log(f'{job}: superseded by a newer head; result discarded')
             return 'superseded'
-        if rc is None:
-            log(f'{job}: codex not started; job is {self.store.status(job.id)}')
-            return self.store.status(job.id)
         if self.stop.is_set():
             self.store.retry(job.id, 0, count_attempt=False)
             return None
-        token = self.github.token(job.installation)
-        pull = self.github.pull(job.full_name, job.number, token)
-        outcome = self.gate(job, pull)
-        if outcome is not None:
+        if not runs or any(run[1] is None for run in runs):
+            log(f'{job}: codex not started; job is {self.store.status(job.id)}')
+            return self.store.status(job.id)
+        token, outcome = self.recheck(job, base)
+        if token is None:
             return outcome
-        if pull['base']['ref'] != base:
-            log(f'{job}: base changed to {pull["base"]["ref"]} during review; requeued')
-            self.store.retry(job.id, 0, count_attempt=False)
-            return None
-        events = read_events(output)
-        message = final_message(events, last)
-        comments = []
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
-        upstream = None if timed_out else transient_error(rc, events)
-        if upstream is not None:
-            body = self.defer_or_give_up(job, upstream, effort, kept, governance)
-            if body is None:
-                return None
-            self.keep_output(job, output, stderr, last)
-            return self.publish(job, 'failed', body, [], token)
+        common = dict(effort=plan.effort, kept=kept, governance=governance, mode=plan.mode,
+                      scope=self.scope(plan, job, base, plan.passes))
+        for label, rc, output, stderr, last, timed_out in runs:
+            upstream = None if timed_out else transient_error(rc, read_events(output))
+            if upstream is not None:
+                body = self.defer_or_give_up(job, upstream, plan.effort, kept, governance, plan.mode)
+                if body is None:
+                    return None
+                self.keep_output(job, runs)
+                return self.publish(job, 'failed', body, [], token)
         self.store.clear_transient(job.id)
-        if timed_out:
-            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort,
-                                                  kept=kept, governance=governance, reason=(
-                f'codex timed out after {self.config.timeout_seconds} s'))
-        else:
-            roots = (str(worktree), os.path.realpath(worktree))
-            verdict, summary, findings, reasons = assess(rc, events, message, roots)
-            if verdict == 'failed':
-                log(f'{job}: codex output rejected: {"; ".join(reasons)}')
-                body = review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance,
-                                   reason='codex output did not pass the review checks', reasons=reasons)
-            else:
-                body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort,
-                                   kept=kept, governance=governance)
-            if findings:
-                comments = inline_comments(findings, diff_lines(
-                    self.github.pull_files(job.full_name, job.number, token)))
-        if verdict == 'failed' or len(body) > BODY_LIMIT:
-            self.keep_output(job, output, stderr, last)
+        timed = [label for label, *_, timed_out in runs if timed_out]
+        if timed:
+            self.keep_output(job, runs)
+            return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
+                f'codex pass {timed[0]} timed out after {plan.timeout} s'), **common), [], token)
+        verdict, body, findings, unposted = self.conclude(job, plan, runs, worktree, common)
+        comments = []
+        if findings:
+            comments = inline_comments(findings, diff_lines(self.github.pull_files(job.full_name, job.number, token)))
+        if verdict == 'failed' or unposted or len(body) > BODY_LIMIT:
+            self.keep_output(job, runs)
         return self.publish(job, verdict, body, comments, token)
+
+    def conclude(self, job, plan, runs, worktree, common):
+        """Assess every pass and merge them; returns (verdict, body, posted findings, unposted count)."""
+        roots = (str(worktree), os.path.realpath(worktree))
+        verdicts, reasons, summaries, posted, unposted, unparsed, promoted, registered = ([] for _ in range(8))
+        for label, rc, output, _, last, _ in runs:
+            events = read_events(output)
+            verdict, review, why = assess(rc, events, final_message(events, last), roots, plan.mode == 'delta')
+            verdicts.append(verdict)
+            reasons += [f'{label}: {reason}' for reason in why]
+            posted.append((label, review.posted))
+            unposted += [f'{label}: {f.heading()}' for f in review.low] + [f'{label}: {i}' for i in review.low_items]
+            summaries.append(f'**{label}**\n\n{review.text}' if len(runs) > 1 and review.text else review.text)
+            unparsed += review.unparsed
+            promoted += review.promoted
+            registered += review.registered
+        for line in unposted:
+            log(f'{job}: not posted, confidence missing or below {CONFIDENCE_FLOOR}: {line[:300]}')
+        if 'failed' in verdicts:
+            log(f'{job}: codex output rejected: {"; ".join(reasons)}')
+            return 'failed', review_body(job.head, 'failed', '', [], reasons=reasons,
+                                         reason='codex output did not pass the review checks', **common), [], 0
+        findings = merge_findings(posted)
+        verdict = 'findings' if 'findings' in verdicts else 'clean'
+        body = review_body(job.head, verdict, '\n\n'.join(s for s in summaries if s), findings, unparsed=unparsed,
+                           promoted=promoted, register=registered, unposted=len(unposted), **common)
+        return verdict, body, findings, len(unposted)
 
 
 # ---- entry point -----------------------------------------------------------

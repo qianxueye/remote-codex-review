@@ -28,9 +28,29 @@ def fixture(name):
         encoding='utf-8')
 
 
-def judge(stdout, last, rc=0):
+def judge_all(stdout, last, rc=0):
+    """Return assess()'s (verdict, summary, posted, unposted, reasons)."""
     events = cr.read_events(stdout)
-    return cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
+    verdict, review, reasons = cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
+    return verdict, review.text, review.posted if verdict == 'findings' else [], review.low, reasons
+
+
+def judge(stdout, last, rc=0):
+    """Return (verdict, summary, posted findings, reasons)."""
+    verdict, summary, posted, _, reasons = judge_all(stdout, last, rc)
+    return verdict, summary, posted, reasons
+
+
+def with_confidence(last, score):
+    """Append `Confidence: <score>` to every finding block of a recorded final message."""
+    out, inside = [], False
+    for line in last.splitlines():
+        if inside and not line.startswith('  '):
+            out.append(f'  Confidence: {score}')
+            inside = False
+        out.append(line)
+        inside = inside or bool(cr.FINDING_RE.match(line))
+    return '\n'.join(out + ([f'  Confidence: {score}'] if inside else [])) + '\n'
 
 
 def without(stdout, predicate):
@@ -53,20 +73,28 @@ class RealOutputTests(unittest.TestCase):
     def test_real_findings_runs_are_findings(self):
         for name in ('findings-tests', 'findings-ro'):
             with self.subTest(name):
-                verdict, _, findings, _ = judge(*fixture(name))
+                stdout, last = fixture(name)
+                verdict, _, findings, _ = judge(stdout, with_confidence(last, 80))
                 self.assertEqual(verdict, 'findings')
                 self.assertEqual([(f.priority, f.path, f.start) for f in findings],
                                  [('P2', 'paging.py', 8), ('P2', 'paging.py', 9)])
 
     def test_real_single_finding_read_only_run_drops_the_block_header(self):
         last = (FIXTURES / 'findings-ro-single.last').read_text(encoding='utf-8')
-        verdict, summary, findings, _ = judge(fixture('findings-ro')[0], last)
+        verdict, summary, findings, _ = judge(fixture('findings-ro')[0], with_confidence(last, 50))
         self.assertEqual(verdict, 'findings')
         self.assertEqual([(f.priority, f.title, f.path, f.start, f.end) for f in findings],
                          [('P2', 'Correct both pagination slice bounds', 'paging.py', 8, 9)])
         self.assertIn('page([0, 1, 2, 3, 4], 0, 2)', findings[0].text)
         self.assertNotIn('Review comment', summary)
         self.assertNotIn('VERDICT', summary)
+
+    def test_real_findings_without_confidence_are_not_posted_and_the_run_is_clean(self):
+        for name in ('findings-tests', 'findings-ro'):
+            with self.subTest(name):
+                verdict, _, posted, unposted, reasons = judge_all(*fixture(name))
+                self.assertEqual((verdict, posted, reasons), ('clean', [], []))
+                self.assertEqual([(f.priority, f.confidence) for f in unposted], [('P2', None), ('P2', None)])
 
     def test_real_run_without_code_mode_host_is_failed(self):
         verdict, _, findings, reasons = judge(*fixture('broken-tests'))
@@ -78,7 +106,7 @@ class RealOutputTests(unittest.TestCase):
 
     def test_incident_message_with_no_priority_tag_is_failed_not_clean(self):
         stdout, _ = fixture('clean-ro')
-        self.assertEqual(cr.parse_review(INCIDENT_MESSAGE)[0], 'clean')
+        self.assertEqual((cr.read_review(INCIDENT_MESSAGE).findings, cr.read_review(INCIDENT_MESSAGE).unparsed), ([], []))
         verdict, _, _, reasons = judge(stdout, INCIDENT_MESSAGE)
         self.assertEqual(verdict, 'failed')
         self.assertTrue(any('reports a failure' in reason for reason in reasons))
@@ -423,7 +451,7 @@ class FakeTransport:
 
 class InvalidateTests(unittest.TestCase):
     def review(self, login='remote-review[bot]', verdict='clean'):
-        marker = cr.MARKER.format(head=HEAD, verdict=verdict, effort=' effort=high', tests=' tests=read-only')
+        marker = cr.MARKER.format(head=HEAD, verdict=verdict, effort=' effort=high', tests=' tests=read-only', mode='')
         return {'id': 5, 'user': {'login': login}, 'body': f'{marker}\n\n**Remote codex review: no findings**'}
 
     def test_rewrites_body_and_marks_verdict_invalid(self):
@@ -445,14 +473,14 @@ class InvalidateTests(unittest.TestCase):
 
     def test_invalid_marker_does_not_count_as_reviewed(self):
         reviews = [{'user': {'login': 'remote-review[bot]'}, 'id': 3,
-                    'body': cr.MARKER.format(head=HEAD, verdict='invalid', effort='', tests='')}]
+                    'body': cr.MARKER.format(head=HEAD, verdict='invalid', effort='', tests='', mode='')}]
 
         def transport(method, url, token, body):
             return 200, ({'slug': 'remote-review'} if url.endswith('/app') else reviews), ''
         github = cr.GitHub(config(), transport=transport, jwt_factory=lambda: 'jwt')
         self.assertIsNone(github.existing_marker(REPO, 7, HEAD, 't'))
         reviews.append({'user': {'login': 'remote-review[bot]'}, 'id': 4,
-                        'body': cr.MARKER.format(head=HEAD, verdict='clean', effort='', tests='')})
+                        'body': cr.MARKER.format(head=HEAD, verdict='clean', effort='', tests='', mode='')})
         self.assertEqual(github.existing_marker(REPO, 7, HEAD, 't'), ('clean', 4))
 
 
@@ -504,7 +532,8 @@ class EnqueueTests(Harness):
         self.github.markers[(7, HEAD)] = None
         self.store.force_enqueue(REPO, 7, HEAD, 'main', 99)
         self.assertEqual(self.run_next()[1], 'clean')
-        self.assertEqual(len(self.codex.calls), 1)
+        self.assertEqual(len(self.codex.calls), 2)
+        self.assertIn('mode=full -->', self.github.posted[-1]['body'])
 
 
 FAKE_CODEX = '''#!{python}
