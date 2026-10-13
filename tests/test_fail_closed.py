@@ -113,6 +113,24 @@ class SingleConditionTests(unittest.TestCase):
         self.assertNotIn('git diff', stdout)
         self.assert_failed(judge(stdout, self.last), 'ran `git diff` or `git show`')
 
+    def test_only_a_real_git_diff_or_show_subcommand_is_evidence(self):
+        accepted = ("/usr/bin/bash -lc 'git diff origin/main...HEAD'", 'git diff', '/usr/bin/git show HEAD:x',
+                    '/bin/zsh -lc "cd a && git -c core.pager=cat diff --stat"', 'git -C /x --no-pager show HEAD',
+                    "bash -lc 'git status; git diff'")
+        rejected = ("bash -lc 'git show-ref'", "bash -lc 'git config --get diff.algorithm'", "bash -lc 'git difftool'",
+                    "bash -lc 'git diff-tree HEAD'", "bash -lc 'git showx'", "bash -lc 'git log --format=diff'",
+                    "bash -lc 'git config diff.renames'", "bash -lc 'rg \"git diff\" docs'",
+                    "bash -lc 'echo git diff'", "bash -lc 'mygit diff'")
+        for command in accepted + rejected:
+            with self.subTest(command):
+                event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': command,
+                                                            'exit_code': 0, 'status': 'completed'}}
+                self.assertEqual(len(cr.diff_commands([event])), int(command in accepted))
+        stdout = without(self.stdout, is_command)
+        lone = {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': "bash -lc 'git show-ref'",
+                                                   'aggregated_output': '', 'exit_code': 0, 'status': 'completed'}}
+        self.assert_failed(judge(json.dumps(lone) + '\n' + stdout, self.last), 'ran `git diff` or `git show`')
+
     def test_error_item(self):
         error = {'type': 'item.completed', 'item': {'id': 'e', 'type': 'error', 'message': 'Code Mode is off'}}
         self.assert_failed(judge(json.dumps(error) + '\n' + self.stdout, self.last), 'error item: Code Mode is off')
@@ -136,7 +154,10 @@ class SingleConditionTests(unittest.TestCase):
         for text in ('Review blocked: the execution tool failed.',
                      'The correctness verdict is an unverified placeholder.',
                      'Unable to review or verify correctness.', 'The sandbox was blocked.',
-                     'Codex failed to read the diff.', '审查中断：未能读取 diff。', '我无法读取仓库。'):
+                     'Codex failed to read the diff.', '审查中断：未能读取 diff。', '我无法读取仓库。',
+                     '本次审查无法读取文件，因此无法完成审查。',
+                     'The reviewer was unable to read the files, so the review is incomplete.',
+                     'I could not complete the review.', 'The review was incomplete.', '审查未完成。'):
             with self.subTest(text):
                 self.assert_failed(judge(self.stdout, text + '\nVERDICT: CLEAN'), 'reports a failure')
 
