@@ -166,6 +166,16 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 
 `CODEX_REVIEW_CONCURRENCY` 是同时运行的 codex 审查数。按「单个审查的内存峰值 × N ≤ 可用内存的 70%」取 N，上限 6，并且 N × 峰值要低于单元的 `MemoryMax=3G`。峰值的测法：用 `systemd-run` 以服务账号和同样的加固参数运行一次审查，每 0.5 秒读取该临时单元 cgroup 的 `memory.current`，取最大值；可用内存取 `free -m` 的 available 列。只读审查不运行测试，峰值主要是 codex 进程本身。
 
+#### 2.6.4 治理 issue 预取
+
+被审仓库根目录的 `AGENTS.md` 可能要求先读某些 GitHub issue，而 codex 的只读沙箱不能访问网络。因此服务在启动 codex 之前代为读取：
+
+- 从工作树的 `AGENTS.md` 中找出所有 `github.com/<owner>/<repo>/issues/<n>` 链接，去重后最多取 20 个；没有 `AGENTS.md` 或其中没有链接时跳过这一步。
+- 用本仓库的 installation token 调 `GET /repos/<owner>/<repo>/issues/<n>`，把标题和正文写到 `work/<任务 id>/governance/<owner>-<repo>-<n>.md`（权限 0444）。该目录在工作树之外，随任务目录一起删除。请求地址只由链接中匹配到的 owner、repo 和编号拼成，令牌只发往 `api.github.com`。
+- 提示中列出每个 issue 对应的文件路径，并要求 codex 读取这些文件，不要从网络获取。
+- 某个 issue 读取失败（403、404、网络错误等）时，审查照常进行：提示中把它列为不可用，发布的 review 正文写明 `Governance issue <owner>/<repo>#<n> linked from AGENTS.md could not be prefetched (<错误>)`，日志另记一行。结论仍按 §2.4.1 判定；codex 在最终消息中写「未能读取」之类的话时照样判 `failed`。
+- App 没有 `issues: read` 权限时，每次读取都会得到 403。补授权限的步骤见 §4.1。
+
 ### 2.7 为什么用常驻服务
 
 webhook 需要一个一直在监听的进程。队列、并发上限和「新 head 终止旧审查」也需要同一个进程掌握正在运行的 codex 进程组。因此用一个常驻的 `codex-review.service`，不用 timer。
@@ -221,9 +231,10 @@ bash /root/remote-codex-review/deploy/install.sh
 
 manifest 是 `deploy/app-manifest.json`：
 
-- 权限：`contents: read`、`metadata: read`、`pull_requests: write`；
+- 权限：`contents: read`、`issues: read`、`metadata: read`、`pull_requests: write`。`issues: read` 用于 §2.6.4 的治理 issue 预取；
 - 订阅事件：`pull_request`；
 - `url`、`hook_attributes.url` 和 `redirect_url` 使用占位值 `<owner>` 和 `review.example.com`，创建前改成实际值；
+- 已经创建的 App 不会因为 manifest 改动而自动获得新权限。缺少 `issues: read` 时，由 App 所有者在 GitHub 上操作：打开 `https://github.com/settings/apps/<slug>/permissions`，在 Repository permissions 中把 Issues 设为 Read-only 并保存；然后在每个白名单账户的安装页（`https://github.com/settings/installations/<安装 id>`，组织账户在组织设置中）接受新的权限请求。接受之前，治理 issue 预取一律按「未能预取」处理；
 - `public: true`：App 要安装到白名单中的每个账户，设为「仅本账户」的 App 无法安装到另一个账户。其他人即使安装了这个 App，他们的事件也会被 §2.2.1 的账户校验挡掉。
 
 创建链接的用法：在本机新建一个 HTML 文件，用浏览器打开后点击按钮。表单把 manifest 提交到 `https://github.com/settings/apps/new`，App 会建在当前登录账户名下：
