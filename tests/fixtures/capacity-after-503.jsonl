@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a133d9-423f-7d32-951e-8c4a656f51a4"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 2/5 (unexpected status 503 Service Unavailable: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists.)"}
+{"type":"error","message":"Reconnecting... 3/5 (unexpected status 503 Service Unavailable: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists.)"}
+{"type":"error","message":"Selected model is at capacity. Please try a different model."}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Review was interrupted. Please re-run /review and wait for it to complete."}}
+{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}

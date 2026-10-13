@@ -1,0 +1,2 @@
+Unable to review or verify correctness: running `git diff origin/main...HEAD` failed because `/usr/local/bin/codex-code-mode-host` was missing. The correctness verdict is an unverified placeholder.
+VERDICT: BLOCKED

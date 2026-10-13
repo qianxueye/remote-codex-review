@@ -23,7 +23,19 @@ SECRET = b'webhook-secret'
 REPO = 'Example-Org/Example-Repo'
 WORKTREE = '/var/lib/codex-review/work/7/tree'
 
-CLEAN = 'The change is consistent with its callers; no defects found.'
+CLEAN = 'The change is consistent with its callers; no defects found.\nVERDICT: CLEAN'
+
+
+def events_jsonl(message, read=True):
+    """Return a minimal `codex exec --json` stream: one successful command, the message, a completed turn."""
+    events = [{'type': 'thread.started', 'thread_id': 't-1'}, {'type': 'turn.started'}]
+    if read:
+        events.append({'type': 'item.completed', 'item': {
+            'id': 'item_0', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff origin/main...HEAD'",
+            'aggregated_output': 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n', 'exit_code': 0, 'status': 'completed'}})
+    events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
+    events.append({'type': 'turn.completed', 'usage': {}})
+    return '\n'.join(json.dumps(event) for event in events) + '\n'
 FINDINGS = f"""Two defects remain.
 
 Full review comments:
@@ -125,17 +137,19 @@ class FakeGit:
 class FakeCodex:
     def __init__(self, message='', rc=0, timed_out=False, during=None):
         self.message, self.rc, self.timed_out, self.during = message, rc, timed_out, during
+        self.events = None
         self.calls = []
         self.cancelled = []
 
-    def __call__(self, job_id, worktree, base, effort, tier, timeout, scratch, proceed):
+    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed):
         if not proceed():
-            return None, '', '', False
-        self.calls.append((job_id, worktree, base, effort, tier))
+            return None, '', '', '', False
+        self.calls.append((job_id, worktree, base, effort))
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))
-        return self.rc, 'progress\ncodex\n' + message, message, self.timed_out
+        events = self.events if self.events is not None else events_jsonl(message)
+        return self.rc, events, 'progress\n', message, self.timed_out
 
     def cancel(self, job_ids):
         self.cancelled.extend(job_ids)
@@ -194,10 +208,11 @@ class ParseTests(unittest.TestCase):
         body = cr.review_body(HEAD, verdict, '', findings, raw='One issue: [P2] the retry loop never ends.')
         self.assertIn('[P2] the retry loop never ends.', body)
 
-    def test_final_message_prefers_output_file_then_last_codex_line(self):
-        self.assertEqual(cr.final_message('codex\nold\ncodex\nnew', ''), 'new')
-        self.assertEqual(cr.final_message('codex\nfrom stdout', 'from -o file\n'), 'from -o file')
-        self.assertEqual(cr.final_message('no marker here', ''), '')
+    def test_final_message_prefers_output_file_then_last_agent_message(self):
+        events = cr.read_events(events_jsonl('old') + events_jsonl('new'))
+        self.assertEqual(cr.final_message(events, ''), 'new')
+        self.assertEqual(cr.final_message(events, 'from -o file\n'), 'from -o file')
+        self.assertEqual(cr.final_message(cr.read_events('codex\nnot json'), ''), '')
 
     def test_inline_comments_only_for_lines_in_the_diff(self):
         _, _, findings = cr.parse_review(FINDINGS, (WORKTREE,))
@@ -592,43 +607,16 @@ class EffortTests(unittest.TestCase):
             harness.tearDown()
 
 
-class TestTierTests(unittest.TestCase):
-    rules = {'default': cr.DEFAULT_EFFORT_RULES, 'repos': {}}
-
-    def tier(self, files, repo=REPO, rules=None):
-        return cr.choose_tests(rules or self.rules, repo, files)
-
-    def test_no_high_risk_file_is_read_only(self):
-        self.assertEqual(self.tier(['src/app.py', 'docs/wiki/a.md']), 'read-only')
-
-    def test_one_high_risk_file_needs_tests(self):
-        self.assertEqual(self.tier(['src/app.py', 'db/migrations/0002_add.py']), 'tests')
-        self.assertEqual(self.tier(['deploy/install.sh']), 'tests')
-        self.assertEqual(self.tier(['src/config/secret_store.py']), 'tests')
-
-    def test_no_changed_files_needs_tests(self):
-        self.assertEqual(self.tier([]), 'tests')
-
-    def test_table_without_tests_key_always_needs_tests(self):
-        rules = {'default': {'medium': ['docs/**']}, 'repos': {}}
-        self.assertEqual(self.tier(['src/app.py'], rules=rules), 'tests')
-
-    def test_repository_override_replaces_default(self):
-        rules = {'default': cr.DEFAULT_EFFORT_RULES,
-                 'repos': {'Example-Org/Example-Repo': {'tests': ['src/orders/**']}}}
-        self.assertEqual(self.tier(['src/orders/submit.py'], rules=rules), 'tests')
-        self.assertEqual(self.tier(['deploy/install.sh'], rules=rules), 'read-only')
-        self.assertEqual(self.tier(['src/orders/submit.py'], repo='example-owner/other', rules=rules), 'read-only')
-
-    def test_rules_file_accepts_tests_and_drops_annotations(self):
+class ReadOnlyTests(unittest.TestCase):
+    def test_rules_file_drops_annotations_and_rejects_unknown_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'rules.json'
-            path.write_text(json.dumps({'_basis': 'x', 'default': {'tests': ['a/**'], '_why': {'a/**': 'y'}},
-                                        'repos': {'example-owner/x': {'tests': ['b/**'], '_why': {}}}}))
+            path.write_text(json.dumps({'_basis': 'x', 'default': {'medium': ['a/**'], '_why': {'a/**': 'y'}},
+                                        'repos': {'example-owner/x': {'high': ['b/**'], '_why': {}}}}))
             loaded = cr.load_effort_rules(str(path))
-            self.assertEqual(loaded['default'], {'tests': ['a/**']})
-            self.assertEqual(loaded['repos'], {'example-owner/x': {'tests': ['b/**']}})
-            path.write_text(json.dumps({'default': {'test': ['a/**']}}))
+            self.assertEqual(loaded['default'], {'medium': ['a/**']})
+            self.assertEqual(loaded['repos'], {'example-owner/x': {'high': ['b/**']}})
+            path.write_text(json.dumps({'default': {'tests': ['a/**']}}))
             with self.assertRaises(cr.ConfigError):
                 cr.load_effort_rules(str(path))
 
@@ -636,39 +624,31 @@ class TestTierTests(unittest.TestCase):
         shipped = cr.load_effort_rules(str(Path(__file__).resolve().parent.parent / 'deploy' / 'effort-rules.json'))
         self.assertEqual(shipped['default'], cr.DEFAULT_EFFORT_RULES)
 
-    def run_with(self, files):
+    def test_high_risk_paths_are_reviewed_read_only(self):
         harness = ReviewTests('test_clean_review_posts_marker')
         harness.setUp()
         try:
-            harness.git.files = files
+            harness.git.files = ['src/app.py', 'deploy/install.sh', 'db/migrations/0002_add.py']
             harness.deliver(pull_payload())
             harness.run_next()
-            return harness.codex.calls[0][4], harness.github.posted[0]['body']
+            body = harness.github.posted[0]['body']
         finally:
             harness.tearDown()
-
-    def test_read_only_tier_reaches_codex_and_marker(self):
-        tier, body = self.run_with(['src/app.py'])
-        self.assertEqual(tier, 'read-only')
         self.assertIn('verdict=clean effort=high tests=read-only -->', body)
         self.assertIn('Read-only review', body)
         self.assertEqual(cr.MARKER_RE.search(body).group(1), HEAD)
 
-    def test_tests_tier_reaches_codex_and_marker(self):
-        tier, body = self.run_with(['src/app.py', 'deploy/install.sh'])
-        self.assertEqual(tier, 'tests')
-        self.assertIn('verdict=clean effort=high tests=tests -->', body)
-        self.assertNotIn('Read-only review', body)
-
-    def test_read_only_command_drops_base_and_forbids_tests(self):
-        command = cr.CodexRunner('codex').command('main', '/w/last.txt', 'high', 'read-only')
+    def test_command_is_read_only_and_forbids_tests(self):
+        command = cr.CodexRunner('codex').command('main', '/w/last.txt', 'high')
+        self.assertEqual(command, ['codex', 'exec', '--json', '--sandbox', 'read-only',
+                                   '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
+                                   'review', cr.review_prompt('main'), '-o', '/w/last.txt'])
         self.assertNotIn('--base', command)
-        self.assertEqual(command[2:4], ['--sandbox', 'read-only'])
-        prompt = command[command.index('review') + 1]
+        prompt = command[-3]
         self.assertIn('git diff origin/main...HEAD', prompt)
         self.assertIn('do not run pytest, vitest or any other test suite', prompt)
         self.assertIn('本次为只读审查，未运行测试', prompt)
-        self.assertEqual(command[-2:], ['-o', '/w/last.txt'])
+        self.assertIn('`VERDICT: CLEAN`', prompt)
 
 
 class GitHubClientTests(unittest.TestCase):
@@ -864,14 +844,6 @@ class ConfigTests(unittest.TestCase):
                 cr.read_private(path)
             os.chmod(path, 0o600)
             self.assertEqual(cr.read_private(path), b'value\n')
-
-    def test_codex_command_pins_sandbox_network_and_approval(self):
-        command = cr.CodexRunner('codex').command('main', '/w/last.txt', 'high')
-        self.assertEqual(command, ['codex', 'exec', '--sandbox', 'workspace-write',
-                                   '-c', 'sandbox_workspace_write.network_access=false',
-                                   '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
-                                   'review', '--base', 'origin/main', '-o', '/w/last.txt'])
-
 
 if __name__ == '__main__':
     unittest.main()

@@ -16,7 +16,7 @@ GitHub App webhook
   -> cloudflared（codex-review-tunnel.service，审查主机只有出站连接）
   -> http://127.0.0.1:8787/webhook                    （codex-review.service）
   -> /var/lib/codex-review/state.sqlite 中的任务队列
-  -> worker（并发上限 2）：bare 镜像 fetch -> detached 工作树 -> codex exec review -> 发 review
+  -> worker（并发数见 §2.6.3，默认 2）：bare 镜像 fetch -> detached 工作树 -> codex exec review -> 发 review
 ```
 
 ## 2. 行为约定
@@ -66,13 +66,40 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 ### 2.4 发布与幂等
 
 - 每个 head 只发一条 review，event 为 `COMMENT`，`commit_id` 为该 head。
-- 正文第一行是标记：`<!-- remote-codex-review head=<完整 sha> verdict=clean|findings|failed effort=medium|high tests=tests|read-only -->`。codex 未运行就失败时（例如本节末条的基础设施错误），标记中没有 `effort=` 和 `tests=`。`tests=read-only` 的正文另有一行说明本次为只读审查。
+- 正文第一行是标记：`<!-- remote-codex-review head=<完整 sha> verdict=clean|findings|failed|invalid effort=medium|high tests=read-only -->`。`invalid` 只由 §7 的 `--invalidate` 写入，表示该条 review 已作废。codex 未运行就失败时（例如本节末条的基础设施错误），标记中没有 `effort=` 和 `tests=`。codex 运行过的 review 都是只读审查，标记带 `tests=read-only`，正文另有一行说明。早期 review 的标记中可能是 `tests=tests`，解析时照常识别。
 - 正文包含结论摘要和每条发现的完整内容。发现中的 `路径:行号` 去掉工作树前缀后，如果该行在 PR diff 的右侧，再另外作为行内评论。GitHub 对整条 review 返回 422 时，去掉全部行内评论重发一次；因为正文本来就包含全部发现，所以不会丢失内容。
-- 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。
-- 结论判定：codex 最终消息中含 `[P0]` 到 `[P3]` 即为 `findings`，否则为 `clean`。最终消息优先取 `-o` 输出文件，取不到时取输出中最后一个单独的 `codex` 行之后的文本。
-- codex 非零退出、超时（默认 40 分钟）或没有最终消息时，发 `verdict=failed`，正文写明「This is not a pass」。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--requeue`。
+- 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。`verdict=invalid` 的标记不算，所以作废后重新入队的 head 会再审一次。
+- 结论判定（§2.4.1）默认为 `failed`。最终消息优先取 `-o` 输出文件，取不到时取 `--json` 事件流中最后一条 `agent_message`。
+- codex 因上游临时故障失败时先按 §2.4.2 重试，不发 review。超时（默认 40 分钟）或判定为 `failed` 时，发 `verdict=failed`，正文写明「This is not a pass」，并逐条列出未通过的检查。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--enqueue`。
 - 结论为 `failed`，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
 - GitHub 或 git 出错（不是 codex 本身失败）时，任务重新排队，等待 5 分钟乘以已失败次数后再试。累计 `CODEX_REVIEW_MAX_ATTEMPTS`（默认 3）次仍失败时，发 `failed` 标记。
+
+#### 2.4.1 结论判定
+
+codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独保存。事件格式见 §9。
+
+- codex 退出码为 0、有最终消息，并且最终消息含 `[P0]` 到 `[P3]` 的发现或 `VERDICT: FINDINGS` 行时，判为 `findings`。
+- 同时满足以下全部条件时，判为 `clean`：
+  1. codex 退出码为 0；
+  2. 事件流中有 `turn.completed`，没有 `turn.failed`、`error` 条目和顶层 `error` 事件。例外：回合正常完成时，内容属于临时故障的顶层 `error` 事件（例如 `Reconnecting... 2/5 (unexpected status 503 …)`）只是 codex 自动重连的通知，不计；
+  3. 至少有一条 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，并且它的 `aggregated_output` 含有统一 diff 的结构：一行以 `diff --git a/` 或 `diff --git "a/` 开头（后者是 git 默认 `core.quotePath=true` 时非 ASCII 路径的写法），另有至少一行以 `@@ ` 开头的 hunk 头。合并提交的组合 diff（`diff --cc`、`diff --combined`，hunk 头为 `@@@ `）不算，因为它只含合并时的冲突处理，不是 PR 相对 base 的改动。这一条只看命令的输出，不分析命令怎么写；输出被截断时，只要剩下的部分仍有这两种行就算。只跑过 `git status`、`ls`、`git -v`、`echo`、`git diff --stat` 的不算。与 base 没有任何差别的 PR，`git diff` 输出为空，也按这一条判 `failed`，原因中写明这种情况；服务目前没有单独的「无改动」处理。只改二进制文件或只改名的 PR 没有 hunk 头，同样判 `failed`；
+  4. 最终消息中没有 codex 说自己没能完成审查的语句。这一条只拦截意思明确的说法：`Reviewer failed to output a response.`、`Review blocked`、`the verdict is a placeholder`、`I could not read`、`The reviewer was unable to read`、`unable to read the diff`、`the review is incomplete`、`codex-code-mode-host is missing`、「我无法读取」、「本次审查无法读取文件」、「审查未完成」、「未能读取 diff」，完整列表见 `codex_review.py` 的 `FAILURE_SIGNAL_RE`。结论描述被审代码时也会用到的词不在列表中，例如单独的 blocked、placeholder、cannot view、no such file or directory、工具缺失；工具坏到读不了 diff 的情况由第 3 条判定；
+  5. 最终消息中恰好有一行 `VERDICT: CLEAN`。
+- 其余情况一律判为 `failed`。
+
+第 5 条的结论行来自提示词：提示要求 codex 在 `overall_explanation` 末尾写 `VERDICT: CLEAN`、`VERDICT: FINDINGS` 或 `VERDICT: BLOCKED`。`--json` 事件流不包含 review 模式的结构化字段 `overall_correctness`，而且工具失败时 codex 仍可能把该字段填成占位值，所以不用它判定。结论行写在 `overall_explanation` 内，因为 codex 只取模型输出中的 JSON 对象，对象之外的文字会被丢弃。
+
+原因：审查主机缺少 `codex-code-mode-host` 时，codex 的每次工具调用都失败，模型仍然输出没有 `[P*]` 的说明。旧规则把这种输出判为 `clean`。现在缺任何一条证据都发 `failed`。
+
+#### 2.4.2 上游临时故障的重试
+
+codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并且决定性的错误消息属于临时故障时，本次结果作废，不发 review。决定性消息取最后一个 `turn.failed` 的 `error.message`，没有 `turn.failed` 时取最后一个顶层 `error` 事件。临时故障包括：模型满载（`Selected model is at capacity`）、overloaded、429 与 rate limit、usage limit、5xx、`stream disconnected`、连接重置或中断、网络超时，完整列表见 `codex_review.py` 的 `TRANSIENT_RE`。其他失败（输出格式不对、没有读代码的证据、工具缺失、401 等）是确定性失败，立即按 §2.4.1 发 `failed`。
+
+- 同一任务重新排队，延迟按 `CODEX_REVIEW_RETRY_FIRST_SECONDS`（默认 60）逐次翻倍，封顶 `CODEX_REVIEW_RETRY_MAX_DELAY_SECONDS`（默认 1800），即 1、2、4、8、16、30、30 分钟。每次重试记一行日志 `transient codex failure #<n>, retrying in <s> s: <错误原文>`。
+- 自第一次临时故障起，已过时间加下一次延迟超过 `CODEX_REVIEW_RETRY_WINDOW_SECONDS`（默认 7200）时不再重试，发 `failed`，正文写明临时故障次数、持续时间和最后一条错误原文。默认参数下最多运行 8 次 codex。
+- 重试状态存放在 `state.sqlite` 的 `retries` 表，任务以 `queued` 状态等待，服务重启后照常继续。
+- 等待重试期间 PR 收到新 head，或重试前查询发现 head 已变，旧任务按 §2.3 标为 `superseded`。同一 head 再次入队时重新计算重试时长。
+- 本服务自己的 40 分钟超时不算临时故障，直接发 `failed`：一次审查跑满 40 分钟后再重试，2 小时内最多再跑两次，代价高且多半同样超时。
 
 ### 2.5 漏投补救
 
@@ -90,18 +117,17 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 
 - 每个仓库在 `/var/lib/codex-review/mirrors/<owner>/<repo>.git` 维护一份 bare 镜像。每次 fetch 取回 `refs/pull/<n>/head` 和 base 分支，base 写到 `refs/remotes/origin/<base>`。
 - installation token 通过环境变量 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` 设置 `http.https://github.com/.extraheader`，不出现在命令行参数、URL 或日志里。
-- 每个任务在 `/var/lib/codex-review/work/<任务 id>/tree` 建一个 detached 工作树，结束后删除。服务启动时会清掉上次残留的工作树。需要保留的输出按 §2.4 另存到 `output/`，不随工作树删除。
-- codex 命令（`<effort>` 的取法见 §2.6.1；以下为 `tests` 档，`read-only` 档见 §2.6.2）：
+- 每个任务在 `/var/lib/codex-review/work/<任务 id>/tree` 建一个 detached 工作树，结束后删除。codex 的事件流和标准错误写在同一任务目录的 `events.jsonl`、`stderr.log`。服务启动时会清掉上次残留的工作树。需要保留的输出按 §2.4 另存到 `output/`，不随工作树删除。
+- codex 命令（`<effort>` 的取法见 §2.6.1，只读规则见 §2.6.2）：
 
   ```
-  codex exec --sandbox workspace-write \
-    -c sandbox_workspace_write.network_access=false \
+  codex exec --json --sandbox read-only \
     -c approval_policy="never" \
     -c model_reasoning_effort=<effort> \
-    review --base origin/<base> -o <工作目录>/last-message.txt
+    review "<提示>" -o <工作目录>/last-message.txt
   ```
 
-  `workspace-write` 只允许写工作树和临时目录。`network_access=false` 关闭 codex 所执行命令的网络访问。`approval_policy="never"` 使 codex 不会停下来等待批准。配置键的出处见 §9。
+  提示由 `codex_review.py` 的 `review_prompt()` 生成：要求 codex 运行 `git diff origin/<base>...HEAD` 查看改动，并按 §2.4.1 写结论行。`codex exec review` 不允许 `--base` 和自定义提示同时出现，所以命令不带 `--base`，改在提示中写明对比 `origin/<base>`；`origin/<base>` 是 bare 镜像中的 `refs/remotes/origin/<base>`，工作树可以直接引用。`read-only` 沙箱不允许 codex 执行的命令写文件，也不允许访问网络。`approval_policy="never"` 使 codex 不会停下来等待批准。配置键的出处见 §9。
 - codex 自己的 `config.toml`（`/var/lib/codex-review/.codex/config.toml`）由 `deploy/codex-config.toml` 模板生成，只含模型和 provider，不含任何密钥。
 
 #### 2.6.1 推理档位
@@ -132,17 +158,13 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 
 `repos` 中某个仓库的表整体取代 `default`，不与它合并；仓库名比较不区分大小写。以 `_` 开头的键是注释，加载时忽略。修改后重启服务生效：`systemctl restart codex-review`。选中的档位写在 review 标记的 `effort=` 中。
 
-#### 2.6.2 测试档位
+#### 2.6.2 只读审查
 
-同一个表中的 `tests` 列出高风险路径。档位按同一份改动文件决定：
+所有 PR 都做只读审查，不按改动路径分档：codex 不运行测试，测试由本地审查和 CI 负责。提示另加 `READ_ONLY_RULE`：要求 codex 不运行 pytest、vitest 或其他测试套件，不启动数据库或其他服务，结论中写明「本次为只读审查，未运行测试」。沙箱为 `--sandbox read-only`。
 
-- 有一个改动文件匹配 `tests` 中的模式，用 `tests` 档：命令同 §2.6，codex 可以运行测试；
-- 没有任何改动文件、或该表没有 `tests` 键时，也用 `tests` 档；
-- 其余情况用 `read-only` 档。
+#### 2.6.3 并发
 
-默认表中的 `tests` 是通用示例：`**/migrations/**`、`deploy/**`、`.github/workflows/**`、`**/*secret*`、`**/*credential*`。各仓库的实际清单写在 `repos` 下。
-
-`codex exec review` 不允许 `--base` 和自定义提示同时出现，所以 `read-only` 档不带 `--base`，改为在提示中写明对比 `origin/<base>`，并要求 codex 不运行 pytest、vitest 或其他测试套件，不启动数据库或其他服务，结论中写明「本次为只读审查，未运行测试」。该档的沙箱为 `--sandbox read-only`。提示全文见 `codex_review.py` 的 `READ_ONLY_PROMPT`。选中的档位写在 review 标记的 `tests=` 中。
+`CODEX_REVIEW_CONCURRENCY` 是同时运行的 codex 审查数。按「单个审查的内存峰值 × N ≤ 可用内存的 70%」取 N，上限 6，并且 N × 峰值要低于单元的 `MemoryMax=3G`。峰值的测法：用 `systemd-run` 以服务账号和同样的加固参数运行一次审查，每 0.5 秒读取该临时单元 cgroup 的 `memory.current`，取最大值；可用内存取 `free -m` 的 available 列。只读审查不运行测试，峰值主要是 codex 进程本身。
 
 ### 2.7 为什么用常驻服务
 
@@ -150,7 +172,7 @@ webhook 需要一个一直在监听的进程。队列、并发上限和「新 he
 
 ### 2.8 systemd 加固与 codex 沙箱
 
-codex 0.160.1 在 Linux 上用 bubblewrap（`bwrap`）隔离它执行的命令：优先用 `PATH` 中的 `bwrap`，找不到时用随包附带的版本（出处见 §9）。bubblewrap 需要创建用户命名空间，并挂载一个新的 `/proc`。所以 `codex-review.service`：
+codex 0.160.1 在 Linux 上用 bubblewrap（`bwrap`）隔离它执行的命令：优先用 `PATH` 中的 `bwrap`，找不到时用包内的 `codex-resources/bwrap`（出处见 §9）。bubblewrap 需要创建用户命名空间，并挂载一个新的 `/proc`。所以 `codex-review.service`：
 
 - 保留 `NoNewPrivileges`、`ProtectSystem=strict`、`ReadWritePaths=/var/lib/codex-review`、`ProtectHome`、`PrivateTmp`、`RestrictSUIDSGID`、`UMask=0077`，以及 `MemoryMax=3G`、`CPUQuota=300%`、`Nice=10`；
 - 不设 `RestrictNamespaces`、`PrivateUsers`，因为它们会阻止 bwrap 创建命名空间；
@@ -184,8 +206,10 @@ bash /root/remote-codex-review/deploy/install.sh
 2. 创建系统用户 `codex-review` 和 `codex-review-tunnel`；
 3. 核验与 runner 账户的隔离（§2.9）；
 4. 创建 `/var/lib/codex-review/{mirrors,work,.codex}`（0700，属主 `codex-review`）、`/etc/codex-review`（0750，root:codex-review）、`/etc/codex-review-tunnel`（0750，root:codex-review-tunnel）；
-5. 安装 `/opt/codex-review/codex_review.py`，写入 codex 的 `config.toml`；`/etc/codex-review/codex-review.env` 和 `effort-rules.json` 不存在时才从模板复制；
-6. 下载 codex-cli 0.160.1 和 cloudflared 2026.10.0，校验 sha256 后安装到 `/usr/local/bin`；已是该版本时跳过下载；
+5. 安装 `/opt/codex-review/codex_review.py`，写入 codex 的 `config.toml`；`/etc/codex-review/codex-review.env` 和 `effort-rules.json` 不存在时才从模板复制；已有的 `effort-rules.json`，以及 `codex-review.env` 中 `CODEX_REVIEW_EFFORT_RULES` 指向的另一个规则文件，如果还有已废弃的 `tests` 表，删去这些表，`medium`、`high` 和 `repos` 原样保留，否则服务读取规则时报 `ConfigError` 并以退出码 2 退出；
+6. 下载 codex-cli 0.160.1 的整包 `codex-package-x86_64-unknown-linux-musl.tar.gz`，校验 sha256 后解到 `/opt/codex`，属主改为 root，目录和可执行文件设为 0755、其余文件 0644，与运行脚本时的 umask 无关，再把 `/usr/local/bin/codex` 设为指向 `/opt/codex/bin/codex` 的符号链接；下载 cloudflared 2026.10.0，校验 sha256 后安装到 `/usr/local/bin`。已是该版本且文件齐全时跳过下载。安装后自检：`/opt/codex` 下的 `bin/codex`、`bin/codex-code-mode-host`、`codex-resources/bwrap`、`codex-resources/zsh/bin/zsh`、`codex-path/rg` 都存在且可执行，`codex-package.json` 的版本正确，`/usr/local/bin/codex` 解析到 `/opt/codex/bin/codex`；任一项不满足即失败退出。
+
+   只装 `codex` 一个二进制时，codex 找不到 `codex-code-mode-host`，所有工具调用都会失败。codex 按可执行文件解析后的真实路径识别包结构（出处见 §9），所以经符号链接调用也能找到包内的配套程序；
 7. 安装两个 systemd 单元并执行 `daemon-reload`，**不启用**；
 8. 列出仍缺少的凭据。
 
@@ -287,18 +311,17 @@ sudo -u codex-review env HOME=/var/lib/codex-review CODEX_HOME=/var/lib/codex-re
      -p ReadWritePaths=/var/lib/codex-review -p InaccessiblePaths=-/opt/actions-runner \
      -p WorkingDirectory=/var/lib/codex-review \
      -E HOME=/var/lib/codex-review -E CODEX_HOME=/var/lib/codex-review/.codex \
-     /usr/local/bin/codex sandbox -c sandbox_mode='"workspace-write"' \
-       -c sandbox_workspace_write.network_access=false -- /bin/echo sandbox ok
+     /usr/local/bin/codex sandbox -c sandbox_mode='"read-only"' -- /bin/echo sandbox ok
    ```
 
-2. 启动隧道和服务，并设为开机自启：
+2. 启动隧道和服务，并设为开机自启。服务每次启动时先做自检：在 `/var/lib/codex-review/work/` 下建一个临时 git 仓库，写入随机标记，让 codex（`--sandbox read-only`、`--ephemeral`、推理档位 low）读取该文件并回显标记。codex 执行的命令输出和最终消息都含该标记才算通过，否则服务记录原因并以退出码 3 退出。单元设了 `RestartPreventExitStatus=3`，自检失败后 systemd 不会反复重启，避免每 10 秒调用一次模型：
 
    ```
    systemctl enable --now codex-review-tunnel.service codex-review.service
    ```
 
 3. 验证：
-   - `journalctl -u codex-review -n 20` 中应有 `listening on 127.0.0.1:8787/webhook`，以及一行 `startup:`；
+   - `journalctl -u codex-review -n 20` 中应有一行 `startup:`、一行 `startup self-check passed`，以及 `listening on 127.0.0.1:8787/webhook`。出现 `startup self-check failed` 时，按其中的原因修复后再 `systemctl restart codex-review`；
    - `curl -s -o /dev/null -w '%{http_code}\n' https://review.example.com/other` 应返回 404；对 `/webhook` 用 GET 请求应返回 405，说明请求到达了服务；
    - 在 App 设置页的 Advanced → Recent Deliveries 中，新投递的响应码应为 202；
    - 推送一个测试 PR，几分钟内应出现一条带标记的 review。
@@ -330,21 +353,42 @@ sudo -u codex-review sqlite3 /var/lib/codex-review/state.sqlite \
     --config /etc/codex-review/codex-review.env --requeue 'owner/repo#<pr>@<完整 sha>'
   ```
 
-  这只把任务改回排队状态。如果 GitHub 上已有该 head 的标记，worker 不会重复发 review；需要重新发时，先在 PR 页面删除那条 review。
+  这只把已记录的任务改回排队状态。如果 GitHub 上已有该 head 的标记，worker 不会重复发 review；需要重新发时，先用下面的 `--invalidate` 作废那条 review。
+
+- 把任意 head 加入队列，包括本地从未记录或已经审完的 head：
+
+  ```
+  sudo -u codex-review /usr/bin/python3 /opt/codex-review/codex_review.py \
+    --config /etc/codex-review/codex-review.env --enqueue 'owner/repo#<pr>@<完整 sha>'
+  ```
+
+  命令先用 App 身份取该仓库的安装和 PR，安装账户不在白名单、PR 不满足 §2.2 准入条件时不入队。入队使用 PR 当前的 base。给出的 sha 不是 PR 当前 head 时，命令改为把当前 head 入队并提示一行。服务进程最多 30 秒后取到新任务。
+
+- 作废本 App 发出的某条 review：
+
+  ```
+  sudo -u codex-review /usr/bin/python3 /opt/codex-review/codex_review.py \
+    --config /etc/codex-review/codex-review.env --invalidate 'owner/repo#<pr>:<review id>' --note '<作废说明>'
+  ```
+
+  命令用 `PUT /repos/{owner}/{repo}/pulls/{pr}/reviews/{review id}` 把正文改为原标记加作废说明，标记中的 verdict 改为 `invalid`。作者不是本 App 或正文没有标记时拒绝修改。作废后用 `--enqueue` 重新审查同一 head。
 
 ## 8. 回滚
 
 1. `systemctl disable --now codex-review.service codex-review-tunnel.service`
 2. `rm /etc/systemd/system/codex-review.service /etc/systemd/system/codex-review-tunnel.service && systemctl daemon-reload`
 3. 在 App 设置页停用 Webhook，或者在各账户的 Installed GitHub Apps 中挂起或卸载该 App。
-4. 可选：删除 `/opt/codex-review`、`/usr/local/bin/codex`、`/usr/local/bin/cloudflared`。`/var/lib/codex-review` 中有 codex 登录凭据和镜像，`/etc/codex-review*` 中有私钥、webhook secret 和隧道令牌；确认不再需要后，用 `shred` 删除凭据文件，再删除目录和两个系统用户。
+4. 可选：删除 `/opt/codex-review`、`/opt/codex`、`/usr/local/bin/codex`（符号链接）、`/usr/local/bin/cloudflared`。`/var/lib/codex-review` 中有 codex 登录凭据和镜像，`/etc/codex-review*` 中有私钥、webhook secret 和隧道令牌；确认不再需要后，用 `shred` 删除凭据文件，再删除目录和两个系统用户。
 5. 在 Cloudflare 控制台删除隧道，在 GitHub 上删除 App 或吊销它的私钥。
 
 ## 9. 出处
 
-- codex-cli 0.160.1：<https://github.com/openai/codex/releases/tag/rust-v0.160.1>，文件 `codex-x86_64-unknown-linux-musl.tar.gz`，sha256 `9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c84bba33f`。摘要取自 GitHub Releases API 中该文件的 `digest` 字段（`gh api repos/openai/codex/releases/tags/rust-v0.160.1`）。
+- codex-cli 0.160.1：<https://github.com/openai/codex/releases/tag/rust-v0.160.1>，文件 `codex-package-x86_64-unknown-linux-musl.tar.gz`，sha256 `340801565906a7028f6baaa9ab6853addaef221f0016a1417a7c1ffdd96c21f0`。摘要取自 GitHub Releases API 中该文件的 `digest` 字段（`gh api repos/openai/codex/releases/tags/rust-v0.160.1`）。包内 `bin/codex` 与单独发布的 `codex-x86_64-unknown-linux-musl.tar.gz` 中的二进制相同（sha256 `f34a4d2301892ae96c90097786bfe5dc269f187b6f69faf42a7b357b8c081e35`）。
+- 包结构：同一标签的 `scripts/codex_package/README.md`（`bin/codex`、`bin/codex-code-mode-host`、`codex-resources/bwrap`、`codex-resources/zsh/bin/zsh`、`codex-path/rg`、`codex-package.json`）。
+- 配套程序查找：同一标签的 `codex-rs/install-context/src/lib.rs`。`CodexPackageLayout::from_exe` 先把可执行文件路径规范化（解析符号链接），所在目录名为 `bin` 且上一级有 `codex-package.json` 时按包结构处理；`code_mode_host_program()` 依次查找 `codex-resources/codex-code-mode-host`、包的 `bin/codex-code-mode-host`，不是包结构时查找可执行文件同目录的 `codex-code-mode-host`。`rg_command()` 优先用包内 `codex-path/rg`。
+- `--json` 事件：同一标签的 `codex-rs/exec/src/exec_events.rs` 定义 `item.completed` 中的条目类型 `agent_message`、`command_execution`（含 `exit_code`、`status`）、`error` 等，没有 review 结构化结果的条目。review 结果的渲染：`codex-rs/core/src/tasks/review.rs` 的 `parse_review_output_event` 只取模型输出中的 JSON 对象，`codex-rs/protocol/src/review_format.rs` 的 `render_review_output_text` 只输出 `overall_explanation` 和发现，不输出 `overall_correctness`；没有任何内容时输出 `Reviewer failed to output a response.`。
 - cloudflared 2026.10.0：<https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0>，文件 `cloudflared-linux-amd64`，sha256 `d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db`，取法同上。
-- codex 配置键：openai/codex 标签 `rust-v0.160.1` 中的 `sdk/typescript/src/exec.ts` 把 `sandboxMode` 映射为 `--sandbox`，把 `networkAccessEnabled` 映射为 `--config sandbox_workspace_write.network_access=<bool>`，把 `approvalPolicy` 映射为 `--config approval_policy="<mode>"`；`sdk/typescript/src/threadOptions.ts` 列出取值 `workspace-write` 和 `never`。`codex exec --help`（0.160.1）列出 `-s, --sandbox`，`codex exec review --help` 列出 `--base` 和 `-o, --output-last-message`。
+- codex 配置键：openai/codex 标签 `rust-v0.160.1` 中的 `sdk/typescript/src/exec.ts` 把 `sandboxMode` 映射为 `--sandbox`，把 `approvalPolicy` 映射为 `--config approval_policy="<mode>"`；`sdk/typescript/src/threadOptions.ts` 列出取值 `read-only` 和 `never`。`codex exec --help`（0.160.1）列出 `-s, --sandbox`，`codex exec review --help` 列出 `--base` 和 `-o, --output-last-message`。
 - codex 的 bwrap 查找顺序：同一标签的 `codex-rs/core/README.md` 的 Linux 部分。
 - Linux 上的 `codex sandbox`：同一标签的 `codex-rs/cli/src/main.rs` 在 Linux 上把 `sandbox` 子命令映射到 `LandlockCommand`，`codex-rs/cli/src/lib.rs` 中该结构以尾随参数接收要运行的命令。
 - cloudflared 的 `--token-file`：标签 `2026.10.0` 中的 `cmd/cloudflared/tunnel/subcommands.go`；读取后用 `strings.TrimSpace` 去掉首尾空白，所以令牌文件末尾的换行不影响使用。

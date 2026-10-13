@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a133d1-0408-7b02-847a-fcc29d07eeb9"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Code Mode is unavailable because failed to spawn code-mode host /usr/local/bin/codex-code-mode-host: host executable was not found. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Code Mode is unavailable because failed to spawn code-mode host /usr/local/bin/codex-code-mode-host: host executable was not found. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Unable to review or verify correctness: running `git diff origin/main...HEAD` failed because `/usr/local/bin/codex-code-mode-host` was missing. The correctness verdict is an unverified placeholder.\nVERDICT: BLOCKED"}}
+{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}
