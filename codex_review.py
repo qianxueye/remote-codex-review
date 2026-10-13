@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -54,16 +55,18 @@ FAILURE_SIGNAL_RE = re.compile(
     r'|(?:\b(?:I|we|codex|(?:the |this )?review(?:er)?)(?: was| were| am| are| is)? |^\W*|[.!?;:]\s+)'
     r'(?:unable|not able|could not|couldn\'t|cannot|can\'t|failed) to '
     r'(?:review|inspect|read|open|view|examine|load|complete)\b'
-    r'|\breview (?:is |was )?(?:incomplete|not complete[d]?)\b|\b(?:complete|finish) the review\b'
+    r'|\breview (?:is |was )?(?:incomplete|not complete[d]?)\b'
+    r'|\b(?:unable to|not able to|could not|couldn\'t|cannot|can\'t|did not|didn\'t|failed to) '
+    r'(?:complete|finish) (?:the |this )?review\b'
     r'|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|open|view|examine|load) '
     r'(?:the |any )?(?:diff|repository|repo|code|changes?|patch|worktree)\b'
     r'|(?:codex-)?code-mode[ -]host\b[^.\n]{0,20}\b(?:missing|unavailable|not found|not installed)'
     r'|(?:我们?|本次审查|审查方?)\s*(?:无法|未能|不能)(?:检查|审查|读取|查看|完成)'
-    r'|审查(?:未|没有|没能)完成|(?:无法|未能|不能|没能)完成(?:本次)?审查'
+    r'|审查(?:未|没有|没能)完成|(?:无法|未能|不能|没能|没有)完成(?:本次)?审查'
     r'|(?:无法|未能)(?:检查|审查|读取|查看)\s*(?:diff|差异|代码|仓库|改动|变更|补丁|工作树)', re.I | re.M)
-DIFF_COMMAND_RE = re.compile(
-    r'(?:^|[;&|(\n]|\b(?:sh|bash|zsh) +-l?c +[\'"]?)\s*(?:\S*/)?git'
-    r'(?:\s+(?:-[cC]\s+\S+|--[a-z-]+(?:=\S+)?|-[pP]))*\s+(?:diff|show)(?=$|[\s\'";&|)])')
+SHELLS = frozenset({'sh', 'bash', 'zsh'})
+GIT_VALUE_OPTIONS = frozenset({'-c', '-C', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'})
+SHELL_OPERATORS = frozenset(';&|()')
 TRANSIENT_RE = re.compile(
     r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
@@ -489,9 +492,52 @@ def ran_commands(events):
             if item.get('status') == 'completed' and item.get('exit_code') == 0]
 
 
+def runs_git_diff(command, depth=0):
+    """Return whether a shell command line runs `git diff` or `git show`; unparsable text is not evidence."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|()')
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    words = []
+    for token in tokens + [';']:
+        if token and set(token) <= SHELL_OPERATORS:
+            if words and segment_runs_git_diff(words, depth):
+                return True
+            words = []
+        else:
+            words.append(token)
+    return False
+
+
+def segment_runs_git_diff(words, depth):
+    """Judge one simple command: a shell -c script is parsed recursively, git must reach diff/show."""
+    while words and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', words[0]):
+        words = words[1:]
+    name = words[0].rsplit('/', 1)[-1] if words else ''
+    if name in SHELLS:
+        for index, word in enumerate(words[1:-1], 1):
+            if word.startswith('-') and not word.startswith('--') and 'c' in word[1:]:
+                return depth < 3 and runs_git_diff(words[index + 1], depth + 1)
+        return False
+    if name != 'git':
+        return False
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word in GIT_VALUE_OPTIONS:
+            index += 2
+        elif word.startswith('-'):
+            index += 1
+        else:
+            return word in ('diff', 'show')
+    return False
+
+
 def diff_commands(events):
     """Return the successful commands that ran `git diff` or `git show`; clean requires at least one."""
-    return [item for item in ran_commands(events) if DIFF_COMMAND_RE.search(str(item.get('command') or ''))]
+    return [item for item in ran_commands(events) if runs_git_diff(str(item.get('command') or ''))]
 
 
 def turn_completed(events):

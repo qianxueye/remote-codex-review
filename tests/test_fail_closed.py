@@ -116,11 +116,15 @@ class SingleConditionTests(unittest.TestCase):
     def test_only_a_real_git_diff_or_show_subcommand_is_evidence(self):
         accepted = ("/usr/bin/bash -lc 'git diff origin/main...HEAD'", 'git diff', '/usr/bin/git show HEAD:x',
                     '/bin/zsh -lc "cd a && git -c core.pager=cat diff --stat"', 'git -C /x --no-pager show HEAD',
-                    "bash -lc 'git status; git diff'")
+                    "bash -lc 'git status; git diff'", 'git -C "/tmp/repo with spaces" diff HEAD',
+                    'git -c "core.pager=cat -n" diff HEAD', 'git --git-dir /x/.git --work-tree /x show HEAD',
+                    "/bin/zsh -lc 'git -C \"/Volumes/a b/c\" diff --stat origin/main...HEAD'",
+                    "bash -lc 'cd x || exit 1; GIT_PAGER=cat git diff'")
         rejected = ("bash -lc 'git show-ref'", "bash -lc 'git config --get diff.algorithm'", "bash -lc 'git difftool'",
                     "bash -lc 'git diff-tree HEAD'", "bash -lc 'git showx'", "bash -lc 'git log --format=diff'",
                     "bash -lc 'git config diff.renames'", "bash -lc 'rg \"git diff\" docs'",
-                    "bash -lc 'echo git diff'", "bash -lc 'mygit diff'")
+                    "bash -lc 'echo git diff'", "bash -lc 'mygit diff'", "bash -lc 'git -C \"unterminated diff'",
+                    "bash -lc 'git --git-dir diff show-ref'")
         for command in accepted + rejected:
             with self.subTest(command):
                 event = {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': command,
@@ -157,7 +161,8 @@ class SingleConditionTests(unittest.TestCase):
                      'Codex failed to read the diff.', '审查中断：未能读取 diff。', '我无法读取仓库。',
                      '本次审查无法读取文件，因此无法完成审查。',
                      'The reviewer was unable to read the files, so the review is incomplete.',
-                     'I could not complete the review.', 'The review was incomplete.', '审查未完成。'):
+                     'I could not complete the review.', 'The review was incomplete.', '审查未完成。',
+                     'I did not finish the review.', 'Codex failed to complete this review.', '没有完成审查。'):
             with self.subTest(text):
                 self.assert_failed(judge(self.stdout, text + '\nVERDICT: CLEAN'), 'reports a failure')
 
@@ -170,7 +175,9 @@ class SingleConditionTests(unittest.TestCase):
                      'No tool is missing and the review was not blocked.',
                      'The handler correctly returns no such file or directory for absent paths.',
                      'The installer fails if the helper binary is missing, which is intended.',
-                     '普通用户无法查看他人订单，与设计一致。', '没有无法读取的文件。', '没有工具缺失。'):
+                     '普通用户无法查看他人订单，与设计一致。', '没有无法读取的文件。', '没有工具缺失。',
+                     'I was able to complete the review. No defects found.', 'I finished the review of every file.',
+                     '已完成审查，未发现缺陷。', '本次审查已完成。'):
             with self.subTest(text):
                 self.assertEqual(judge(self.stdout, text + '\nVERDICT: CLEAN')[:1], ('clean',))
 
