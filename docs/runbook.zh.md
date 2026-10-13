@@ -83,7 +83,7 @@ codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独
   1. codex 退出码为 0；
   2. 事件流中有 `turn.completed`，没有 `turn.failed`、`error` 条目和顶层 `error` 事件。例外：回合正常完成时，内容属于临时故障的顶层 `error` 事件（例如 `Reconnecting... 2/5 (unexpected status 503 …)`）只是 codex 自动重连的通知，不计；
   3. 至少有一条 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，即 codex 确实执行过读取代码的命令；
-  4. 最终消息中没有失败信号，例如 blocked、placeholder、unable to read、工具缺失、`Reviewer failed to output a response.`，完整列表见 `codex_review.py` 的 `FAILURE_SIGNAL_RE`；
+  4. 最终消息中没有说明审查本身失败的语句，例如 `Review blocked`、`the verdict is a placeholder`、`I could not read`、`unable to read the diff`、「未能读取 diff」、工具缺失、`Reviewer failed to output a response.`，完整列表见 `codex_review.py` 的 `FAILURE_SIGNAL_RE`。单独出现的 blocked、placeholder、cannot view 等词不算，因为无发现的结论描述被审代码时也会用到；「没有工具缺失」这类否定句也不算；
   5. 最终消息中恰好有一行 `VERDICT: CLEAN`。
 - 其余情况一律判为 `failed`。
 
@@ -206,7 +206,7 @@ bash /root/remote-codex-review/deploy/install.sh
 2. 创建系统用户 `codex-review` 和 `codex-review-tunnel`；
 3. 核验与 runner 账户的隔离（§2.9）；
 4. 创建 `/var/lib/codex-review/{mirrors,work,.codex}`（0700，属主 `codex-review`）、`/etc/codex-review`（0750，root:codex-review）、`/etc/codex-review-tunnel`（0750，root:codex-review-tunnel）；
-5. 安装 `/opt/codex-review/codex_review.py`，写入 codex 的 `config.toml`；`/etc/codex-review/codex-review.env` 和 `effort-rules.json` 不存在时才从模板复制；
+5. 安装 `/opt/codex-review/codex_review.py`，写入 codex 的 `config.toml`；`/etc/codex-review/codex-review.env` 和 `effort-rules.json` 不存在时才从模板复制；已有的 `effort-rules.json` 中如果还有已废弃的 `tests` 表，删去这些表，`medium`、`high` 和 `repos` 原样保留，否则服务读取规则时报 `ConfigError` 并以退出码 2 退出；
 6. 下载 codex-cli 0.160.1 的整包 `codex-package-x86_64-unknown-linux-musl.tar.gz`，校验 sha256 后解到 `/opt/codex`，再把 `/usr/local/bin/codex` 设为指向 `/opt/codex/bin/codex` 的符号链接；下载 cloudflared 2026.10.0，校验 sha256 后安装到 `/usr/local/bin`。已是该版本且文件齐全时跳过下载。安装后自检：`/opt/codex` 下的 `bin/codex`、`bin/codex-code-mode-host`、`codex-resources/bwrap`、`codex-resources/zsh/bin/zsh`、`codex-path/rg` 都存在且可执行，`codex-package.json` 的版本正确，`/usr/local/bin/codex` 解析到 `/opt/codex/bin/codex`；任一项不满足即失败退出。
 
    只装 `codex` 一个二进制时，codex 找不到 `codex-code-mode-host`，所有工具调用都会失败。codex 按可执行文件解析后的真实路径识别包结构（出处见 §9），所以经符号链接调用也能找到包内的配套程序；
