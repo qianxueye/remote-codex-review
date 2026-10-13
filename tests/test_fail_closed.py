@@ -159,6 +159,137 @@ class ReviewerFailClosedTests(Harness):
         self.assertEqual(self.run_next()[1], 'failed')
 
 
+RECONNECT = ('{"type":"error","message":"Reconnecting... 2/5 (unexpected status 503 Service Unavailable: An error '
+             'occurred while processing your request.)"}\n')
+CAPACITY = 'Selected model is at capacity. Please try a different model.'
+
+
+class TransientClassifierTests(unittest.TestCase):
+    def test_real_capacity_failures_are_transient(self):
+        for name in ('capacity-after-command', 'capacity-after-503'):
+            with self.subTest(name):
+                stdout = (FIXTURES / f'{name}.jsonl').read_text(encoding='utf-8')
+                self.assertEqual(cr.transient_error(1, cr.read_events(stdout)), CAPACITY)
+
+    def test_completed_and_deterministic_runs_are_not_transient(self):
+        for name in ('clean-tests', 'findings-ro', 'broken-tests'):
+            with self.subTest(name):
+                self.assertIsNone(cr.transient_error(0, cr.read_events(fixture(name)[0])))
+        auth = '{"type":"turn.failed","error":{"message":"401 Unauthorized: invalid credentials"}}\n'
+        self.assertIsNone(cr.transient_error(1, cr.read_events(auth)))
+        self.assertIsNone(cr.transient_error(1, []))
+
+    def test_reconnect_notices_of_a_completed_turn_do_not_fail_the_review(self):
+        stdout, last = fixture('clean-tests')
+        stdout = RECONNECT + stdout
+        self.assertIsNone(cr.transient_error(0, cr.read_events(stdout)))
+        self.assertEqual(judge(stdout, last)[0], 'clean')
+
+
+class TransientRetryTests(Harness):
+    def setUp(self):
+        super().setUp()
+        self.now = [1_000_000.0]
+        self.store.clock = lambda: self.now[0]
+        self.capacity = (FIXTURES / 'capacity-after-503.jsonl').read_text(encoding='utf-8')
+        self.codex.events, self.codex.rc, self.codex.message = self.capacity, 1, ''
+
+    def run_due(self):
+        due = self.store.db.execute("SELECT not_before FROM jobs WHERE status = 'queued' ORDER BY id").fetchone()
+        self.now[0] = max(self.now[0], due[0])
+        return self.run_next()
+
+    def test_capacity_failure_posts_nothing_and_requeues_with_backoff(self):
+        self.deliver(pull_payload())
+        job, status = self.run_next()
+        self.assertIsNone(status)
+        self.assertEqual(self.github.posted, [])
+        self.assertEqual(self.store.status(job.id), 'queued')
+        self.assertEqual(self.store.transient_state(job.id), (1, 1_000_000.0, CAPACITY))
+        first = self.store.db.execute('SELECT not_before FROM jobs WHERE id = ?', (job.id,)).fetchone()[0]
+        self.assertEqual(first - self.now[0], 60)
+        delays = []
+        for _ in range(6):
+            self.run_due()
+            due = self.store.db.execute('SELECT not_before FROM jobs WHERE id = ?', (job.id,)).fetchone()[0]
+            delays.append(int(due - self.now[0]))
+        self.assertEqual(delays, [120, 240, 480, 960, 1800, 1800])
+        self.assertEqual(self.github.posted, [])
+
+    def test_window_spent_posts_failed_with_count_and_last_error(self):
+        self.deliver(pull_payload())
+        statuses = [self.run_next()[1]]
+        while statuses[-1] is None and len(statuses) < 20:
+            statuses.append(self.run_due()[1])
+        self.assertEqual(statuses, [None] * 7 + ['failed'])
+        body = self.github.posted[0]['body']
+        self.assertIn(f'head={HEAD} verdict=failed', body)
+        self.assertIn('transient upstream errors 8 time(s) over 5460 s', body)
+        self.assertIn(f'last error: {CAPACITY}', body)
+        self.assertEqual(len(self.codex.calls), 8)
+
+    def test_success_after_transient_failure_posts_the_real_verdict(self):
+        self.deliver(pull_payload())
+        job, _ = self.run_next()
+        self.codex.events, self.codex.rc, self.codex.message = None, 0, cr_clean()
+        self.assertEqual(self.run_due()[1], 'clean')
+        self.assertIn('verdict=clean', self.github.posted[0]['body'])
+        self.assertIsNone(self.store.transient_state(job.id))
+
+    def test_deterministic_failure_posts_failed_at_once(self):
+        for events, rc in ((fixture('broken-tests')[0], 0),
+                           ('{"type":"turn.failed","error":{"message":"401 Unauthorized"}}\n', 1)):
+            with self.subTest(rc=rc):
+                self.github.posted.clear()
+                self.github.markers.clear()
+                self.codex.events, self.codex.rc = events, rc
+                self.store.force_enqueue(REPO, 7, HEAD, 'main', 99)
+                job, status = self.run_next()
+                self.assertEqual(status, 'failed')
+                self.assertEqual(len(self.github.posted), 1)
+                self.assertIsNone(self.store.transient_state(job.id))
+
+    def test_head_change_during_retry_supersedes_the_old_job(self):
+        self.deliver(pull_payload())
+        job, _ = self.run_next()
+        self.github.heads[7] = NEW_HEAD
+        self.assertEqual(self.run_due()[1], 'superseded')
+        self.assertEqual(self.store.status(job.id), 'superseded')
+        self.assertEqual([j.head for j in self.store.queued()], [NEW_HEAD])
+        self.assertEqual(self.github.posted, [])
+
+    def test_new_head_delivery_supersedes_a_job_waiting_to_retry(self):
+        self.deliver(pull_payload())
+        job, _ = self.run_next()
+        self.deliver(pull_payload(head=NEW_HEAD), guid='d-2')
+        self.assertEqual(self.store.status(job.id), 'superseded')
+        self.assertEqual([j.head for j in self.store.queued()], [NEW_HEAD])
+
+    def test_pending_retry_survives_a_restart(self):
+        self.deliver(pull_payload())
+        job, _ = self.run_next()
+        self.store.db.close()
+        self.store = cr.Store(self.root / 'state.sqlite', clock=lambda: self.now[0])
+        self.reviewer = cr.Reviewer(self.config, self.github, self.store, self.git, self.codex)
+        self.assertEqual(self.store.reset_running(), 0)
+        self.assertEqual(self.store.transient_state(job.id), (1, 1_000_000.0, CAPACITY))
+        self.assertIsNone(self.store.claim_next())
+        self.assertIsNone(self.run_due()[1])
+        self.assertEqual(self.store.transient_state(job.id)[0], 2)
+
+    def test_requeued_job_starts_a_fresh_retry_window(self):
+        self.deliver(pull_payload())
+        job, _ = self.run_next()
+        self.deliver(pull_payload(head=NEW_HEAD), guid='d-2')
+        self.deliver(pull_payload(head=HEAD), guid='d-3')
+        self.assertEqual(self.store.status(job.id), 'queued')
+        self.assertIsNone(self.store.transient_state(job.id))
+
+
+def cr_clean():
+    return 'The change is consistent with its callers.\nVERDICT: CLEAN'
+
+
 class FakeTransport:
     def __init__(self, review):
         self.review, self.calls = review, []

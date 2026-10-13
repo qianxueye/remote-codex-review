@@ -50,10 +50,16 @@ SELF_CHECK_PROMPT = 'Run `cat token.txt` and reply with the exact contents of th
 VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
 FAILURE_SIGNAL_RE = re.compile(
     r'\bblocked\b|placeholder|\bunverified\b|Reviewer failed to output a response|no such file or directory'
-    r'|failed to spawn|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|access|run|'
-    r'execute|open|view|examine|load)\b|\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|'
-    r'mode)s? (?:is |was |are |were )?(?:missing|unavailable|not found|not installed)'
+    r'|failed to spawn|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to '
+    r'(?:review|inspect|read|access|run|execute|open|view|examine|load)\b'
+    r'|\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|mode)s? '
+    r'(?:is |was |are |were )?(?:missing|unavailable|not found|not installed)'
     r'|(?:无法|未能)(?:检查|审查|读取|运行|执行|查看|访问)|工具缺失|缺少(?:组件|工具|程序)', re.I)
+TRANSIENT_RE = re.compile(
+    r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'
+    r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
+    r'|connection (?:reset|closed|refused|error)|timed out|timeout|temporarily unavailable|network error'
+    r'|error sending request', re.I)
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
 FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
@@ -170,6 +176,9 @@ class Config:
         self.timeout_seconds = number('CODEX_REVIEW_TIMEOUT_SECONDS', '2400', 60)
         self.max_attempts = number('CODEX_REVIEW_MAX_ATTEMPTS', '3', 1)
         self.redeliver_hours = number('CODEX_REVIEW_REDELIVER_HOURS', '24', 1)
+        self.retry_first = number('CODEX_REVIEW_RETRY_FIRST_SECONDS', '60', 1)
+        self.retry_max_delay = number('CODEX_REVIEW_RETRY_MAX_DELAY_SECONDS', '1800', 1)
+        self.retry_window = number('CODEX_REVIEW_RETRY_WINDOW_SECONDS', '7200', 0)
         self.state_dir = Path(values.get('CODEX_REVIEW_STATE_DIR', '/var/lib/codex-review'))
         self.codex = values.get('CODEX_REVIEW_CODEX_BIN', 'codex')
         self.effort_rules = load_effort_rules(values.get('CODEX_REVIEW_EFFORT_RULES', ''))
@@ -480,12 +489,33 @@ def ran_commands(events):
             if item.get('status') == 'completed' and item.get('exit_code') == 0]
 
 
+def turn_completed(events):
+    return (any(event.get('type') == 'turn.completed' for event in events)
+            and not any(event.get('type') == 'turn.failed' for event in events))
+
+
+def transient_error(rc, events):
+    """Return the upstream error text when the turn failed for a transient reason (overload, 5xx, network)."""
+    if rc == 0 and turn_completed(events):
+        return None
+    failed = [event for event in events if event.get('type') == 'turn.failed']
+    if failed:
+        decisive = str((failed[-1].get('error') or {}).get('message') or '')
+    else:
+        notices = [str(event.get('message') or '') for event in events if event.get('type') == 'error']
+        decisive = notices[-1] if notices else ''
+    return decisive if decisive and TRANSIENT_RE.search(decisive) else None
+
+
 def failure_reasons(rc, events, message):
     """List every reason a finished codex run cannot count as a review; empty means all checks passed."""
     reasons = [] if rc == 0 else [f'codex exited {rc}']
+    completed = turn_completed(events)
     if not any(event.get('type') == 'turn.completed' for event in events):
         reasons.append('codex reported no completed turn')
     for event in events:
+        if event.get('type') == 'error' and completed and TRANSIENT_RE.search(str(event.get('message'))):
+            continue
         if event.get('type') in ('turn.failed', 'error'):
             reasons.append(f'codex reported {event["type"]}: {json.dumps(event, ensure_ascii=False)[:300]}')
     reasons += [f'codex reported an error item: {str(item.get("message"))[:300]}'
@@ -637,7 +667,9 @@ class Store:
             'attempts INTEGER NOT NULL DEFAULT 0, not_before REAL NOT NULL DEFAULT 0, review_id INTEGER, '
             'updated_at REAL NOT NULL, UNIQUE (repo, pr, head_sha));'
             'CREATE TABLE IF NOT EXISTS deliveries (guid TEXT PRIMARY KEY, received_at REAL NOT NULL);'
-            'CREATE TABLE IF NOT EXISTS redeliveries (delivery_id INTEGER PRIMARY KEY, requested_at REAL NOT NULL);')
+            'CREATE TABLE IF NOT EXISTS redeliveries (delivery_id INTEGER PRIMARY KEY, requested_at REAL NOT NULL);'
+            'CREATE TABLE IF NOT EXISTS retries (job_id INTEGER PRIMARY KEY, count INTEGER NOT NULL, '
+            'since REAL NOT NULL, last_error TEXT NOT NULL);')
 
     def _transaction(self, work):
         with self.lock:
@@ -665,6 +697,7 @@ class Store:
         if row:
             self.db.execute("UPDATE jobs SET status = 'queued', attempts = 0, not_before = 0, base_ref = ?, "
                             'installation_id = ?, updated_at = ? WHERE id = ?', (base, installation, now, row[0]))
+            self.db.execute('DELETE FROM retries WHERE job_id = ?', (row[0],))
         else:
             self.db.execute("INSERT INTO jobs (repo, pr, head_sha, base_ref, installation_id, status, updated_at) "
                             "VALUES (?, ?, ?, ?, ?, 'queued', ?)", (repo, pr, head, base, installation, now))
@@ -717,6 +750,24 @@ class Store:
             self.db.execute("UPDATE jobs SET status = 'queued', attempts = attempts + ?, not_before = ?, "
                             "updated_at = ? WHERE id = ? AND status = 'running'",
                             (1 if count_attempt else 0, self.clock() + delay, self.clock(), job_id))
+
+    def transient_state(self, job_id):
+        """Return (retries so far, time of the first transient failure, last error) or None."""
+        with self.lock:
+            return self.db.execute('SELECT count, since, last_error FROM retries WHERE job_id = ?',
+                                   (job_id,)).fetchone()
+
+    def defer_transient(self, job_id, count, since, error, delay):
+        """Record a transient failure and requeue the running job after delay seconds."""
+        def work():
+            self.db.execute('INSERT OR REPLACE INTO retries VALUES (?, ?, ?, ?)', (job_id, count, since, error))
+            self.db.execute("UPDATE jobs SET status = 'queued', not_before = ?, updated_at = ? "
+                            "WHERE id = ? AND status = 'running'", (self.clock() + delay, self.clock(), job_id))
+        self._transaction(work)
+
+    def clear_transient(self, job_id):
+        with self.lock:
+            self.db.execute('DELETE FROM retries WHERE job_id = ?', (job_id,))
 
     def reset_running(self):
         with self.lock:
@@ -1142,6 +1193,21 @@ class Reviewer:
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
                 f'review infrastructure error after {job.attempts + 1} attempts: {exc}')), [], token)
 
+    def defer_or_give_up(self, job, error, effort, tier, kept):
+        """Requeue with backoff after a transient upstream error; once the window is spent, return a failed body."""
+        now = self.store.clock()
+        count, since, _ = self.store.transient_state(job.id) or (0, now, '')
+        delay = min(self.config.retry_first * 2 ** count, self.config.retry_max_delay)
+        if now - since + delay <= self.config.retry_window:
+            self.store.defer_transient(job.id, count + 1, since, error, delay)
+            log(f'{job}: transient codex failure #{count + 1}, retrying in {delay} s: {error}')
+            return None
+        log(f'{job}: transient codex failure #{count + 1}, {self.config.retry_window} s retry window spent: {error}')
+        self.store.clear_transient(job.id)
+        return review_body(job.head, 'failed', '', [], effort=effort, tests=tier, kept=kept, reason=(
+            f'codex failed with transient upstream errors {count + 1} time(s) over {int(now - since)} s and the '
+            f'{self.config.retry_window} s retry window is spent'), reasons=[f'last error: {error}'])
+
     def publish(self, job, verdict, body, comments, token=None):
         token = token or self.github.token(job.installation)
         existing = self.github.existing_marker(job.full_name, job.number, job.head, token)
@@ -1210,6 +1276,14 @@ class Reviewer:
         message = final_message(events, last)
         comments = []
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
+        upstream = None if timed_out else transient_error(rc, events)
+        if upstream is not None:
+            body = self.defer_or_give_up(job, upstream, effort, tier, kept)
+            if body is None:
+                return None
+            self.keep_output(job, output, stderr, last)
+            return self.publish(job, 'failed', body, [], token)
+        self.store.clear_transient(job.id)
         if timed_out:
             verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, tests=tier,
                                                   kept=kept, reason=(

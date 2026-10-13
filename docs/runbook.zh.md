@@ -70,7 +70,7 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 - 正文包含结论摘要和每条发现的完整内容。发现中的 `路径:行号` 去掉工作树前缀后，如果该行在 PR diff 的右侧，再另外作为行内评论。GitHub 对整条 review 返回 422 时，去掉全部行内评论重发一次；因为正文本来就包含全部发现，所以不会丢失内容。
 - 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。`verdict=invalid` 的标记不算，所以作废后重新入队的 head 会再审一次。
 - 结论判定（§2.4.1）默认为 `failed`。最终消息优先取 `-o` 输出文件，取不到时取 `--json` 事件流中最后一条 `agent_message`。
-- 超时（默认 40 分钟）或判定为 `failed` 时，发 `verdict=failed`，正文写明「This is not a pass」，并逐条列出未通过的检查。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--enqueue`。
+- codex 因上游临时故障失败时先按 §2.4.2 重试，不发 review。超时（默认 40 分钟）或判定为 `failed` 时，发 `verdict=failed`，正文写明「This is not a pass」，并逐条列出未通过的检查。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--enqueue`。
 - 结论为 `failed`，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
 - GitHub 或 git 出错（不是 codex 本身失败）时，任务重新排队，等待 5 分钟乘以已失败次数后再试。累计 `CODEX_REVIEW_MAX_ATTEMPTS`（默认 3）次仍失败时，发 `failed` 标记。
 
@@ -81,7 +81,7 @@ codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独
 - codex 退出码为 0、有最终消息，并且最终消息含 `[P0]` 到 `[P3]` 的发现或 `VERDICT: FINDINGS` 行时，判为 `findings`。
 - 同时满足以下全部条件时，判为 `clean`：
   1. codex 退出码为 0；
-  2. 事件流中有 `turn.completed`，没有 `turn.failed`、顶层 `error` 事件和 `error` 条目；
+  2. 事件流中有 `turn.completed`，没有 `turn.failed`、`error` 条目和顶层 `error` 事件。例外：回合正常完成时，内容属于临时故障的顶层 `error` 事件（例如 `Reconnecting... 2/5 (unexpected status 503 …)`）只是 codex 自动重连的通知，不计；
   3. 至少有一条 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，即 codex 确实执行过读取代码的命令；
   4. 最终消息中没有失败信号，例如 blocked、placeholder、unable to read、工具缺失、`Reviewer failed to output a response.`，完整列表见 `codex_review.py` 的 `FAILURE_SIGNAL_RE`；
   5. 最终消息中恰好有一行 `VERDICT: CLEAN`。
@@ -90,6 +90,16 @@ codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独
 第 5 条的结论行来自提示词：两档提示都要求 codex 在 `overall_explanation` 末尾写 `VERDICT: CLEAN`、`VERDICT: FINDINGS` 或 `VERDICT: BLOCKED`。`--json` 事件流不包含 review 模式的结构化字段 `overall_correctness`，而且工具失败时 codex 仍可能把该字段填成占位值，所以不用它判定。结论行写在 `overall_explanation` 内，因为 codex 只取模型输出中的 JSON 对象，对象之外的文字会被丢弃。
 
 原因：审查主机缺少 `codex-code-mode-host` 时，codex 的每次工具调用都失败，模型仍然输出没有 `[P*]` 的说明。旧规则把这种输出判为 `clean`。现在缺任何一条证据都发 `failed`。
+
+#### 2.4.2 上游临时故障的重试
+
+codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并且决定性的错误消息属于临时故障时，本次结果作废，不发 review。决定性消息取最后一个 `turn.failed` 的 `error.message`，没有 `turn.failed` 时取最后一个顶层 `error` 事件。临时故障包括：模型满载（`Selected model is at capacity`）、overloaded、429 与 rate limit、usage limit、5xx、`stream disconnected`、连接重置或中断、网络超时，完整列表见 `codex_review.py` 的 `TRANSIENT_RE`。其他失败（输出格式不对、没有读代码的证据、工具缺失、401 等）是确定性失败，立即按 §2.4.1 发 `failed`。
+
+- 同一任务重新排队，延迟按 `CODEX_REVIEW_RETRY_FIRST_SECONDS`（默认 60）逐次翻倍，封顶 `CODEX_REVIEW_RETRY_MAX_DELAY_SECONDS`（默认 1800），即 1、2、4、8、16、30、30 分钟。每次重试记一行日志 `transient codex failure #<n>, retrying in <s> s: <错误原文>`。
+- 自第一次临时故障起，已过时间加下一次延迟超过 `CODEX_REVIEW_RETRY_WINDOW_SECONDS`（默认 7200）时不再重试，发 `failed`，正文写明临时故障次数、持续时间和最后一条错误原文。默认参数下最多运行 8 次 codex。
+- 重试状态存放在 `state.sqlite` 的 `retries` 表，任务以 `queued` 状态等待，服务重启后照常继续。
+- 等待重试期间 PR 收到新 head，或重试前查询发现 head 已变，旧任务按 §2.3 标为 `superseded`。同一 head 再次入队时重新计算重试时长。
+- 本服务自己的 40 分钟超时不算临时故障，直接发 `failed`：一次审查跑满 40 分钟后再重试，2 小时内最多再跑两次，代价高且多半同样超时。
 
 ### 2.5 漏投补救
 
