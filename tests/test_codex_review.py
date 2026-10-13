@@ -152,8 +152,10 @@ class FakeGit:
             self.during_delta()
         return getattr(self, 'delta', ('c' * 40, f'delta from reviewed head {prev[:12]}'))
 
-    def diff_files(self, full_name, tree, head):
-        return getattr(self, 'delta_files', ['src/fix.py'])
+    def diff_files(self, full_name, old, new):
+        if old == getattr(self, 'delta', ('c' * 40,))[0]:
+            return getattr(self, 'delta_files', ['src/fix.py'])
+        return getattr(self, 'base_touched', [])
 
     def add_worktree(self, full_name, path, head):
         path.mkdir(parents=True)

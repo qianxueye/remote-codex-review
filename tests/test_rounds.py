@@ -157,6 +157,31 @@ class DeltaTests(Rounds):
         self.assertEqual(status, 'findings')
         self.assertIn('**[P1] Order is sent twice**', body)
 
+    def test_empty_delta_whose_base_merge_touched_a_blocker_file_is_reviewed_in_full(self):
+        self.first_round(message(finding('P1', 'Order is sent twice', 'src/order.py', 7, 90)), message(verdict='CLEAN'))
+        self.git.delta_files, self.git.base_touched = [], ['src/order.py']
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual(status, 'clean')
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 4)
+        self.assertIn('mode=full -->', body)
+        self.assertIn('changed the files of 1 earlier blocking finding(s)', body)
+        self.assertNotIn(cr.CARRIED_HEADING, body)
+
+    def test_empty_delta_whose_base_merge_left_blocker_files_alone_carries_them(self):
+        self.first_round(message(finding('P1', 'Order is sent twice', 'src/order.py', 7, 90)), message(verdict='CLEAN'))
+        self.git.delta_files, self.git.base_touched = [], ['src/other.py', 'src/order.py.bak']
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual((status, len(self.codex.calls)), ('findings', 2))
+        self.assertIn('**[P1] Order is sent twice** — `src/order.py:7` · 置信度 90', body)
+
+    def test_empty_delta_after_an_unparsed_previous_review_is_reviewed_in_full(self):
+        self.first_round('One issue: [P1] the retry loop never ends.\nVERDICT: FINDINGS', message(verdict='CLEAN'))
+        self.assertIn('unparsed finding(s)**', self.github.posted[0]['body'])
+        self.git.delta_files = []
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 4)
+        self.assertIn('mode=full -->', body)
+
     def test_empty_delta_after_only_non_blocking_findings_is_clean(self):
         self.first_round(message(finding('P2', 'Slow loop', 'src/app.py', 7, 90)), message(verdict='CLEAN'))
         self.git.delta_files = []
@@ -245,10 +270,28 @@ class ConfidenceTests(Rounds):
         status, _ = self.review_once(message(finding('P1', 'Guess', 'src/a.py', 3, 10)))
         self.assertEqual(status, 'failed')
 
+    def test_floor_is_compared_before_rounding(self):
+        for line, posted in (('Confidence: 49.6', False), ('confidence_score: 0.496', False),
+                             ('Confidence: 50.0', True), ('confidence_score: 0.5', True)):
+            with self.subTest(line):
+                self.github.posted.clear()
+                self.github.markers.clear()
+                self.store.db.execute('DELETE FROM jobs')
+                self.store.db.execute('DELETE FROM deliveries')
+                msg = message(finding('P2', 'Edge', 'src/app.py', 3, body=f'Off by one.\n  {line}'))
+                status, post = self.review_once(msg)
+                self.assertEqual(status, 'findings' if posted else 'clean')
+                self.assertEqual('Edge' in post['body'], posted)
+                if posted:
+                    self.assertIn('· 置信度 50', post['body'])
+
     def test_confidence_scales(self):
         self.assertEqual(cr.confidence('Confidence: 50'), 50)
         self.assertEqual(cr.confidence('**Confidence:** 49'), 49)
         self.assertEqual(cr.confidence('confidence_score: 0.8'), 80)
+        self.assertEqual(cr.confidence('Confidence: 49.6'), cr.Decimal('49.6'))
+        self.assertLess(cr.confidence('confidence_score: 0.496'), cr.CONFIDENCE_FLOOR)
+        self.assertIsNone(cr.confidence('confidence_score: 1.5'))
         self.assertIsNone(cr.confidence('confidence_score: 80'))
         self.assertIsNone(cr.confidence('Confidence: 101'))
         self.assertIsNone(cr.confidence('no score here'))
@@ -315,6 +358,39 @@ class DeltaTreeTests(unittest.TestCase):
         self.assertIn('conflicts', why)
         self.assertEqual(self.git.diff_files(REPO, tree, self.head), ['c.txt', 'd.txt'])
         self.assertFalse((self.git.work / '1' / 'delta-base').exists())
+
+    def test_modify_delete_conflict_falls_back_to_a_full_round(self):
+        git(self.src, 'switch', '-q', '-c', 'pr2', self.prev)
+        (self.src / 'a.txt').write_text('a changed on the branch\n')
+        git(self.src, 'commit', '-qam', 'modify a')
+        prev = git(self.src, 'rev-parse', 'HEAD')
+        git(self.src, 'switch', '-q', 'main')
+        git(self.src, 'rm', '-q', 'a.txt')
+        git(self.src, 'commit', '-qm', 'delete a')
+        git(self.src, 'switch', '-q', 'pr2')
+        subprocess.run(['git', '-C', str(self.src), 'merge', '-q', 'main'], capture_output=True,
+                       env=dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t', GIT_COMMITTER_NAME='t',
+                                GIT_COMMITTER_EMAIL='t@t'))
+        (self.src / 'c.txt').write_text('resolved\n')
+        git(self.src, 'add', '-A')
+        git(self.src, 'commit', '-qm', 'keep a, resolve c')
+        head = git(self.src, 'rev-parse', 'HEAD')
+        git(self.src, 'push', '-q', '-f', str(self.git.mirror(REPO)), 'main:refs/remotes/origin/main',
+            'pr2:refs/codex/pr/7')
+        tree, why = self.git.delta_tree(REPO, 'main', prev, head, self.git.work / '1' / 'delta-base')
+        self.assertIsNone(tree)
+        self.assertIn('conflicts without text markers (a.txt)', why)
+        self.assertFalse((self.git.work / '1' / 'delta-base').exists())
+
+    def test_unmarked_conflict_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'text.txt').write_text('<<<<<<< HEAD\na\n=======\nb\n>>>>>>> main\n')
+            Path(tmp, 'bin.dat').write_bytes(b'\x00ours')
+            listing = ''.join(f'{mode} {"0" * 40} {stage}\t{path}\0' for mode, stage, path in (
+                ('100644', 1, 'text.txt'), ('100644', 2, 'text.txt'), ('100644', 3, 'text.txt'),
+                ('100644', 1, 'bin.dat'), ('100644', 2, 'bin.dat'), ('100644', 3, 'bin.dat'),
+                ('120000', 2, 'link'), ('120000', 3, 'link'), ('100644', 1, 'gone.txt'), ('100644', 2, 'gone.txt')))
+            self.assertEqual(cr.unmarked_conflicts(listing, tmp), ['bin.dat', 'gone.txt', 'link'])
 
     def test_force_pushed_head_has_no_delta(self):
         git(self.src, 'switch', '-q', '-c', 'rewrite', 'main')

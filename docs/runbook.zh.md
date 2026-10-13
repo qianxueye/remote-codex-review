@@ -79,7 +79,7 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独保存。事件格式见 §9。
 
 - 每条发现必须带置信度（0–100）。提示要求 codex 在每条发现正文末尾写一行 `Confidence: <0-100>`；codex 0.160.1 的 `--json` 输出和最终消息都不含 review 模式的结构化 `confidence_score`，所以只能从文字中读。文字写成 `confidence_score: 0.8` 时按 0–1 刻度乘以 100；`Confidence:` 后的值超过 100、`confidence_score` 超过 1，或没有写，都按缺失处理。
-- 置信度 ≥ 50 的发现才发布到 PR（正文和行内评论都标出「置信度 NN」），并参与判定。低于 50 或缺失的发现不发布、不计入判定：日志中每条记一行 `not posted, confidence missing or below 50`，完整输出按 §2.4 写入 `output/<任务 id>.log`，正文最后一行写「另有 N 条置信度低于 50 的发现未提交」。
+- 置信度 ≥ 50 的发现才发布到 PR（正文和行内评论都标出「置信度 NN」），并参与判定。比较用未取整的精确值，例如 `Confidence: 49.6`、`confidence_score: 0.496` 都低于 50，不发布；只有正文显示时取整。低于 50 或缺失的发现不发布、不计入判定：日志中每条记一行 `not posted, confidence missing or below 50`，完整输出按 §2.4 写入 `output/<任务 id>.log`，正文最后一行写「另有 N 条置信度低于 50 的发现未提交」。
 - codex 退出码为 0、有最终消息，并且有置信度 ≥ 50 的发现时，判为 `findings`。最终消息含 `[P0]` 到 `[P3]` 标记却解析不出任何一条带位置的发现，或者写了 `VERDICT: FINDINGS` 却没有任何发现时，也判为 `findings`，正文附上原文：这是解析失败，不是「没写置信度的发现」，因此按失败从严处理。
 - 同时满足以下全部条件时，判为 `clean`：
   1. codex 退出码为 0；
@@ -190,9 +190,9 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 - 首轮（`mode=full`）：找不到上一个已审 head、PR 的 base 分支与上一个已审 head 审查时的 base 不同（PR 改了目标分支）、上一个已审 head 已不在 bare 镜像中、它不是新 head 的祖先（例如 force-push 或 rebase），或计算增量基准失败时，做首轮。首轮跑两遍独立审查，档位 `xhigh`，每遍的超时为 `CODEX_REVIEW_FIRST_TIMEOUT_SECONDS`（默认 3600 秒）。第一遍侧重改动本身的正确性，第二遍侧重调用方与边界输入。两遍都通过 §2.4.1 的检查后合并：同一文件中行号范围重叠的发现折叠为一条，另一遍的报告附在其下；按优先级排序。任一遍判为 `failed`，或超时，整轮发 `failed`；第一遍 codex 退出码非 0 或超时时，不再跑第二遍。正文写明选择首轮的原因。
 - 复审（`mode=delta`）：只跑一遍，超时为 `CODEX_REVIEW_TIMEOUT_SECONDS`。增量基准树按以下步骤计算：
   1. 在 `refs/remotes/origin/<base>` 的第一父链上，取新 head 已包含的最新提交 M（新 head 一个都不包含时做首轮）；
-  2. 在 `work/<任务 id>/delta-base` 建一个停在上一个已审 head 的临时工作树，执行 `git merge --no-commit --no-ff M`。有冲突时保留带冲突标记的文件；`git add --all` 后用 `git write-tree` 得到基准树，再删除临时工作树。
+  2. 在 `work/<任务 id>/delta-base` 建一个停在上一个已审 head 的临时工作树，执行 `git merge --no-commit --no-ff M`。`git add --all` 之前先用 `git ls-files --unmerged` 列出未合并的条目：只有两边都存在、都是普通文件、并且工作树文件中有 `<<<<<<<` 和 `>>>>>>>` 冲突标记的文本冲突才保留在基准树中；modify/delete、符号链接、二进制、改名等冲突在工作树中可能只剩一边的版本，增量无法显示其解决结果，这时做首轮。然后用 `git write-tree` 得到基准树，再删除临时工作树。
   3. 交给 codex 的是 `git diff <基准树> HEAD`：从 base 合入的改动已在基准树中，不出现在增量里；解冲突的改动仍在增量里（删除冲突标记的 hunk 即解冲突结果）。这里不用 `git merge-tree --write-tree`，因为 Ubuntu 22.04 自带的 git 2.34 还没有这个选项（2.38 起才有）。
-- 增量为空（新 head 相对上一个已审 head 只有从 base 合入的改动）时不调用 codex。发布前与普通审查一样重新读取实时 PR：PR 已关闭、head 已变、不再满足准入条件（例如变成被排除的草稿）时不发布；base 已变时重新排队。然后从上一条 review 正文中取出已发布的阻塞项（P0/P1，或涉及资金、止损、凭据、安全边界的发现，「登记项」一节除外），原文沿用到本次正文的「上一轮仍未处理的阻塞项（增量为空）」一节，发 `verdict=findings effort=none tests=read-only mode=delta`；没有阻塞项时发 `verdict=clean effort=none tests=read-only mode=delta`。其余非阻塞发现不沿用：它们已在上一个 head 上裁决过，本 head 没有改动相关代码。
+- 增量为空（新 head 相对上一个已审 head 只有从 base 合入的改动）时不调用 codex。发布前与普通审查一样重新读取实时 PR：PR 已关闭、head 已变、不再满足准入条件（例如变成被排除的草稿）时不发布；base 已变时重新排队。然后从上一条 review 正文中取出已发布的阻塞项（P0/P1，或涉及资金、止损、凭据、安全边界的发现，「登记项」一节除外），原文沿用到本次正文的「上一轮仍未处理的阻塞项（增量为空）」一节，发 `verdict=findings effort=none tests=read-only mode=delta`；没有阻塞项时发 `verdict=clean effort=none tests=read-only mode=delta`。以下情况不沿用，改做首轮：从 base 合入的改动（上一个已审 head 到基准树的差异）碰到了某个阻塞项所在的文件，或某个阻塞项没有可识别的 `路径:行号`，因为合入的改动可能已经修掉它；上一条 review 正文被截断，或含解析不出的发现，阻塞项无法完整取出。选首轮而不是只针对这些阻塞项再审一遍，是因为这种情况少见，首轮是已有、已验证的路径，不需要另一套提示词和判定规则。其余非阻塞发现不沿用：它们已在上一个 head 上裁决过，本 head 没有改动相关代码。
 - 复审提示附上上一条 review 的正文（最多 20000 字符），要求报告：增量引入的问题；增量中对上次发现修得不完整或不对的地方。增量之外、本次未改动代码中的问题写进 `增量外问题（登记，不阻塞）` 一节。服务把这一节从最终消息中拆出：
   - 置信度 ≥ 50，并且是 P0/P1，或涉及资金、止损、凭据、安全边界的，列入正文「增量外但阻塞的问题」一节，结论计为 `findings`；
   - 置信度 ≥ 50 的其余条目列入正文「登记项」一节，不计入 verdict；这些条目需要登记为 issue 并在 PR 上回复，不阻塞合并；

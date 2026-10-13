@@ -3,6 +3,7 @@
 import argparse
 import base64
 import calendar
+from decimal import Decimal
 import hashlib
 import hmac
 import http.server
@@ -527,24 +528,25 @@ class Finding:
         return f'{self.path}:{self.start}' + (f'-{self.end}' if self.end != self.start else '')
 
     def heading(self):
-        score = self.confidence
-        return (f'**[{self.priority}] {self.title}** — `{self.location()}` · '
-                + (f'置信度 {score}' if score is not None else '置信度未给出'))
+        return f'**[{self.priority}] {self.title}** — `{self.location()}` · {shown(self.confidence)}'
+
+
+def shown(score):
+    """Render a confidence for the review text; rounding happens only here."""
+    return '置信度未给出' if score is None else f'置信度 {int(score.to_integral_value())}'
 
 
 def confidence(text):
-    """Return the last stated confidence as 0-100: `Confidence: NN` is 0-100, `confidence_score: 0.NN` is 0-1.
+    """Return the last stated confidence as an exact 0-100 Decimal; `confidence_score: 0.NN` is on a 0-1 scale.
 
-    A value outside its scale counts as missing (None).
+    A value outside its scale counts as missing (None); the floor is compared before any rounding.
     """
     found = CONFIDENCE_RE.findall(text)
     if not found:
         return None
     scored, value = found[-1]
-    number = float(value) * (100 if scored else 1)
-    if (scored and float(value) > 1) or number > 100:
-        return None
-    return int(round(number))
+    number = Decimal(value) * (100 if scored else 1)
+    return None if number > 100 else number
 
 
 def split_register(message):
@@ -581,6 +583,12 @@ def blocking_items(body):
             current = None
     blocks = ['\n'.join(item).strip() for item in items]
     return [block for block in blocks if BLOCKING_RE.search(block)]
+
+
+def blocker_path(item):
+    """Return the file path a carried finding points at, or None when it names no `path:line`."""
+    match = re.search(r'\s(?:—|–|--|-)\s+`?([^`\s]+?):\d+(?:-\d+)?(?:`|:|\s|$)', item.splitlines()[0])
+    return match.group(1) if match else None
 
 
 def merge_findings(passes):
@@ -755,7 +763,7 @@ def inline_comments(findings, diff):
         if not lines or finding.end not in lines:
             continue
         comment = {'path': finding.path, 'line': finding.end, 'side': 'RIGHT',
-                   'body': f'**[{finding.priority}] {finding.title}** · 置信度 {finding.confidence}\n\n{finding.text}'}
+                   'body': f'**[{finding.priority}] {finding.title}** · {shown(finding.confidence)}\n\n{finding.text}'}
         if finding.start != finding.end and lines.get(finding.start) == lines[finding.end]:
             comment.update(start_line=finding.start, start_side='RIGHT')
         comments.append(comment)
@@ -1168,6 +1176,10 @@ class Git:
                                      'merge', '--quiet', '--no-commit', '--no-ff', merged])
             if conflicts > 1:
                 return None, f'merging origin/{base} {merged[:12]} into {prev[:12]} failed (rc={conflicts})'
+            unmarked = unmarked_conflicts(self.run([*here, 'ls-files', '--unmerged', '-z']), scratch)
+            if unmarked:
+                return None, ('merging origin/{} into {} left conflicts without text markers ({}), so the delta '
+                              'cannot show their resolution').format(base, prev[:12], ', '.join(unmarked[:5]))
             self.run([*here, 'add', '--all'])
             tree = self.run([*here, 'write-tree'])
         finally:
@@ -1207,6 +1219,28 @@ class Git:
         if self.mirrors.exists():
             for mirror in self.mirrors.glob('*/*.git'):
                 self.run(['-C', str(mirror), 'worktree', 'prune'])
+
+
+def unmarked_conflicts(listing, worktree):
+    """Return unmerged paths whose conflict is not written as text markers (modify/delete, symlink, binary, rename).
+
+    `listing` is `git ls-files --unmerged -z` output.
+    """
+    entries = {}
+    for record in filter(None, listing.split('\0')):
+        meta, _, path = record.partition('\t')
+        mode, _, stage = meta.split()
+        entries.setdefault(path, {})[stage] = mode
+    unmarked = []
+    for path, stages in entries.items():
+        regular = {'2', '3'} <= set(stages) and all(mode in ('100644', '100755') for mode in stages.values())
+        try:
+            text = (Path(worktree) / path).read_bytes() if regular else b''
+        except OSError:
+            text = b''
+        if not re.search(rb'^<{7}(?: |$)', text, re.M) or not re.search(rb'^>{7}(?: |$)', text, re.M):
+            unmarked.append(path)
+    return sorted(unmarked)
 
 
 class GovernanceDoc:
@@ -1389,9 +1423,9 @@ def self_check(codex, work_dir, timeout=300):
 class Plan:
     """How one head is reviewed: mode full or delta, the changed files, effort and (label, prompt sections) passes."""
 
-    def __init__(self, mode, why, files, effort, passes, timeout, prev=None):
+    def __init__(self, mode, why, files, effort, passes, timeout, prev=None, carried=()):
         self.mode, self.why, self.files, self.effort = mode, why, files, effort
-        self.passes, self.timeout, self.prev = passes, timeout, prev
+        self.passes, self.timeout, self.prev, self.carried = passes, timeout, prev, list(carried)
 
 
 class Reviewer:
@@ -1541,10 +1575,20 @@ class Reviewer:
             tree, why = self.git.delta_tree(job.full_name, base, previous[0], job.head, scratch / 'delta-base')
             if tree:
                 files = self.git.diff_files(job.full_name, tree, job.head)
-                effort = choose_effort(self.config.effort_rules, job.full_name, files)
-                sections = delta_prompt(base, previous[0], tree, files, previous[1])
-                return Plan('delta', why, files, effort, [('复审', sections)], self.config.timeout_seconds,
-                            previous[0])
+                carried = [] if files else blocking_items(previous[1])
+                touched = self.git.diff_files(job.full_name, previous[0], tree) if carried else []
+                stale = [item for item in carried if blocker_path(item) is None or blocker_path(item) in touched]
+                if not files and ('\n\n[truncated' in previous[1] or 'unparsed finding(s)**' in previous[1]):
+                    why = (f'the delta since {previous[0][:12]} is empty but the previous review text is truncated '
+                           'or holds unparsed findings, so its blockers cannot be carried over')
+                elif stale:
+                    why = (f'the delta since {previous[0][:12]} is empty but the merge from origin/{base} changed the '
+                           f'files of {len(stale)} earlier blocking finding(s), so they are reviewed again')
+                else:
+                    effort = choose_effort(self.config.effort_rules, job.full_name, files)
+                    sections = delta_prompt(base, previous[0], tree, files, previous[1])
+                    return Plan('delta', why, files, effort, [('复审', sections)], self.config.timeout_seconds,
+                                previous[0], carried)
         files = self.git.changed_files(job.full_name, base, job.head)
         return Plan('full', why, files, FIRST_ROUND_EFFORT,
                     [(label, first_prompt(base, lens)) for label, lens in LENSES], self.config.first_timeout_seconds)
@@ -1598,10 +1642,9 @@ class Reviewer:
             token, outcome = self.recheck(job, base)
             if token is None:
                 return outcome
-            carried = blocking_items(previous[1])
-            verdict = 'findings' if carried else 'clean'
+            verdict = 'findings' if plan.carried else 'clean'
             return self.publish(job, verdict, review_body(
-                job.head, verdict, '', [], effort='none', mode='delta', carried=carried, scope=(
+                job.head, verdict, '', [], effort='none', mode='delta', carried=plan.carried, scope=(
                     f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
                     '合入的改动），未调用 codex。')), [], token)
         runs = []
