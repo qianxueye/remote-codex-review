@@ -806,13 +806,19 @@ class CodexRunner:
                 '-c', f'model_reasoning_effort={effort}',
                 'review', '--base', f'origin/{base}', '-o', str(last_message)]
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch):
+    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed):
+        """Return (rc, output, last message, timed out); rc is None when proceed() refused the start.
+
+        proceed() runs under the lock that cancel() takes, so a cancel issued before registration is not lost.
+        """
         last_message, output = scratch / 'last-message.txt', scratch / 'codex.log'
         with open(output, 'wb') as sink:
-            process = subprocess.Popen(self.command(base, last_message, effort), cwd=str(worktree),
-                                       stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
             with self.lock:
+                if not proceed():
+                    return None, '', '', False
+                process = subprocess.Popen(self.command(base, last_message, effort), cwd=str(worktree),
+                                           stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
                 self.groups[job_id] = process.pid
             timed_out = False
             try:
@@ -958,8 +964,8 @@ class Reviewer:
         try:
             log(f'{job}: codex review started against origin/{base} effort={effort}')
             started = time.time()
-            rc, output, last, timed_out = self.codex(job.id, worktree, base, effort,
-                                                     self.config.timeout_seconds, scratch)
+            rc, output, last, timed_out = self.codex(job.id, worktree, base, effort, self.config.timeout_seconds,
+                                                     scratch, lambda: self.store.status(job.id) == 'running')
             log(f'{job}: codex finished rc={rc} timed_out={timed_out} after {int(time.time() - started)} s')
         finally:
             with self.repo_lock(job.full_name):
@@ -968,6 +974,9 @@ class Reviewer:
         if self.store.status(job.id) == 'superseded':
             log(f'{job}: superseded by a newer head; result discarded')
             return 'superseded'
+        if rc is None:
+            log(f'{job}: codex not started; job is {self.store.status(job.id)}')
+            return self.store.status(job.id)
         if self.stop.is_set():
             self.store.retry(job.id, 0, count_attempt=False)
             return None

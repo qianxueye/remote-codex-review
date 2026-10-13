@@ -125,7 +125,9 @@ class FakeCodex:
         self.calls = []
         self.cancelled = []
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch):
+    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed):
+        if not proceed():
+            return None, '', '', False
         self.calls.append((job_id, worktree, base, effort))
         if self.during:
             self.during()
@@ -352,6 +354,24 @@ class ReviewTests(Harness):
         self.codex.during = lambda: self.deliver(pull_payload(head=NEW_HEAD), guid='d-2')
         job, status = self.run_next()
         self.assertEqual((status, self.github.posted, self.codex.cancelled), ('superseded', [], [job.id]))
+
+    def test_cancel_before_codex_start_is_not_lost(self):
+        stub = self.root / 'codex-stub'
+        started = self.root / 'codex-started'
+        stub.write_text(f'#!/bin/sh\ntouch {started}\n')
+        stub.chmod(0o700)
+        self.reviewer.codex = cr.CodexRunner(str(stub))
+        self.app.on_queued = self.reviewer.on_queued
+        add_worktree = self.git.add_worktree
+
+        def push_then_add(full_name, path, head):
+            self.deliver(pull_payload(head=NEW_HEAD), guid='d-2')
+            add_worktree(full_name, path, head)
+        self.git.add_worktree = push_then_add
+        self.deliver(pull_payload())
+        _, status = self.run_next()
+        self.assertEqual((status, self.github.posted), ('superseded', []))
+        self.assertFalse(started.exists(), 'codex started after its job was superseded')
 
     def test_head_moved_during_review_discards_result(self):
         self.deliver(pull_payload())
