@@ -470,7 +470,8 @@ class ReviewTests(Harness):
         self.assertIn(f'`$CODEX_REVIEW_STATE_DIR/output/{job.id}.log`', self.github.posted[0]['body'])
 
     def test_truncated_body_points_to_kept_full_text(self):
-        self.codex.message = 'Summary.\n\n- [P2] Long finding — src/app.py:1\n' + '  detail\n' * 10000 + '  END-OF-TEXT'
+        self.codex.message = ('Summary.\n\n- [P2] Long finding — src/app.py:1\n'
+                              + '  detail\n' * 10000 + '  END-OF-TEXT')
         self.deliver(pull_payload())
         job, status = self.run_next()
         body = self.github.posted[0]['body']
