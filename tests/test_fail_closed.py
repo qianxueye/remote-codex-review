@@ -304,7 +304,10 @@ REAL_CLEAN_WITHOUT_PYTEST = (
     '未发现符合报告标准的新缺陷；diff 检查和合约清单校验通过。环境仅有 Python 3.10 且缺少 pytest，未能执行项目测试。\n'
     'VERDICT: CLEAN',
     '未发现此次变更引入的明确缺陷。合约清单校验通过；当前环境缺少 pytest，未能运行测试。\nVERDICT: CLEAN',
-    'No defects found. I was unable to run the test suite because pytest is not installed.\nVERDICT: CLEAN')
+    'No defects found. I was unable to run the test suite because pytest is not installed.\nVERDICT: CLEAN',
+    '未发现缺陷。沙箱禁止联网，无法访问 GitHub API，未核对 issue 正文。\nVERDICT: CLEAN',
+    'No defects found. I was unable to access the GitHub API from the sandbox, so the issue text was not checked.\n'
+    'VERDICT: CLEAN')
 
 
 class TestRunLimitTests(unittest.TestCase):

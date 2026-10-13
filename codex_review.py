@@ -51,10 +51,10 @@ VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
 FAILURE_SIGNAL_RE = re.compile(
     r'\bblocked\b|placeholder|\bunverified\b|Reviewer failed to output a response|no such file or directory'
     r'|failed to spawn|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to '
-    r'(?:review|inspect|read|access|open|view|examine|load)\b'
+    r'(?:review|inspect|read|open|view|examine|load)\b'
     r'|\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|mode)s? '
     r'(?:is |was |are |were )?(?:missing|unavailable|not found|not installed)'
-    r'|(?:无法|未能)(?:检查|审查|读取|查看|访问)|工具缺失|缺少(?:组件|工具|程序)', re.I)
+    r'|(?:无法|未能)(?:检查|审查|读取|查看)|工具缺失|缺少(?:组件|工具|程序)', re.I)
 TRANSIENT_RE = re.compile(
     r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
