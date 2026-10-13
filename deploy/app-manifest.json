@@ -1,0 +1,19 @@
+{
+  "name": "remote-codex-review",
+  "url": "https://github.com/<owner>/remote-codex-review",
+  "description": "Posts one codex review per pull request head.",
+  "public": true,
+  "redirect_url": "https://review.example.com/app-created",
+  "hook_attributes": {
+    "url": "https://review.example.com/webhook",
+    "active": true
+  },
+  "default_events": [
+    "pull_request"
+  ],
+  "default_permissions": {
+    "contents": "read",
+    "metadata": "read",
+    "pull_requests": "write"
+  }
+}

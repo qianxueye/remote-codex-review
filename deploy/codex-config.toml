@@ -1,0 +1,8 @@
+model = "gpt-6.1-sol"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "OpenAI"
+requires_openai_auth = true
+supports_websockets = true
+wire_api = "responses"

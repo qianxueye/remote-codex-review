@@ -1,0 +1,34 @@
+[Unit]
+Description=Remote codex review: webhook receiver and review workers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-review
+Group=codex-review
+WorkingDirectory=/var/lib/codex-review
+Environment=HOME=/var/lib/codex-review
+Environment=CODEX_HOME=/var/lib/codex-review/.codex
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /opt/codex-review/codex_review.py --config /etc/codex-review/codex-review.env
+Restart=on-failure
+RestartSec=10s
+KillMode=mixed
+TimeoutStopSec=60s
+Nice=10
+MemoryMax=3G
+CPUQuota=300%
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/codex-review
+InaccessiblePaths=-/opt/actions-runner -/etc/codex-review-tunnel
+# codex runs commands under bubblewrap, which needs user namespaces and a fresh /proc:
+# keep namespace, /proc and syscall-filter hardening off (docs/runbook.zh.md).
+
+[Install]
+WantedBy=multi-user.target

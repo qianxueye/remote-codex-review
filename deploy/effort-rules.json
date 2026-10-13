@@ -1,0 +1,13 @@
+{
+  "default": {
+    "medium": [
+      "docs/wiki/**",
+      "docs/*.md",
+      "**/README.md"
+    ],
+    "high": [
+      "docs/runbooks/**"
+    ]
+  },
+  "repos": {}
+}

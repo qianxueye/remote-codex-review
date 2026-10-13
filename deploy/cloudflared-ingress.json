@@ -1,0 +1,14 @@
+{
+  "config": {
+    "ingress": [
+      {
+        "hostname": "review.example.com",
+        "path": "^/webhook$",
+        "service": "http://127.0.0.1:8787"
+      },
+      {
+        "service": "http_status:404"
+      }
+    ]
+  }
+}

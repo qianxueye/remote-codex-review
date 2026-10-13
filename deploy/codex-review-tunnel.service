@@ -1,0 +1,33 @@
+[Unit]
+Description=Cloudflare Tunnel carrying GitHub webhooks to the remote codex review receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=codex-review-tunnel
+Group=codex-review-tunnel
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --token-file /etc/codex-review-tunnel/token
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+MemoryMax=256M
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+InaccessiblePaths=-/opt/actions-runner -/var/lib/codex-review -/etc/codex-review
+
+[Install]
+WantedBy=multi-user.target
