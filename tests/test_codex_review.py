@@ -93,6 +93,9 @@ class FakeGitHub:
         self.files = []
         self.base = 'main'
         self.draft = False
+        self.issues = {}
+        self.comments = {}
+        self.issue_calls = []
 
     def token(self, installation):
         return 'installation-token'
@@ -108,6 +111,16 @@ class FakeGitHub:
     def existing_marker(self, full_name, number, head, token):
         return self.markers.get((number, head))
 
+    def issue(self, full_name, number, token):
+        self.issue_calls.append((full_name, number))
+        result = self.issues[(full_name, number)]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def issue_comments(self, full_name, number, token):
+        return self.comments.get((full_name, number), [])
+
     def post_review(self, full_name, number, head, body, comments, token):
         self.posted.append({'number': number, 'head': head, 'body': body, 'comments': comments})
         self.markers[(number, head)] = (cr.MARKER_RE.search(body).group(2), len(self.posted))
@@ -119,6 +132,7 @@ class FakeGit:
         self.work = root / 'work'
         self.fetched = []
         self.removed = []
+        self.agents = None
 
     def fetch(self, full_name, number, base, token):
         self.fetched.append((full_name, number, base))
@@ -129,6 +143,8 @@ class FakeGit:
 
     def add_worktree(self, full_name, path, head):
         path.mkdir(parents=True)
+        if self.agents is not None:
+            (path / 'AGENTS.md').write_text(self.agents, encoding='utf-8')
 
     def remove_worktree(self, full_name, path):
         self.removed.append(path)
@@ -140,11 +156,14 @@ class FakeCodex:
         self.events = None
         self.calls = []
         self.cancelled = []
+        self.governance = None
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed):
+    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed, governance=()):
         if not proceed():
             return None, '', '', '', False
         self.calls.append((job_id, worktree, base, effort))
+        self.governance = [(doc.ref, doc.path, doc.path.read_text() if doc.path else None, doc.error)
+                           for doc in governance]
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))

@@ -44,6 +44,12 @@ VERDICT_RULE = (
     'End overall_explanation with a line that reads exactly `VERDICT: CLEAN` when you report no findings, or '
     '`VERDICT: FINDINGS` when you report at least one. If you could not run commands or read the diff, end it '
     'with `VERDICT: BLOCKED` instead and say what failed.')
+GOVERNANCE_RULE = (
+    "The repository's AGENTS.md links these GitHub issues. Their bodies are saved as files outside the "
+    'repository; read them there and do not fetch them from the network:')
+GOVERNANCE_MISSING_RULE = (
+    'These issues linked from AGENTS.md could not be fetched by the review host and are not available; do not '
+    'try to fetch them:')
 SELF_CHECK_PROMPT = 'Run `cat token.txt` and reply with the exact contents of that file and nothing else.'
 VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
 FAILURE_SIGNAL_RE = re.compile(
@@ -70,6 +76,8 @@ TRANSIENT_RE = re.compile(
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
     r'|connection (?:reset|closed|refused|error)|timed out|timeout|temporarily unavailable|network error'
     r'|error sending request', re.I)
+ISSUE_LINK_RE = re.compile(r'github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issues/(\d+)')
+GOVERNANCE_LIMIT = 20
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
 FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
@@ -391,6 +399,12 @@ class GitHub:
     def pull_files(self, full_name, number, token):
         return list(self.paged(f'/repos/{full_name}/pulls/{number}/files', token))
 
+    def issue(self, full_name, number, token):
+        return self.call('GET', f'/repos/{full_name}/issues/{number}', token)
+
+    def issue_comments(self, full_name, number, token):
+        return list(self.paged(f'/repos/{full_name}/issues/{number}/comments', token))
+
     def existing_marker(self, full_name, number, head, token):
         """Return (verdict, review id) this App already posted for head, or None."""
         bot = self.bot_login()
@@ -617,7 +631,8 @@ def inline_comments(findings, diff):
     return comments
 
 
-def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, reasons=()):
+def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, reasons=(),
+                governance=()):
     """Render the review body; it always carries the marker and every finding in full.
 
     effort is set once codex ran, which is always read-only; kept names where the full codex output is preserved.
@@ -634,6 +649,8 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
         parts.append(f'**Remote codex review: {len(findings) or "unparsed"} finding(s)** for `{head}`.')
     if effort:
         parts.append('Read-only review: codex was told not to run tests or start services.')
+    parts += [f'Governance issue `{doc.ref}` linked from AGENTS.md could not be prefetched ({doc.error}); '
+              'codex reviewed without it.' for doc in governance if doc.error]
     if summary:
         parts.append(summary)
     for finding in findings:
@@ -994,9 +1011,61 @@ class Git:
                 self.run(['-C', str(mirror), 'worktree', 'prune'])
 
 
-def review_prompt(base):
+class GovernanceDoc:
+    def __init__(self, ref, path=None, error=None):
+        self.ref, self.path, self.error = ref, path, error
+
+
+def governance_links(text):
+    """Return the distinct (owner/repo, number) issue links in text, in order, at most GOVERNANCE_LIMIT."""
+    links = []
+    for owner, repo, number in ISSUE_LINK_RE.findall(text):
+        if repo in ('.', '..'):
+            continue
+        link = (f'{owner}/{repo}', int(number))
+        if not any(same_name(link[0], seen[0]) and link[1] == seen[1] for seen in links):
+            links.append(link)
+    return links[:GOVERNANCE_LIMIT]
+
+
+def prefetch_governance(github, token, worktree, target):
+    """Save every issue linked from the worktree's AGENTS.md, with its comments, as target/owner/repo/N.md (0444).
+
+    A failed fetch is recorded on its GovernanceDoc instead of raised, so the review still runs.
+    """
+    try:
+        text = (Path(worktree) / 'AGENTS.md').read_text(encoding='utf-8', errors='replace')
+    except FileNotFoundError:
+        return []
+    docs = []
+    for full_name, number in governance_links(text):
+        doc = GovernanceDoc(f'{full_name}#{number}')
+        docs.append(doc)
+        try:
+            issue = github.issue(full_name, number, token)
+            content = f"# {issue['title']}\n\n{issue.get('body') or ''}\n" + ''.join(
+                f"\n## Comment by {(item.get('user') or {}).get('login', '?')} at {item.get('created_at', '?')}\n\n"
+                f"{item.get('body') or ''}\n" for item in github.issue_comments(full_name, number, token))
+        except (GitHubError, OSError, KeyError, TypeError) as exc:
+            doc.error = str(exc)[:200] or type(exc).__name__
+            continue
+        doc.path = target / full_name / f'{number}.md'
+        doc.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        doc.path.write_text(content, encoding='utf-8')
+        doc.path.chmod(0o444)
+    return docs
+
+
+def review_prompt(base, governance=()):
     """Name the base in the prompt, which must demand the verdict line; codex rejects --base with a prompt."""
-    return '\n\n'.join([BASE_PROMPT.format(base=base), READ_ONLY_RULE, VERDICT_RULE])
+    parts = [BASE_PROMPT.format(base=base), READ_ONLY_RULE]
+    fetched = [f'- {doc.ref}: {doc.path}' for doc in governance if doc.path]
+    missing = [f'- {doc.ref}' for doc in governance if not doc.path]
+    if fetched:
+        parts.append('\n'.join([GOVERNANCE_RULE, *fetched]))
+    if missing:
+        parts.append('\n'.join([GOVERNANCE_MISSING_RULE, *missing]))
+    return '\n\n'.join([*parts, VERDICT_RULE])
 
 
 class CodexRunner:
@@ -1007,11 +1076,12 @@ class CodexRunner:
         self.lock = threading.Lock()
         self.groups = {}
 
-    def command(self, base, last_message, effort):
+    def command(self, base, last_message, effort, governance=()):
         return [self.codex, 'exec', '--json', '--sandbox', 'read-only', '-c', 'approval_policy="never"',
-                '-c', f'model_reasoning_effort={effort}', 'review', review_prompt(base), '-o', str(last_message)]
+                '-c', f'model_reasoning_effort={effort}', 'review', review_prompt(base, governance),
+                '-o', str(last_message)]
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed):
+    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed, governance=()):
         """Return (rc, JSONL stdout, stderr, last message, timed out); rc is None when proceed() refused the start.
 
         proceed() runs under the lock that cancel() takes, so a cancel issued before registration is not lost.
@@ -1021,7 +1091,7 @@ class CodexRunner:
             with self.lock:
                 if not proceed():
                     return None, '', '', '', False
-                process = subprocess.Popen(self.command(base, last_message, effort), cwd=str(worktree),
+                process = subprocess.Popen(self.command(base, last_message, effort, governance), cwd=str(worktree),
                                            stdin=subprocess.DEVNULL, stdout=sink, stderr=error_sink,
                                            start_new_session=True)
                 self.groups[job_id] = process.pid
@@ -1198,7 +1268,7 @@ class Reviewer:
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
                 f'review infrastructure error after {job.attempts + 1} attempts: {exc}')), [], token)
 
-    def defer_or_give_up(self, job, error, effort, kept):
+    def defer_or_give_up(self, job, error, effort, kept, governance=()):
         """Requeue with backoff after a transient upstream error; once the window is spent, return a failed body."""
         now = self.store.clock()
         count, since, _ = self.store.transient_state(job.id) or (0, now, '')
@@ -1209,7 +1279,7 @@ class Reviewer:
             return None
         log(f'{job}: transient codex failure #{count + 1}, {self.config.retry_window} s retry window spent: {error}')
         self.store.clear_transient(job.id)
-        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, reason=(
+        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance, reason=(
             f'codex failed with transient upstream errors {count + 1} time(s) over {int(now - since)} s and the '
             f'{self.config.retry_window} s retry window is spent'), reasons=[f'last error: {error}'])
 
@@ -1248,11 +1318,15 @@ class Reviewer:
             shutil.rmtree(scratch, ignore_errors=True)
             self.git.add_worktree(job.full_name, worktree, job.head)
         try:
+            governance = prefetch_governance(self.github, token, worktree, scratch / 'governance')
+            for doc in governance:
+                if doc.error:
+                    log(f'{job}: governance issue {doc.ref} not prefetched: {doc.error}')
             log(f'{job}: codex review started against origin/{base} effort={effort} read-only')
             started = time.time()
             rc, output, stderr, last, timed_out = self.codex(job.id, worktree, base, effort,
                                                      self.config.timeout_seconds, scratch,
-                                                     lambda: self.store.status(job.id) == 'running')
+                                                     lambda: self.store.status(job.id) == 'running', governance)
             log(f'{job}: codex finished rc={rc} timed_out={timed_out} after {int(time.time() - started)} s')
         finally:
             with self.repo_lock(job.full_name):
@@ -1282,7 +1356,7 @@ class Reviewer:
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
         upstream = None if timed_out else transient_error(rc, events)
         if upstream is not None:
-            body = self.defer_or_give_up(job, upstream, effort, kept)
+            body = self.defer_or_give_up(job, upstream, effort, kept, governance)
             if body is None:
                 return None
             self.keep_output(job, output, stderr, last)
@@ -1290,18 +1364,18 @@ class Reviewer:
         self.store.clear_transient(job.id)
         if timed_out:
             verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort,
-                                                  kept=kept, reason=(
+                                                  kept=kept, governance=governance, reason=(
                 f'codex timed out after {self.config.timeout_seconds} s'))
         else:
             roots = (str(worktree), os.path.realpath(worktree))
             verdict, summary, findings, reasons = assess(rc, events, message, roots)
             if verdict == 'failed':
                 log(f'{job}: codex output rejected: {"; ".join(reasons)}')
-                body = review_body(job.head, 'failed', '', [], effort=effort, kept=kept,
+                body = review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance,
                                    reason='codex output did not pass the review checks', reasons=reasons)
             else:
                 body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort,
-                                   kept=kept)
+                                   kept=kept, governance=governance)
             if findings:
                 comments = inline_comments(findings, diff_lines(
                     self.github.pull_files(job.full_name, job.number, token)))
