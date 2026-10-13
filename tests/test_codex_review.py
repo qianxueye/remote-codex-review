@@ -45,7 +45,7 @@ def config(**overrides):
 
 
 def pull_payload(action='synchronize', head=HEAD, number=7, author='Example-Owner', association='OWNER',
-                 head_repo=REPO, draft=False, state='open', repo=REPO, installation_account=None):
+                 head_repo=REPO, draft=False, state='open', repo=REPO, installation_account=None, base='main'):
     owner = repo.split('/')[0]
     installation = {'id': 99}
     if installation_account is not None:
@@ -55,7 +55,7 @@ def pull_payload(action='synchronize', head=HEAD, number=7, author='Example-Owne
             'pull_request': {'number': number, 'state': state, 'draft': draft,
                              'author_association': association, 'user': {'login': author},
                              'head': {'sha': head, 'repo': {'full_name': head_repo}},
-                             'base': {'ref': 'main', 'repo': {'full_name': repo, 'owner': {'login': owner}}}}}
+                             'base': {'ref': base, 'repo': {'full_name': repo, 'owner': {'login': owner}}}}}
 
 
 def signed(body, secret=SECRET):
@@ -78,12 +78,13 @@ class FakeGitHub:
         self.posted = []
         self.markers = {}
         self.files = []
+        self.base = 'main'
 
     def token(self, installation):
         return 'installation-token'
 
     def pull(self, full_name, number, token):
-        payload = pull_payload(head=self.heads.get(number, HEAD), number=number, state=self.state)
+        payload = pull_payload(head=self.heads.get(number, HEAD), number=number, state=self.state, base=self.base)
         return dict(payload['pull_request'], base=payload['pull_request']['base'])
 
     def pull_files(self, full_name, number, token):
@@ -367,6 +368,23 @@ class ReviewTests(Harness):
         self.github.heads[7] = NEW_HEAD
         _, status = self.run_next()
         self.assertEqual((status, self.codex.calls, self.github.posted), ('superseded', [], []))
+
+    def test_review_uses_live_base_not_queued_base(self):
+        self.deliver(pull_payload())
+        self.github.base = 'develop'
+        _, status = self.run_next()
+        self.assertEqual(status, 'clean')
+        self.assertEqual((self.git.fetched[0][2], self.codex.calls[0][2]), ('develop', 'develop'))
+
+    def test_base_changed_during_review_requeues_without_posting(self):
+        self.deliver(pull_payload())
+
+        def retarget():
+            self.github.base = 'develop'
+        self.codex.during = retarget
+        _, status = self.run_next()
+        self.assertEqual((status, self.github.posted), (None, []))
+        self.assertEqual([(j.head, j.status) for j in self.store.queued()], [(HEAD, 'queued')])
 
     def test_findings_posted_inline_and_in_body(self):
         self.codex.message = FINDINGS

@@ -944,20 +944,21 @@ class Reviewer:
         if pull.get('state') != 'open' or pull['head']['sha'] != job.head:
             log(f'{job}: head moved or PR closed before review')
             return self.follow_head(job, pull)
+        base = pull['base']['ref']
         scratch = self.git.work / f'{job.id}'
         worktree = scratch / 'tree'
         with self.repo_lock(job.full_name):
-            fetched = self.git.fetch(job.full_name, job.number, job.base, token)
+            fetched = self.git.fetch(job.full_name, job.number, base, token)
             if fetched != job.head:
                 raise RuntimeError(f'fetched head {fetched[:12]} differs from the queued head')
             effort = choose_effort(self.config.effort_rules, job.full_name,
-                                   self.git.changed_files(job.full_name, job.base, job.head))
+                                   self.git.changed_files(job.full_name, base, job.head))
             shutil.rmtree(scratch, ignore_errors=True)
             self.git.add_worktree(job.full_name, worktree, job.head)
         try:
-            log(f'{job}: codex review started against origin/{job.base} effort={effort}')
+            log(f'{job}: codex review started against origin/{base} effort={effort}')
             started = time.time()
-            rc, output, last, timed_out = self.codex(job.id, worktree, job.base, effort,
+            rc, output, last, timed_out = self.codex(job.id, worktree, base, effort,
                                                      self.config.timeout_seconds, scratch)
             log(f'{job}: codex finished rc={rc} timed_out={timed_out} after {int(time.time() - started)} s')
         finally:
@@ -975,6 +976,10 @@ class Reviewer:
         if pull.get('state') != 'open' or pull['head']['sha'] != job.head:
             log(f'{job}: head moved or PR closed during review; result discarded')
             return self.follow_head(job, pull)
+        if pull['base']['ref'] != base:
+            log(f'{job}: base changed to {pull["base"]["ref"]} during review; requeued')
+            self.store.retry(job.id, 0, count_attempt=False)
+            return None
         message = final_message(output, last)
         comments = []
         if timed_out:
