@@ -66,7 +66,7 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 ### 2.4 发布与幂等
 
 - 每个 head 只发一条 review，event 为 `COMMENT`，`commit_id` 为该 head。
-- 正文第一行是标记：`<!-- remote-codex-review head=<完整 sha> verdict=clean|findings|failed effort=medium|high -->`。codex 未运行就失败时（例如本节末条的基础设施错误），标记中没有 `effort=`。
+- 正文第一行是标记：`<!-- remote-codex-review head=<完整 sha> verdict=clean|findings|failed effort=medium|high tests=tests|read-only -->`。codex 未运行就失败时（例如本节末条的基础设施错误），标记中没有 `effort=` 和 `tests=`。`tests=read-only` 的正文另有一行说明本次为只读审查。
 - 正文包含结论摘要和每条发现的完整内容。发现中的 `路径:行号` 去掉工作树前缀后，如果该行在 PR diff 的右侧，再另外作为行内评论。GitHub 对整条 review 返回 422 时，去掉全部行内评论重发一次；因为正文本来就包含全部发现，所以不会丢失内容。
 - 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。
 - 结论判定：codex 最终消息中含 `[P0]` 到 `[P3]` 即为 `findings`，否则为 `clean`。最终消息优先取 `-o` 输出文件，取不到时取输出中最后一个单独的 `codex` 行之后的文本。
@@ -91,7 +91,7 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 - 每个仓库在 `/var/lib/codex-review/mirrors/<owner>/<repo>.git` 维护一份 bare 镜像。每次 fetch 取回 `refs/pull/<n>/head` 和 base 分支，base 写到 `refs/remotes/origin/<base>`。
 - installation token 通过环境变量 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` 设置 `http.https://github.com/.extraheader`，不出现在命令行参数、URL 或日志里。
 - 每个任务在 `/var/lib/codex-review/work/<任务 id>/tree` 建一个 detached 工作树，结束后删除。服务启动时会清掉上次残留的工作树。需要保留的输出按 §2.4 另存到 `output/`，不随工作树删除。
-- codex 命令（`<effort>` 的取法见 §2.6.1）：
+- codex 命令（`<effort>` 的取法见 §2.6.1；以下为 `tests` 档，`read-only` 档见 §2.6.2）：
 
   ```
   codex exec --sandbox workspace-write \
@@ -130,7 +130,19 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 }
 ```
 
-`repos` 中某个仓库的表整体取代 `default`，不与它合并；仓库名比较不区分大小写。修改后重启服务生效：`systemctl restart codex-review`。选中的档位写在 review 标记的 `effort=` 中。
+`repos` 中某个仓库的表整体取代 `default`，不与它合并；仓库名比较不区分大小写。以 `_` 开头的键是注释，加载时忽略。修改后重启服务生效：`systemctl restart codex-review`。选中的档位写在 review 标记的 `effort=` 中。
+
+#### 2.6.2 测试档位
+
+同一个表中的 `tests` 列出高风险路径。档位按同一份改动文件决定：
+
+- 有一个改动文件匹配 `tests` 中的模式，用 `tests` 档：命令同 §2.6，codex 可以运行测试；
+- 没有任何改动文件、或该表没有 `tests` 键时，也用 `tests` 档；
+- 其余情况用 `read-only` 档。
+
+默认表中的 `tests` 是通用示例：`**/migrations/**`、`deploy/**`、`.github/workflows/**`、`**/*secret*`、`**/*credential*`。各仓库的实际清单写在 `repos` 下。
+
+`codex exec review` 不允许 `--base` 和自定义提示同时出现，所以 `read-only` 档不带 `--base`，改为在提示中写明对比 `origin/<base>`，并要求 codex 不运行 pytest、vitest 或其他测试套件，不启动数据库或其他服务，结论中写明「本次为只读审查，未运行测试」。该档的沙箱为 `--sandbox read-only`。提示全文见 `codex_review.py` 的 `READ_ONLY_PROMPT`。选中的档位写在 review 标记的 `tests=` 中。
 
 ### 2.7 为什么用常驻服务
 

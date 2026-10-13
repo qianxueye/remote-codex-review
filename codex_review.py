@@ -27,10 +27,19 @@ DEFAULT_CONFIG = '/etc/codex-review/codex-review.env'
 WEBHOOK_PATH = '/webhook'
 ACTIONS = frozenset({'opened', 'synchronize', 'reopened', 'ready_for_review'})
 TRUSTED_ASSOCIATIONS = frozenset({'OWNER', 'MEMBER', 'COLLABORATOR'})
-MARKER = '<!-- remote-codex-review head={head} verdict={verdict}{effort} -->'
+MARKER = '<!-- remote-codex-review head={head} verdict={verdict}{effort}{tests} -->'
 MARKER_RE = re.compile(r'<!-- remote-codex-review head=([0-9a-f]{40}) verdict=(clean|findings|failed)'
-                       r'(?: effort=[a-z]+)? -->')
-DEFAULT_EFFORT_RULES = {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**']}
+                       r'(?: effort=[a-z]+)?(?: tests=[a-z-]+)? -->')
+DEFAULT_EFFORT_RULES = {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**'],
+                        'tests': ['**/migrations/**', 'deploy/**', '.github/workflows/**', '**/*secret*',
+                                  '**/*credential*']}
+RULE_KEYS = frozenset({'medium', 'high', 'tests'})
+READ_ONLY_PROMPT = (
+    "Review the code changes against the base branch 'origin/{base}'. Run `git diff origin/{base}...HEAD` to "
+    "inspect the changes relative to origin/{base}. Provide prioritized, actionable findings.\n\n"
+    'This is a read-only review: do not run pytest, vitest or any other test suite, and do not start a database '
+    'or any other service. Read the code; use grep and git to view context. State in your conclusion: '
+    '本次为只读审查，未运行测试 (read-only review; no tests were run).')
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
@@ -155,19 +164,26 @@ class Config:
 
 
 def load_effort_rules(path):
-    """Load {"default": rules, "repos": {"owner/repo": rules}}; rules are {"medium": [...], "high": [...]}."""
+    """Load {"default": rules, "repos": {"owner/repo": rules}}; rules map medium/high/tests to glob lists.
+
+    Keys starting with `_` are annotations and are dropped.
+    """
     if not path:
         return {'default': DEFAULT_EFFORT_RULES, 'repos': {}}
     try:
         data = json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError, ValueError) as exc:
         raise ConfigError(f'CODEX_REVIEW_EFFORT_RULES: {exc}') from None
-    tables = [data.get('default', DEFAULT_EFFORT_RULES), *dict(data.get('repos') or {}).values()]
-    for table in tables:
-        if (not isinstance(table, dict) or set(table) - {'medium', 'high'}
-                or not all(isinstance(v, list) and all(isinstance(p, str) for p in v) for v in table.values())):
-            raise ConfigError('CODEX_REVIEW_EFFORT_RULES: each table maps medium/high to lists of globs')
-    return {'default': data.get('default', DEFAULT_EFFORT_RULES), 'repos': dict(data.get('repos') or {})}
+    def table(value):
+        if not isinstance(value, dict):
+            raise ConfigError('CODEX_REVIEW_EFFORT_RULES: each table maps medium/high/tests to lists of globs')
+        value = {k: v for k, v in value.items() if not str(k).startswith('_')}
+        if (set(value) - RULE_KEYS
+                or not all(isinstance(v, list) and all(isinstance(p, str) for p in v) for v in value.values())):
+            raise ConfigError('CODEX_REVIEW_EFFORT_RULES: each table maps medium/high/tests to lists of globs')
+        return value
+    return {'default': table(data.get('default', DEFAULT_EFFORT_RULES)),
+            'repos': {k: table(v) for k, v in dict(data.get('repos') or {}).items() if not k.startswith('_')}}
 
 
 def glob_regex(pattern):
@@ -192,9 +208,22 @@ def glob_regex(pattern):
     return re.compile(''.join(out) + r'\Z')
 
 
+def rule_table(rules, full_name):
+    return next((value for key, value in rules['repos'].items() if same_name(key, full_name)), rules['default'])
+
+
+def choose_tests(rules, full_name, files):
+    """Return read-only only when the table lists tests globs and no changed file matches one."""
+    table = rule_table(rules, full_name)
+    if 'tests' not in table or not files:
+        return 'tests'
+    patterns = [glob_regex(p) for p in table['tests']]
+    return 'tests' if any(r.match(f) for f in files for r in patterns) else 'read-only'
+
+
 def choose_effort(rules, full_name, files):
     """Return medium only when every changed file matches a medium glob and none a high glob."""
-    table = next((value for key, value in rules['repos'].items() if same_name(key, full_name)), rules['default'])
+    table = rule_table(rules, full_name)
     medium = [glob_regex(p) for p in table.get('medium', [])]
     high = [glob_regex(p) for p in table.get('high', [])]
     if files and all(any(r.match(f) for r in medium) and not any(r.match(f) for r in high) for f in files):
@@ -453,12 +482,13 @@ def inline_comments(findings, diff):
     return comments
 
 
-def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None):
+def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, tests=None):
     """Render the review body; it always carries the marker and every finding in full.
 
     kept names where the full codex output is preserved; failed and truncated bodies point to it.
     """
-    parts = [MARKER.format(head=head, verdict=verdict, effort=f' effort={effort}' if effort else '')]
+    parts = [MARKER.format(head=head, verdict=verdict, effort=f' effort={effort}' if effort else '',
+                           tests=f' tests={tests}' if tests else '')]
     if verdict == 'failed':
         parts.append(f'**Remote codex review failed** for `{head}`: {reason}. This is not a pass.'
                      + (f'\n\nFull codex output is kept on the review host at `{kept}`.' if kept else ''))
@@ -466,6 +496,8 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
     else:
         parts.append(f'**Remote codex review: {len(findings) or "unparsed"} finding(s)** for `{head}`.')
+    if tests == 'read-only':
+        parts.append('Read-only review: codex was told not to run tests or start services.')
     if summary:
         parts.append(summary)
     for finding in findings:
@@ -805,13 +837,16 @@ class CodexRunner:
         self.lock = threading.Lock()
         self.groups = {}
 
-    def command(self, base, last_message, effort):
-        return [self.codex, 'exec', '--sandbox', 'workspace-write',
+    def command(self, base, last_message, effort, tier='tests'):
+        """Build the codex argv; codex rejects --base together with a prompt, so read-only names the base in it."""
+        target = ['--base', f'origin/{base}'] if tier == 'tests' else [READ_ONLY_PROMPT.format(base=base)]
+        sandbox = 'workspace-write' if tier == 'tests' else 'read-only'
+        return [self.codex, 'exec', '--sandbox', sandbox,
                 '-c', 'sandbox_workspace_write.network_access=false', '-c', 'approval_policy="never"',
                 '-c', f'model_reasoning_effort={effort}',
-                'review', '--base', f'origin/{base}', '-o', str(last_message)]
+                'review', *target, '-o', str(last_message)]
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed):
+    def __call__(self, job_id, worktree, base, effort, tier, timeout, scratch, proceed):
         """Return (rc, output, last message, timed out); rc is None when proceed() refused the start.
 
         proceed() runs under the lock that cancel() takes, so a cancel issued before registration is not lost.
@@ -821,7 +856,7 @@ class CodexRunner:
             with self.lock:
                 if not proceed():
                     return None, '', '', False
-                process = subprocess.Popen(self.command(base, last_message, effort), cwd=str(worktree),
+                process = subprocess.Popen(self.command(base, last_message, effort, tier), cwd=str(worktree),
                                            stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
                                            start_new_session=True)
                 self.groups[job_id] = process.pid
@@ -987,15 +1022,17 @@ class Reviewer:
             fetched = self.git.fetch(job.full_name, job.number, base, token)
             if fetched != job.head:
                 raise RuntimeError(f'fetched head {fetched[:12]} differs from the queued head')
-            effort = choose_effort(self.config.effort_rules, job.full_name,
-                                   self.git.changed_files(job.full_name, base, job.head))
+            changed = self.git.changed_files(job.full_name, base, job.head)
+            effort = choose_effort(self.config.effort_rules, job.full_name, changed)
+            tier = choose_tests(self.config.effort_rules, job.full_name, changed)
             shutil.rmtree(scratch, ignore_errors=True)
             self.git.add_worktree(job.full_name, worktree, job.head)
         try:
-            log(f'{job}: codex review started against origin/{base} effort={effort}')
+            log(f'{job}: codex review started against origin/{base} effort={effort} tests={tier}')
             started = time.time()
-            rc, output, last, timed_out = self.codex(job.id, worktree, base, effort, self.config.timeout_seconds,
-                                                     scratch, lambda: self.store.status(job.id) == 'running')
+            rc, output, last, timed_out = self.codex(job.id, worktree, base, effort, tier,
+                                                     self.config.timeout_seconds, scratch,
+                                                     lambda: self.store.status(job.id) == 'running')
             log(f'{job}: codex finished rc={rc} timed_out={timed_out} after {int(time.time() - started)} s')
         finally:
             with self.repo_lock(job.full_name):
@@ -1023,17 +1060,20 @@ class Reviewer:
         comments = []
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
         if timed_out:
-            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, kept=kept, reason=(
+            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, tests=tier,
+                                                  kept=kept, reason=(
                 f'codex timed out after {self.config.timeout_seconds} s'))
         elif rc != 0 or not message:
             tail = '\n'.join(output.strip().splitlines()[-5:])
-            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, kept=kept, reason=(
+            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, tests=tier,
+                                                  kept=kept, reason=(
                 f'codex exited {rc}' + (' with no final message' if rc == 0 else '')
                 + (f'\n\n```\n{tail}\n```' if tail else '')))
         else:
             roots = (str(worktree), os.path.realpath(worktree))
             verdict, summary, findings = parse_review(message, roots)
-            body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort, kept=kept)
+            body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort, tests=tier,
+                               kept=kept)
             if findings:
                 comments = inline_comments(findings, diff_lines(
                     self.github.pull_files(job.full_name, job.number, token)))

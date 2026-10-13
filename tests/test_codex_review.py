@@ -128,10 +128,10 @@ class FakeCodex:
         self.calls = []
         self.cancelled = []
 
-    def __call__(self, job_id, worktree, base, effort, timeout, scratch, proceed):
+    def __call__(self, job_id, worktree, base, effort, tier, timeout, scratch, proceed):
         if not proceed():
             return None, '', '', False
-        self.calls.append((job_id, worktree, base, effort))
+        self.calls.append((job_id, worktree, base, effort, tier))
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))
@@ -316,7 +316,8 @@ class ReviewTests(Harness):
         job, status = self.run_next()
         self.assertEqual(status, 'clean')
         post = self.github.posted[0]
-        self.assertIn(f'<!-- remote-codex-review head={HEAD} verdict=clean effort=high -->', post['body'])
+        self.assertIn(f'<!-- remote-codex-review head={HEAD} verdict=clean effort=high tests=read-only -->',
+                      post['body'])
         self.assertEqual(self.codex.calls[0][3], 'high')
         self.assertEqual(self.codex.calls[0][2], 'main')
         self.assertEqual(self.git.removed, [self.git.work / str(job.id) / 'tree'])
@@ -586,9 +587,88 @@ class EffortTests(unittest.TestCase):
             harness.deliver(pull_payload())
             harness.run_next()
             self.assertEqual(harness.codex.calls[0][3], 'medium')
-            self.assertIn('verdict=clean effort=medium -->', harness.github.posted[0]['body'])
+            self.assertIn('verdict=clean effort=medium tests=read-only -->', harness.github.posted[0]['body'])
         finally:
             harness.tearDown()
+
+
+class TestTierTests(unittest.TestCase):
+    rules = {'default': cr.DEFAULT_EFFORT_RULES, 'repos': {}}
+
+    def tier(self, files, repo=REPO, rules=None):
+        return cr.choose_tests(rules or self.rules, repo, files)
+
+    def test_no_high_risk_file_is_read_only(self):
+        self.assertEqual(self.tier(['src/app.py', 'docs/wiki/a.md']), 'read-only')
+
+    def test_one_high_risk_file_needs_tests(self):
+        self.assertEqual(self.tier(['src/app.py', 'db/migrations/0002_add.py']), 'tests')
+        self.assertEqual(self.tier(['deploy/install.sh']), 'tests')
+        self.assertEqual(self.tier(['src/config/secret_store.py']), 'tests')
+
+    def test_no_changed_files_needs_tests(self):
+        self.assertEqual(self.tier([]), 'tests')
+
+    def test_table_without_tests_key_always_needs_tests(self):
+        rules = {'default': {'medium': ['docs/**']}, 'repos': {}}
+        self.assertEqual(self.tier(['src/app.py'], rules=rules), 'tests')
+
+    def test_repository_override_replaces_default(self):
+        rules = {'default': cr.DEFAULT_EFFORT_RULES,
+                 'repos': {'Example-Org/Example-Repo': {'tests': ['src/orders/**']}}}
+        self.assertEqual(self.tier(['src/orders/submit.py'], rules=rules), 'tests')
+        self.assertEqual(self.tier(['deploy/install.sh'], rules=rules), 'read-only')
+        self.assertEqual(self.tier(['src/orders/submit.py'], repo='example-owner/other', rules=rules), 'read-only')
+
+    def test_rules_file_accepts_tests_and_drops_annotations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'rules.json'
+            path.write_text(json.dumps({'_basis': 'x', 'default': {'tests': ['a/**'], '_why': {'a/**': 'y'}},
+                                        'repos': {'example-owner/x': {'tests': ['b/**'], '_why': {}}}}))
+            loaded = cr.load_effort_rules(str(path))
+            self.assertEqual(loaded['default'], {'tests': ['a/**']})
+            self.assertEqual(loaded['repos'], {'example-owner/x': {'tests': ['b/**']}})
+            path.write_text(json.dumps({'default': {'test': ['a/**']}}))
+            with self.assertRaises(cr.ConfigError):
+                cr.load_effort_rules(str(path))
+
+    def test_shipped_rules_file_matches_builtin_default(self):
+        shipped = cr.load_effort_rules(str(Path(__file__).resolve().parent.parent / 'deploy' / 'effort-rules.json'))
+        self.assertEqual(shipped['default'], cr.DEFAULT_EFFORT_RULES)
+
+    def run_with(self, files):
+        harness = ReviewTests('test_clean_review_posts_marker')
+        harness.setUp()
+        try:
+            harness.git.files = files
+            harness.deliver(pull_payload())
+            harness.run_next()
+            return harness.codex.calls[0][4], harness.github.posted[0]['body']
+        finally:
+            harness.tearDown()
+
+    def test_read_only_tier_reaches_codex_and_marker(self):
+        tier, body = self.run_with(['src/app.py'])
+        self.assertEqual(tier, 'read-only')
+        self.assertIn('verdict=clean effort=high tests=read-only -->', body)
+        self.assertIn('Read-only review', body)
+        self.assertEqual(cr.MARKER_RE.search(body).group(1), HEAD)
+
+    def test_tests_tier_reaches_codex_and_marker(self):
+        tier, body = self.run_with(['src/app.py', 'deploy/install.sh'])
+        self.assertEqual(tier, 'tests')
+        self.assertIn('verdict=clean effort=high tests=tests -->', body)
+        self.assertNotIn('Read-only review', body)
+
+    def test_read_only_command_drops_base_and_forbids_tests(self):
+        command = cr.CodexRunner('codex').command('main', '/w/last.txt', 'high', 'read-only')
+        self.assertNotIn('--base', command)
+        self.assertEqual(command[2:4], ['--sandbox', 'read-only'])
+        prompt = command[command.index('review') + 1]
+        self.assertIn('git diff origin/main...HEAD', prompt)
+        self.assertIn('do not run pytest, vitest or any other test suite', prompt)
+        self.assertIn('本次为只读审查，未运行测试', prompt)
+        self.assertEqual(command[-2:], ['-o', '/w/last.txt'])
 
 
 class GitHubClientTests(unittest.TestCase):
@@ -611,11 +691,12 @@ class GitHubClientTests(unittest.TestCase):
 
     def test_marker_only_counts_from_this_app(self):
         reviews = [{'user': {'login': 'someone'}, 'id': 1,
-                    'body': cr.MARKER.format(head=HEAD, verdict='clean', effort='')},
+                    'body': cr.MARKER.format(head=HEAD, verdict='clean', effort='', tests='')},
                    {'user': {'login': 'Remote-Review[bot]'}, 'id': 2,
-                    'body': cr.MARKER.format(head=NEW_HEAD, verdict='clean', effort=' effort=high')},
+                    'body': cr.MARKER.format(head=NEW_HEAD, verdict='clean', effort=' effort=high', tests='')},
                    {'user': {'login': 'remote-review[bot]'}, 'id': 3,
-                    'body': cr.MARKER.format(head=HEAD, verdict='findings', effort=' effort=medium')}]
+                    'body': cr.MARKER.format(head=HEAD, verdict='findings', effort=' effort=medium',
+                                             tests=' tests=read-only')}]
 
         def transport(method, url, token, body):
             return 200, ({'slug': 'remote-review'} if url.endswith('/app') else reviews), ''
