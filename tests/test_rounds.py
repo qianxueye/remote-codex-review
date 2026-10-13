@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""First-round, re-review and confidence-floor tests; codex and GitHub are fakes, the delta tree uses real git."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import codex_review as cr  # noqa: E402
+from test_codex_review import HEAD, NEW_HEAD, REPO, WORKTREE, Harness, pull_payload  # noqa: E402
+
+THIRD_HEAD = 'd' * 40
+TREE = 'c' * 40
+
+
+def finding(priority, title, path, line, score=None, body='The branch skips the check.'):
+    text = f'- [{priority}] {title} — {WORKTREE}/{path}:{line}\n  {body}\n'
+    return text + (f'  Confidence: {score}\n' if score is not None else '')
+
+
+def message(*findings, verdict='FINDINGS', register=()):
+    head = 'Summary of the change.\n'
+    if register:
+        head += cr.REGISTER_HEADING + '\n' + ''.join(f'{item}\n' for item in register)
+    tail = '\nFull review comments:\n\n' + '\n'.join(findings) if findings else ''
+    return head + f'VERDICT: {verdict}\n' + tail
+
+
+class Rounds(Harness):
+    def first_round(self, *messages):
+        """Review HEAD as the PR's first head and return the posted body."""
+        self.codex.messages = list(messages)
+        self.deliver(pull_payload())
+        self.run_next()
+        return self.github.posted[-1]['body']
+
+    def second_head(self, msg, guid='d-2', head=NEW_HEAD):
+        """Push a new head after a reviewed one and review it; returns (status, posted body)."""
+        self.github.heads[7] = head
+        self.git.head = head
+        self.codex.messages = [msg]
+        self.deliver(pull_payload(head=head), guid=guid)
+        _, status = self.run_next()
+        return status, self.github.posted[-1]['body']
+
+
+class FirstRoundTests(Rounds):
+    def test_first_round_runs_two_xhigh_passes_and_merges_their_findings(self):
+        body = self.first_round(
+            message(finding('P2', 'Retry never stops', 'src/app.py', '10-12', 80),
+                    finding('P3', 'Log is noisy', 'src/log.py', 3, 70)),
+            message(finding('P1', 'Retry loop has no bound', 'src/app.py', 11, 90),
+                    finding('P2', 'Caller ignores the error', 'src/caller.py', 7, 60)))
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh', 'xhigh'])
+        self.assertIn(cr.LENSES[0][1], self.codex.calls[0][2])
+        self.assertIn(cr.LENSES[1][1], self.codex.calls[1][2])
+        for call in self.codex.calls:
+            self.assertIn('git diff origin/main...HEAD', call[2])
+            self.assertIn(cr.EXHAUSTIVE, call[2])
+            self.assertIn('Confidence: <0-100>', call[2])
+        self.assertIn(f'head={HEAD} verdict=findings effort=xhigh tests=read-only mode=full -->', body)
+        self.assertEqual(body.count('Retry never stops'), 1)
+        self.assertIn('同一位置另一遍（调用方与边界）的报告：**[P1] Retry loop has no bound**', body)
+        self.assertLess(body.index('Retry never stops'), body.index('Caller ignores the error'))
+        self.assertLess(body.index('Caller ignores the error'), body.index('Log is noisy'))
+
+    def test_a_failed_second_pass_fails_the_round(self):
+        self.codex.messages = [message(verdict='CLEAN'), 'I could not read the diff.\nVERDICT: BLOCKED']
+        self.deliver(pull_payload())
+        _, status = self.run_next()
+        self.assertEqual(status, 'failed')
+        self.assertIn('调用方与边界: ', self.github.posted[0]['body'])
+
+
+class DeltaTests(Rounds):
+    def test_rereview_gives_codex_only_the_delta(self):
+        self.first_round(message(finding('P2', 'Retry never stops', 'src/app.py', 10, 80)), message(verdict='CLEAN'))
+        self.git.delta_files = ['src/fix.py']
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual(status, 'clean')
+        self.assertEqual(len(self.codex.calls), 3)
+        prompt, effort = self.codex.calls[2][2], self.codex.calls[2][3]
+        self.assertEqual(self.git.delta_calls, [(HEAD, NEW_HEAD)])
+        self.assertIn(f'run `git diff {TREE} HEAD`', prompt)
+        self.assertIn('- src/fix.py', prompt)
+        self.assertNotIn('origin/main...HEAD', prompt)
+        self.assertIn('Retry never stops', prompt)
+        self.assertEqual(effort, 'high')
+        self.assertIn(f'head={NEW_HEAD} verdict=clean effort=high tests=read-only mode=delta -->', body)
+        self.assertIn(f'`{HEAD[:12]}..{NEW_HEAD[:12]}`', body)
+
+    def test_out_of_delta_findings_are_registered_and_do_not_count(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        item = '- [P2] Stale comment — src/old.py:4: the comment names a removed flag. Confidence: 80'
+        status, body = self.second_head(message(verdict='FINDINGS', register=[item]))
+        self.assertEqual(status, 'clean')
+        self.assertIn(f'verdict=clean effort=high tests=read-only mode=delta -->', body)
+        self.assertIn('## 登记项', body)
+        self.assertIn(item, body)
+        self.assertEqual(self.github.posted[-1]['comments'], [])
+
+    def test_out_of_delta_p1_and_security_findings_still_block(self):
+        for guid, item in (('d-2', '- [P1] Order is sent twice — src/old.py:4: no idempotency key. Confidence: 80'),
+                           ('d-3', '- [P2] Token logged — src/old.py:9: the credential reaches the log. '
+                                   'Confidence: 70')):
+            with self.subTest(item):
+                head = NEW_HEAD if guid == 'd-2' else THIRD_HEAD
+                if guid == 'd-2':
+                    self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+                status, body = self.second_head(message(verdict='CLEAN', register=[item]), guid=guid, head=head)
+                self.assertEqual(status, 'findings')
+                self.assertIn('## 增量外但阻塞的问题', body)
+                self.assertIn(item, body)
+                self.assertNotIn('## 登记项', body)
+
+    def test_force_push_falls_back_to_a_full_first_round(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        self.git.delta = (None, f'last reviewed head {HEAD[:12]} is not an ancestor of {NEW_HEAD[:12]}')
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual(status, 'clean')
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 4)
+        self.assertIn('git diff origin/main...HEAD', self.codex.calls[2][2])
+        self.assertIn('mode=full -->', body)
+        self.assertIn('is not an ancestor', body)
+
+    def test_previous_review_marked_invalid_is_not_a_delta_base(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        first = self.github.posted[0]
+        first['body'] = first['body'].replace('verdict=clean', 'verdict=invalid', 1)
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual(getattr(self.git, 'delta_calls', []), [])
+        self.assertIn('mode=full -->', body)
+
+    def test_empty_delta_is_clean_without_codex_and_keeps_the_read_only_field(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        self.git.delta_files = []
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual((status, len(self.codex.calls)), ('clean', 2))
+        self.assertIn(f'head={NEW_HEAD} verdict=clean effort=none tests=read-only mode=delta -->', body)
+        self.assertNotIn('codex was told', body)
+
+
+class ConfidenceTests(Rounds):
+    def review_once(self, msg):
+        self.codex.messages = [msg, message(verdict='CLEAN')]
+        self.deliver(pull_payload())
+        _, status = self.run_next()
+        return status, self.github.posted[-1]
+
+    def test_49_is_not_posted(self):
+        status, post = self.review_once(message(finding('P1', 'Weak suspicion', 'src/app.py', 3, 49)))
+        self.assertEqual(status, 'clean')
+        self.assertNotIn('Weak suspicion', post['body'])
+        self.assertEqual(post['comments'], [])
+        self.assertTrue(post['body'].endswith('另有 1 条置信度低于 50 的发现未提交。'))
+
+    def test_50_is_posted_with_its_confidence(self):
+        self.github.files = [{'filename': 'src/app.py', 'patch': '@@ -1,4 +1,5 @@\n a\n b\n+c\n d\n e'}]
+        status, post = self.review_once(message(finding('P2', 'Real defect', 'src/app.py', 3, 50)))
+        self.assertEqual(status, 'findings')
+        self.assertIn('**[P2] Real defect** — `src/app.py:3` · 置信度 50', post['body'])
+        self.assertNotIn('Confidence: 50', post['body'])
+        self.assertIn('置信度 50', post['comments'][0]['body'])
+        self.assertNotIn('置信度低于', post['body'])
+
+    def test_missing_confidence_is_not_posted(self):
+        status, post = self.review_once(message(finding('P0', 'Unscored', 'src/app.py', 3)))
+        self.assertEqual(status, 'clean')
+        self.assertNotIn('Unscored', post['body'])
+        self.assertTrue(post['body'].endswith('另有 1 条置信度低于 50 的发现未提交。'))
+        self.assertIn('Unscored', (self.root / 'output' / '1.log').read_text())
+
+    def test_all_below_50_is_clean(self):
+        status, post = self.review_once(message(finding('P1', 'Guess one', 'src/a.py', 3, 10),
+                                                finding('P2', 'Guess two', 'src/b.py', 4, 49),
+                                                finding('P3', 'Guess three', 'src/c.py', 5)))
+        self.assertEqual(status, 'clean')
+        self.assertIn(f'head={HEAD} verdict=clean effort=xhigh tests=read-only mode=full -->', post['body'])
+        self.assertTrue(post['body'].endswith('另有 3 条置信度低于 50 的发现未提交。'))
+
+    def test_all_below_50_still_needs_evidence_of_reading(self):
+        self.codex.events = cr.json.dumps({'type': 'turn.completed'}) + '\n'
+        status, _ = self.review_once(message(finding('P1', 'Guess', 'src/a.py', 3, 10)))
+        self.assertEqual(status, 'failed')
+
+    def test_confidence_scales(self):
+        self.assertEqual(cr.confidence('Confidence: 50'), 50)
+        self.assertEqual(cr.confidence('**Confidence:** 49'), 49)
+        self.assertEqual(cr.confidence('confidence_score: 0.8'), 80)
+        self.assertIsNone(cr.confidence('confidence_score: 80'))
+        self.assertIsNone(cr.confidence('Confidence: 101'))
+        self.assertIsNone(cr.confidence('no score here'))
+
+
+class MarkerTests(unittest.TestCase):
+    def test_marker_with_mode_parses_and_old_markers_still_parse(self):
+        for marker in (f'<!-- remote-codex-review head={HEAD} verdict=clean effort=xhigh tests=read-only mode=full -->',
+                       f'<!-- remote-codex-review head={HEAD} verdict=findings effort=high tests=read-only -->',
+                       f'<!-- remote-codex-review head={HEAD} verdict=failed -->'):
+            with self.subTest(marker):
+                self.assertEqual(cr.MARKER_RE.search(marker).group(1), HEAD)
+
+
+def git(cwd, *args):
+    env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t', GIT_COMMITTER_NAME='t',
+               GIT_COMMITTER_EMAIL='t@t', GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null')
+    return subprocess.run(['git', '-C', str(cwd), *args], check=True, capture_output=True, text=True,
+                          env=env).stdout.strip()
+
+
+class DeltaTreeTests(unittest.TestCase):
+    """Real git: the delta tree drops base-branch changes and keeps the conflict resolution."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.src, self.git = root / 'src', cr.Git(root / 'state')
+        self.src.mkdir()
+        git(self.src, 'init', '-q', '-b', 'main')
+        for name, text in (('a.txt', 'a\n'), ('b.txt', 'base\n'), ('c.txt', 'base\n')):
+            (self.src / name).write_text(text)
+        git(self.src, 'add', '-A')
+        git(self.src, 'commit', '-qm', 'A')
+        git(self.src, 'switch', '-qc', 'pr')
+        (self.src / 'c.txt').write_text('pr\n')
+        git(self.src, 'commit', '-qam', 'P')
+        self.prev = git(self.src, 'rev-parse', 'HEAD')
+        git(self.src, 'switch', '-q', 'main')
+        (self.src / 'b.txt').write_text('main\n')
+        (self.src / 'c.txt').write_text('main\n')
+        git(self.src, 'commit', '-qam', 'M')
+        git(self.src, 'switch', '-q', 'pr')
+        subprocess.run(['git', '-C', str(self.src), 'merge', '-q', 'main'], capture_output=True,
+                       env=dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t', GIT_COMMITTER_NAME='t',
+                                GIT_COMMITTER_EMAIL='t@t'))
+        (self.src / 'c.txt').write_text('resolved\n')
+        git(self.src, 'commit', '-qam', 'merge main')
+        (self.src / 'd.txt').write_text('fix\n')
+        git(self.src, 'add', '-A')
+        git(self.src, 'commit', '-qm', 'fix')
+        self.head = git(self.src, 'rev-parse', 'HEAD')
+        mirror = self.git.mirror(REPO)
+        mirror.parent.mkdir(parents=True)
+        git(root, 'init', '-q', '--bare', str(mirror))
+        git(self.src, 'push', '-q', str(mirror), 'main:refs/remotes/origin/main', 'pr:refs/codex/pr/7')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_delta_excludes_base_changes_and_keeps_the_conflict_resolution(self):
+        tree, why = self.git.delta_tree(REPO, 'main', self.prev, self.head, self.git.work / '1' / 'delta-base')
+        self.assertIsNotNone(tree, why)
+        self.assertIn('conflicts', why)
+        self.assertEqual(self.git.diff_files(REPO, tree, self.head), ['c.txt', 'd.txt'])
+        self.assertFalse((self.git.work / '1' / 'delta-base').exists())
+
+    def test_force_pushed_head_has_no_delta(self):
+        git(self.src, 'switch', '-q', '-c', 'rewrite', 'main')
+        (self.src / 'e.txt').write_text('e\n')
+        git(self.src, 'add', '-A')
+        git(self.src, 'commit', '-qm', 'rewrite')
+        rewritten = git(self.src, 'rev-parse', 'HEAD')
+        git(self.src, 'push', '-q', '-f', str(self.git.mirror(REPO)), 'rewrite:refs/codex/pr/7')
+        tree, why = self.git.delta_tree(REPO, 'main', self.prev, rewritten, self.git.work / '1' / 'delta-base')
+        self.assertIsNone(tree)
+        self.assertIn('not an ancestor', why)
+
+
+if __name__ == '__main__':
+    unittest.main()

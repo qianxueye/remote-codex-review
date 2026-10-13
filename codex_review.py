@@ -1120,7 +1120,7 @@ class Git:
     def delta_tree(self, full_name, base, prev, head, scratch):
         """Return (tree, why): prev merged with the newest base commit head contains, or (None, why) for a full round.
 
-        `git diff <tree> <head>` then drops base-branch changes and keeps conflict resolutions; see docs/runbook.zh.md §2.6.5.
+        `git diff <tree> <head>` drops base-branch changes, keeps conflict resolutions (docs/runbook.zh.md §2.6.5).
         """
         mirror = ['-C', str(self.mirror(full_name))]
         if self.status([*mirror, 'rev-parse', '--verify', '-q', f'{prev}^{{commit}}']):
