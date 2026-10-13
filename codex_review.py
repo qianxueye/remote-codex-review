@@ -772,7 +772,7 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
             block += ['', f'  同一位置另一遍（{label}）的报告：{other.heading()}',
                       *('    ' + line for line in other.text.splitlines())]
         parts.append('\n'.join(block))
-    if verdict == 'findings' and not findings and not promoted and raw:
+    if verdict == 'findings' and raw:
         parts.append(raw)
     if promoted:
         parts.append('## 增量外但阻塞的问题（P0/P1 或资金、止损、凭据、安全边界）\n\n' + '\n'.join(promoted))
@@ -1459,7 +1459,7 @@ class Reviewer:
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
                 f'review infrastructure error after {job.attempts + 1} attempts: {exc}')), [], token)
 
-    def defer_or_give_up(self, job, error, effort, kept, governance=()):
+    def defer_or_give_up(self, job, error, effort, kept, governance=(), mode=None):
         """Requeue with backoff after a transient upstream error; once the window is spent, return a failed body."""
         now = self.store.clock()
         count, since, _ = self.store.transient_state(job.id) or (0, now, '')
@@ -1470,9 +1470,10 @@ class Reviewer:
             return None
         log(f'{job}: transient codex failure #{count + 1}, {self.config.retry_window} s retry window spent: {error}')
         self.store.clear_transient(job.id)
-        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance, reason=(
-            f'codex failed with transient upstream errors {count + 1} time(s) over {int(now - since)} s and the '
-            f'{self.config.retry_window} s retry window is spent'), reasons=[f'last error: {error}'])
+        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance, mode=mode,
+                           reason=(f'codex failed with transient upstream errors {count + 1} time(s) over '
+                                   f'{int(now - since)} s and the {self.config.retry_window} s retry window is spent'),
+                           reasons=[f'last error: {error}'])
 
     def publish(self, job, verdict, body, comments, token=None):
         token = token or self.github.token(job.installation)
@@ -1545,13 +1546,14 @@ class Reviewer:
             shutil.rmtree(scratch, ignore_errors=True)
             plan = self.plan(job, base, previous, scratch)
             log(f'{job}: mode={plan.mode} effort={plan.effort} files={len(plan.files)}: {plan.why}')
-            if plan.mode == 'delta' and not plan.files:
-                shutil.rmtree(scratch, ignore_errors=True)
-                return self.publish(job, 'clean', review_body(
-                    job.head, 'clean', '', [], effort='none', mode='delta', scope=(
-                        f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
-                        '合入的改动），未调用 codex。')), [], token)
-            self.git.add_worktree(job.full_name, worktree, job.head)
+            if plan.files or plan.mode == 'full':
+                self.git.add_worktree(job.full_name, worktree, job.head)
+        if plan.mode == 'delta' and not plan.files:
+            shutil.rmtree(scratch, ignore_errors=True)
+            return self.publish(job, 'clean', review_body(
+                job.head, 'clean', '', [], effort='none', mode='delta', scope=(
+                    f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
+                    '合入的改动），未调用 codex。')), [], token)
         runs = []
         try:
             governance = prefetch_governance(self.github, token, worktree, scratch / 'governance')
@@ -1600,7 +1602,7 @@ class Reviewer:
         for label, rc, output, stderr, last, timed_out in runs:
             upstream = None if timed_out else transient_error(rc, read_events(output))
             if upstream is not None:
-                body = self.defer_or_give_up(job, upstream, plan.effort, kept, governance)
+                body = self.defer_or_give_up(job, upstream, plan.effort, kept, governance, plan.mode)
                 if body is None:
                     return None
                 self.keep_output(job, runs)
