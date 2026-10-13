@@ -57,14 +57,19 @@ FAILURE_SIGNAL_RE = re.compile(
     r'|\b(?:review|reviewer|sandbox|execution)s? (?:is |was |were )?blocked\b'
     r'|\b(?:verdict|review|conclusion)\b[^.\n]{0,30}\b(?:placeholder|unverified)\b'
     r'|\b(?:placeholder|unverified) (?:verdict|review|conclusion)\b'
-    r'|(?:\b(?:I|we|codex)(?: was| were| am| are)? |^\W*|[.!?;:]\s+)'
-    r'(?:unable|not able|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|open|view|examine|load)\b'
+    r'|(?:\b(?:I|we|codex|(?:the |this )?review(?:er)?)(?: was| were| am| are| is)? |^\W*|[.!?;:]\s+)'
+    r'(?:unable|not able|could not|couldn\'t|cannot|can\'t|failed) to '
+    r'(?:review|inspect|read|open|view|examine|load|complete)\b'
+    r'|\breview (?:is |was )?(?:incomplete|not complete[d]?)\b|\b(?:complete|finish) the review\b'
     r'|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to (?:review|inspect|read|open|view|examine|load) '
     r'(?:the |any )?(?:diff|repository|repo|code|changes?|patch|worktree)\b'
     r'|(?:codex-)?code-mode[ -]host\b[^.\n]{0,20}\b(?:missing|unavailable|not found|not installed)'
-    r'|我们?(?:无法|未能|不能)(?:检查|审查|读取|查看)'
+    r'|(?:我们?|本次审查|审查方?)\s*(?:无法|未能|不能)(?:检查|审查|读取|查看|完成)'
+    r'|审查(?:未|没有|没能)完成|(?:无法|未能|不能|没能)完成(?:本次)?审查'
     r'|(?:无法|未能)(?:检查|审查|读取|查看)\s*(?:diff|差异|代码|仓库|改动|变更|补丁|工作树)', re.I | re.M)
-DIFF_COMMAND_RE = re.compile(r'\bgit\b[^\n|;&]*?\b(?:diff|show)\b')
+DIFF_COMMAND_RE = re.compile(
+    r'(?:^|[;&|(\n]|\b(?:sh|bash|zsh) +-l?c +[\'"]?)\s*(?:\S*/)?git'
+    r'(?:\s+(?:-[cC]\s+\S+|--[a-z-]+(?:=\S+)?|-[pP]))*\s+(?:diff|show)(?=$|[\s\'";&|)])')
 TRANSIENT_RE = re.compile(
     r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
