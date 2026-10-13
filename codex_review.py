@@ -63,7 +63,7 @@ FAILURE_SIGNAL_RE = re.compile(
     r'|(?:我们?|本次审查|审查方?)\s*(?:无法|未能|不能)(?:检查|审查|读取|查看|完成)'
     r'|审查(?:未|没有|没能)完成|(?:无法|未能|不能|没能|没有)完成(?:本次)?审查'
     r'|(?:无法|未能)(?:检查|审查|读取|查看)\s*(?:diff|差异|代码|仓库|改动|变更|补丁|工作树)', re.I | re.M)
-DIFF_HEADER_RE = re.compile(r'^diff --git a/', re.M)
+DIFF_HEADER_RE = re.compile(r'^diff --git "?a/', re.M)
 HUNK_HEADER_RE = re.compile(r'^@@ ', re.M)
 TRANSIENT_RE = re.compile(
     r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'

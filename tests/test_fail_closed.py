@@ -84,6 +84,28 @@ class RealOutputTests(unittest.TestCase):
         self.assertTrue(any('reports a failure' in reason for reason in reasons))
 
 
+# Real `git diff` output for a non-ASCII path under the default core.quotePath=true.
+QUOTED_PATH_DIFF = (
+    'diff --git "a/\\346\\226\\207\\346\\241\\243/\\350\\257\\264\\346\\230\\216.md"'
+    ' "b/\\346\\226\\207\\346\\241\\243/\\350\\257\\264\\346\\230\\216.md"\n'
+    'index f2ad6c7..6178079 100644\n'
+    '--- "a/\\346\\226\\207\\346\\241\\243/\\350\\257\\264\\346\\230\\216.md"\n'
+    '+++ "b/\\346\\226\\207\\346\\241\\243/\\350\\257\\264\\346\\230\\216.md"\n'
+    '@@ -1 +1 @@\n'
+    '-c\n'
+    '+b\n')
+# Real `git show` output of a merge commit: a combined diff, not the PR diff.
+MERGE_COMBINED_DIFF = (
+    'diff --cc "\\346\\226\\207\\346\\241\\243/\\350\\257\\264\\346\\230\\216.md"\n'
+    'index f2ad6c7,6178079..4bcfe98\n'
+    '--- "a/\\346\\226\\207\\346\\241\\243/\\350\\257\\264\\346\\230\\216.md"\n'
+    '+++ "b/\\346\\226\\207\\346\\241\\243/\\350\\257\\264\\346\\230\\216.md"\n'
+    '@@@ -1,1 -1,1 +1,1 @@@\n'
+    '- c\n'
+    ' -b\n'
+    '++d\n')
+
+
 class SingleConditionTests(unittest.TestCase):
     """Each case breaks exactly one clean-verdict condition of a real clean run."""
 
@@ -124,7 +146,9 @@ class SingleConditionTests(unittest.TestCase):
                 ("bash -lc 'git diff --stat'", ' x | 2 +-\n 1 file changed\n', 0),
                 ("bash -lc 'git diff origin/main...HEAD'", '', 0),
                 ("bash -lc 'git diff --name-only'", 'diff --git a/x b/x\n', 0),
-                ("bash -lc 'git diff origin/main...HEAD'", diff_text, 128)):
+                ("bash -lc 'git diff origin/main...HEAD'", diff_text, 128),
+                ("bash -lc 'git show HEAD'", MERGE_COMBINED_DIFF, 0),
+                ("bash -lc 'git show -c HEAD'", MERGE_COMBINED_DIFF.replace('diff --cc', 'diff --combined'), 0)):
             with self.subTest(command=command, output=output):
                 self.assert_failed(judge(self.command_only(command, output, exit_code), self.last),
                                    'printed a unified diff')
@@ -135,7 +159,8 @@ class SingleConditionTests(unittest.TestCase):
                 ("bash -lc 'git status --short\ngit diff HEAD'", ' M x\n' + diff_text),
                 ('git -C "/tmp/repo with spaces" diff HEAD', diff_text),
                 ("bash -lc 'git diff origin/main...HEAD | head -c 60'", diff_text[:60]),
-                ("bash -lc 'git log -p -1'", 'commit abc\n\n' + diff_text)):
+                ("bash -lc 'git log -p -1'", 'commit abc\n\n' + diff_text),
+                ("bash -lc 'git diff origin/main...HEAD'", QUOTED_PATH_DIFF)):
             with self.subTest(command=command):
                 self.assertTrue(cr.diff_commands(cr.read_events(self.command_only(command, output))))
                 self.assertEqual(judge(self.command_only(command, output), self.last)[0], 'clean')
