@@ -453,11 +453,15 @@ def inline_comments(findings, diff):
     return comments
 
 
-def review_body(head, verdict, summary, findings, raw='', reason='', effort=None):
-    """Render the review body; it always carries the marker and every finding in full."""
+def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None):
+    """Render the review body; it always carries the marker and every finding in full.
+
+    kept names where the full codex output is preserved; failed and truncated bodies point to it.
+    """
     parts = [MARKER.format(head=head, verdict=verdict, effort=f' effort={effort}' if effort else '')]
     if verdict == 'failed':
-        parts.append(f'**Remote codex review failed** for `{head}`: {reason}. This is not a pass.')
+        parts.append(f'**Remote codex review failed** for `{head}`: {reason}. This is not a pass.'
+                     + (f'\n\nFull codex output is kept on the review host at `{kept}`.' if kept else ''))
     elif verdict == 'clean':
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
     else:
@@ -471,7 +475,8 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
         parts.append(raw)
     body = '\n\n'.join(parts)
     if len(body) > BODY_LIMIT:
-        body = body[:BODY_LIMIT] + '\n\n[truncated; full text in the service journal]'
+        body = body[:BODY_LIMIT] + (f'\n\n[truncated; full text kept on the review host at `{kept}`]'
+                                    if kept else '\n\n[truncated]')
     return body
 
 
@@ -901,6 +906,15 @@ class Reviewer:
             return 'skipped'
         return None
 
+    def keep_output(self, job, output, last):
+        """Write codex output to state_dir/output/<job id>.log with mode 0600."""
+        path = self.config.state_dir / 'output' / f'{job.id}.log'
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(output + ('\n--- last message ---\n' + last if last else ''))
+
     def work_forever(self):
         while not self.stop.is_set():
             if not self.work_once():
@@ -1007,21 +1021,24 @@ class Reviewer:
             return None
         message = final_message(output, last)
         comments = []
+        kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
         if timed_out:
-            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, reason=(
+            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, kept=kept, reason=(
                 f'codex timed out after {self.config.timeout_seconds} s'))
         elif rc != 0 or not message:
             tail = '\n'.join(output.strip().splitlines()[-5:])
-            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, reason=(
+            verdict, body = 'failed', review_body(job.head, 'failed', '', [], effort=effort, kept=kept, reason=(
                 f'codex exited {rc}' + (' with no final message' if rc == 0 else '')
                 + (f'\n\n```\n{tail}\n```' if tail else '')))
         else:
             roots = (str(worktree), os.path.realpath(worktree))
             verdict, summary, findings = parse_review(message, roots)
-            body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort)
+            body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort, kept=kept)
             if findings:
                 comments = inline_comments(findings, diff_lines(
                     self.github.pull_files(job.full_name, job.number, token)))
+        if verdict == 'failed' or len(body) > BODY_LIMIT:
+            self.keep_output(job, output, last)
         return self.publish(job, verdict, body, comments, token)
 
 

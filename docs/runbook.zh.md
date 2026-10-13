@@ -67,6 +67,7 @@ worker 在审查开始前和结束后各向 GitHub 查一次 PR。PR 已关闭�
 - 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。
 - 结论判定：codex 最终消息中含 `[P0]` 到 `[P3]` 即为 `findings`，否则为 `clean`。最终消息优先取 `-o` 输出文件，取不到时取输出中最后一个单独的 `codex` 行之后的文本。
 - codex 非零退出、超时（默认 40 分钟）或没有最终消息时，发 `verdict=failed`，正文写明「This is not a pass」。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--requeue`。
+- 结论为 `failed`，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
 - GitHub 或 git 出错（不是 codex 本身失败）时，任务重新排队，等待 5 分钟乘以已失败次数后再试。累计 `CODEX_REVIEW_MAX_ATTEMPTS`（默认 3）次仍失败时，发 `failed` 标记。
 
 ### 2.5 漏投补救
@@ -85,7 +86,7 @@ worker 在审查开始前和结束后各向 GitHub 查一次 PR。PR 已关闭�
 
 - 每个仓库在 `/var/lib/codex-review/mirrors/<owner>/<repo>.git` 维护一份 bare 镜像。每次 fetch 取回 `refs/pull/<n>/head` 和 base 分支，base 写到 `refs/remotes/origin/<base>`。
 - installation token 通过环境变量 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` 设置 `http.https://github.com/.extraheader`，不出现在命令行参数、URL 或日志里。
-- 每个任务在 `/var/lib/codex-review/work/<任务 id>/tree` 建一个 detached 工作树，结束后删除。服务启动时会清掉上次残留的工作树。
+- 每个任务在 `/var/lib/codex-review/work/<任务 id>/tree` 建一个 detached 工作树，结束后删除。服务启动时会清掉上次残留的工作树。需要保留的输出按 §2.4 另存到 `output/`，不随工作树删除。
 - codex 命令（`<effort>` 的取法见 §2.6.1）：
 
   ```

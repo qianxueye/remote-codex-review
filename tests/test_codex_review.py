@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -147,7 +148,7 @@ class Harness(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.config = config()
+        self.config = config(CODEX_REVIEW_STATE_DIR=str(self.root))
         self.store = cr.Store(self.root / 'state.sqlite')
         self.github = FakeGitHub()
         self.git = FakeGit(self.root)
@@ -458,6 +459,31 @@ class ReviewTests(Harness):
         _, status = self.run_next()
         self.assertEqual(status, 'failed')
         self.assertIn('timed out', self.github.posted[0]['body'])
+
+    def test_timeout_output_is_kept_private_and_referenced(self):
+        self.codex.timed_out, self.codex.rc = True, -9
+        self.deliver(pull_payload())
+        job, _ = self.run_next()
+        kept = self.root / 'output' / f'{job.id}.log'
+        self.assertIn('progress', kept.read_text())
+        self.assertEqual(stat.S_IMODE(kept.stat().st_mode), 0o600)
+        self.assertIn(f'`$CODEX_REVIEW_STATE_DIR/output/{job.id}.log`', self.github.posted[0]['body'])
+
+    def test_truncated_body_points_to_kept_full_text(self):
+        self.codex.message = 'Summary.\n\n- [P2] Long finding — src/app.py:1\n' + '  detail\n' * 10000 + '  END-OF-TEXT'
+        self.deliver(pull_payload())
+        job, status = self.run_next()
+        body = self.github.posted[0]['body']
+        self.assertEqual(status, 'findings')
+        self.assertTrue(body.endswith(f'[truncated; full text kept on the review host at '
+                                      f'`$CODEX_REVIEW_STATE_DIR/output/{job.id}.log`]'))
+        self.assertNotIn('END-OF-TEXT', body)
+        self.assertIn('END-OF-TEXT', (self.root / 'output' / f'{job.id}.log').read_text())
+
+    def test_clean_review_keeps_no_output(self):
+        self.deliver(pull_payload())
+        self.run_next()
+        self.assertFalse((self.root / 'output').exists())
 
     def test_empty_final_message_is_failed_not_clean(self):
         self.codex.message = ''
