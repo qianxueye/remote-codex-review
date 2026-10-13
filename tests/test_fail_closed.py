@@ -41,7 +41,7 @@ def is_command(event):
 
 
 class RealOutputTests(unittest.TestCase):
-    def test_real_clean_runs_are_clean_in_both_tiers(self):
+    def test_real_clean_runs_are_clean(self):
         for name in ('clean-tests', 'clean-ro'):
             with self.subTest(name):
                 verdict, summary, findings, reasons = judge(*fixture(name))
@@ -49,7 +49,7 @@ class RealOutputTests(unittest.TestCase):
                 self.assertNotIn('VERDICT', summary)
                 self.assertIn('pagination helper', summary)
 
-    def test_real_findings_runs_are_findings_in_both_tiers(self):
+    def test_real_findings_runs_are_findings(self):
         for name in ('findings-tests', 'findings-ro'):
             with self.subTest(name):
                 verdict, _, findings, _ = judge(*fixture(name))
@@ -317,27 +317,6 @@ class TestRunLimitTests(unittest.TestCase):
             with self.subTest(message[:20]):
                 self.assertEqual(judge(stdout, message)[0], 'clean')
 
-
-class TierSettingTests(Harness):
-    def test_read_only_setting_overrides_high_risk_paths(self):
-        self.reviewer.config = config(CODEX_REVIEW_STATE_DIR=str(self.root), CODEX_REVIEW_TIER='read-only')
-        self.git.files = ['deploy/install.sh', '.github/workflows/ci.yml']
-        self.deliver(pull_payload())
-        self.run_next()
-        self.assertEqual(self.codex.calls[0][4], 'read-only')
-        self.assertIn('verdict=clean effort=high tests=read-only -->', self.github.posted[0]['body'])
-
-    def test_auto_setting_keeps_path_based_tiers(self):
-        self.git.files = ['deploy/install.sh']
-        self.deliver(pull_payload())
-        self.run_next()
-        self.assertEqual(self.codex.calls[0][4], 'tests')
-
-    def test_unknown_setting_is_rejected(self):
-        with self.assertRaises(cr.ConfigError):
-            config(CODEX_REVIEW_TIER='none')
-
-
 class FakeTransport:
     def __init__(self, review):
         self.review, self.calls = review, []
@@ -359,7 +338,7 @@ class FakeTransport:
 
 class InvalidateTests(unittest.TestCase):
     def review(self, login='remote-review[bot]', verdict='clean'):
-        marker = cr.MARKER.format(head=HEAD, verdict=verdict, effort=' effort=high', tests=' tests=tests')
+        marker = cr.MARKER.format(head=HEAD, verdict=verdict, effort=' effort=high', tests=' tests=read-only')
         return {'id': 5, 'user': {'login': login}, 'body': f'{marker}\n\n**Remote codex review: no findings**'}
 
     def test_rewrites_body_and_marks_verdict_invalid(self):
@@ -369,7 +348,7 @@ class InvalidateTests(unittest.TestCase):
         method, path, body = transport.calls[-1]
         self.assertEqual((method, path), ('PUT', f'/repos/{REPO}/pulls/7/reviews/5'))
         self.assertEqual(body['body'], f'<!-- remote-codex-review head={HEAD} verdict=invalid effort=high '
-                                       'tests=tests -->\n\nVoid.')
+                                       'tests=read-only -->\n\nVoid.')
 
     def test_refuses_reviews_of_other_authors_and_unmarked_reviews(self):
         for review in (self.review(login='someone'), dict(self.review(), body='plain text')):

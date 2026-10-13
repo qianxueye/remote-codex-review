@@ -7,13 +7,6 @@
     ],
     "high": [
       "docs/runbooks/**"
-    ],
-    "tests": [
-      "**/migrations/**",
-      "deploy/**",
-      ".github/workflows/**",
-      "**/*secret*",
-      "**/*credential*"
     ]
   },
   "repos": {}
