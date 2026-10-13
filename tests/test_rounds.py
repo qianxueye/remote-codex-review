@@ -134,7 +134,7 @@ class DeltaTests(Rounds):
         self.assertEqual(getattr(self.git, 'delta_calls', []), [])
         self.assertIn('mode=full -->', body)
 
-    def test_empty_delta_is_clean_without_codex_and_keeps_the_read_only_field(self):
+    def test_empty_delta_after_a_clean_review_is_clean_without_codex(self):
         self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
         self.git.delta_files = []
         status, body = self.second_head(message(verdict='CLEAN'))
@@ -142,52 +142,31 @@ class DeltaTests(Rounds):
         self.assertIn(f'head={NEW_HEAD} verdict=clean effort=none tests=read-only mode=delta -->', body)
         self.assertNotIn('codex was told', body)
 
-    def test_empty_delta_keeps_unresolved_p1_of_the_previous_review_blocking(self):
-        self.first_round(message(finding('P1', 'Order is sent twice', 'src/order.py', 7, 90),
-                                 finding('P3', 'Typo in log', 'src/log.py', 2, 80)), message(verdict='CLEAN'))
+    def assert_full_after_findings(self, previous):
+        self.first_round(message(previous), message(verdict='CLEAN'))
+        self.assertIn('verdict=findings', self.github.posted[0]['body'])
         self.git.delta_files = []
-        status, body = self.second_head(message(verdict='CLEAN'))
-        self.assertEqual((status, len(self.codex.calls)), ('findings', 2))
-        self.assertIn(f'head={NEW_HEAD} verdict=findings effort=none tests=read-only mode=delta -->', body)
-        self.assertIn('## ' + cr.CARRIED_HEADING, body)
-        self.assertIn('**[P1] Order is sent twice** — `src/order.py:7` · 置信度 90', body)
-        self.assertNotIn('Typo in log', body)
-        self.git.head = THIRD_HEAD
-        status, body = self.second_head(message(verdict='CLEAN'), guid='d-3', head=THIRD_HEAD)
-        self.assertEqual(status, 'findings')
-        self.assertIn('**[P1] Order is sent twice**', body)
-
-    def test_empty_delta_whose_base_merge_touched_a_blocker_file_is_reviewed_in_full(self):
-        self.first_round(message(finding('P1', 'Order is sent twice', 'src/order.py', 7, 90)), message(verdict='CLEAN'))
-        self.git.delta_files, self.git.base_touched = [], ['src/order.py']
+        self.codex.messages = [message(verdict='CLEAN'), message(verdict='CLEAN')]
         status, body = self.second_head(message(verdict='CLEAN'))
         self.assertEqual(status, 'clean')
         self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 4)
-        self.assertIn('mode=full -->', body)
-        self.assertIn('changed the files of 1 earlier blocking finding(s)', body)
-        self.assertNotIn(cr.CARRIED_HEADING, body)
+        self.assertIn(f'head={NEW_HEAD} verdict=clean effort=xhigh tests=read-only mode=full -->', body)
+        self.assertIn('was findings', body)
 
-    def test_empty_delta_whose_base_merge_left_blocker_files_alone_carries_them(self):
-        self.first_round(message(finding('P1', 'Order is sent twice', 'src/order.py', 7, 90)), message(verdict='CLEAN'))
-        self.git.delta_files, self.git.base_touched = [], ['src/other.py', 'src/order.py.bak']
-        status, body = self.second_head(message(verdict='CLEAN'))
-        self.assertEqual((status, len(self.codex.calls)), ('findings', 2))
-        self.assertIn('**[P1] Order is sent twice** — `src/order.py:7` · 置信度 90', body)
+    def test_empty_delta_after_a_p1_review_is_reviewed_in_full(self):
+        self.assert_full_after_findings(finding('P1', 'Order is sent twice', 'src/order.py', 7, 90))
 
-    def test_empty_delta_after_an_unparsed_previous_review_is_reviewed_in_full(self):
-        self.first_round('One issue: [P1] the retry loop never ends.\nVERDICT: FINDINGS', message(verdict='CLEAN'))
-        self.assertIn('unparsed finding(s)**', self.github.posted[0]['body'])
+    def test_empty_delta_after_a_p3_only_review_is_reviewed_in_full(self):
+        self.assert_full_after_findings(finding('P3', 'Typo in log', 'src/log.py', 2, 80))
+
+    def test_empty_delta_after_a_truncated_clean_review_is_reviewed_in_full(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        self.github.posted[0]['body'] += '\n\n[truncated]'
         self.git.delta_files = []
         status, body = self.second_head(message(verdict='CLEAN'))
         self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 4)
         self.assertIn('mode=full -->', body)
-
-    def test_empty_delta_after_only_non_blocking_findings_is_clean(self):
-        self.first_round(message(finding('P2', 'Slow loop', 'src/app.py', 7, 90)), message(verdict='CLEAN'))
-        self.git.delta_files = []
-        status, body = self.second_head(message(verdict='CLEAN'))
-        self.assertEqual(status, 'clean')
-        self.assertNotIn('Slow loop', body)
+        self.assertIn('was clean and truncated', body)
 
     def test_base_change_falls_back_to_a_full_round(self):
         self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))

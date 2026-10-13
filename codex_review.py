@@ -86,7 +86,6 @@ DELTA_PROMPT = (
     "delta. Problems listed only in that section do not count as findings for the VERDICT line.")
 PREVIOUS_LIMIT_CHARS = 20000
 PROMOTED_HEADING = '增量外但阻塞的问题（P0/P1 或资金、止损、凭据、安全边界）'
-CARRIED_HEADING = '上一轮仍未处理的阻塞项（增量为空）'
 
 # Out-of-delta items that still block: P0/P1 or the funds, stop-loss, credential and security classes.
 BLOCKING_RE = re.compile(
@@ -568,29 +567,6 @@ def split_register(message):
     return '\n'.join(kept), list(dict.fromkeys(items))
 
 
-def blocking_items(body):
-    """Return the posted P0/P1, funds, stop-loss, credential or security findings of a review body, verbatim."""
-    items, current, section = [], None, ''
-    for line in body.splitlines():
-        if line.startswith('## '):
-            section, current = line[3:].strip(), None
-        elif re.match(r'^- (?:\*\*)?\[P[0-3]\]', line) and section != '登记项':
-            current = [line]
-            items.append(current)
-        elif current is not None and (line.startswith(' ') or not line.strip()):
-            current.append(line)
-        else:
-            current = None
-    blocks = ['\n'.join(item).strip() for item in items]
-    return [block for block in blocks if BLOCKING_RE.search(block)]
-
-
-def blocker_path(item):
-    """Return the file path a carried finding points at, or None when it names no `path:line`."""
-    match = re.search(r'\s(?:—|–|--|-)\s+`?([^`\s]+?):\d+(?:-\d+)?(?:`|:|\s|$)', item.splitlines()[0])
-    return match.group(1) if match else None
-
-
 def merge_findings(passes):
     """Fold findings of several (label, findings) passes; one at an overlapping location of the same file joins it."""
     merged = []
@@ -771,7 +747,7 @@ def inline_comments(findings, diff):
 
 
 def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, reasons=(),
-                governance=(), mode=None, scope='', promoted=(), register=(), unposted=0, carried=()):
+                governance=(), mode=None, scope='', promoted=(), register=(), unposted=0):
     """Render the review body; it always carries the marker and every posted finding in full.
 
     effort is set once a review was decided (`none` when codex had nothing to read); kept names the kept output.
@@ -785,7 +761,7 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
     elif verdict == 'clean':
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
     else:
-        count = len(findings) + len(promoted) + len(carried)
+        count = len(findings) + len(promoted)
         parts.append(f'**Remote codex review: {count or "unparsed"} finding(s)** for `{head}`.')
     if effort and effort != 'none':
         parts.append('Read-only review: codex was told not to run tests or start services.')
@@ -805,9 +781,6 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
         parts.append(raw)
     if promoted:
         parts.append(f'## {PROMOTED_HEADING}\n\n' + '\n'.join(promoted))
-    if carried:
-        parts.append(f'## {CARRIED_HEADING}\n\n上一条 review 的这些阻塞项（P0/P1 或资金、止损、凭据、安全边界）所在代码在本 head '
-                     '没有改动，沿用为本次发现。\n\n' + '\n\n'.join(carried))
     if register:
         parts.append('## 登记项\n\n复审增量之外的问题：登记为 issue 并在 PR 上回复，不阻塞合并，不计入 verdict。\n\n'
                      + '\n'.join(register))
@@ -1423,9 +1396,9 @@ def self_check(codex, work_dir, timeout=300):
 class Plan:
     """How one head is reviewed: mode full or delta, the changed files, effort and (label, prompt sections) passes."""
 
-    def __init__(self, mode, why, files, effort, passes, timeout, prev=None, carried=()):
+    def __init__(self, mode, why, files, effort, passes, timeout, prev=None):
         self.mode, self.why, self.files, self.effort = mode, why, files, effort
-        self.passes, self.timeout, self.prev, self.carried = passes, timeout, prev, list(carried)
+        self.passes, self.timeout, self.prev = passes, timeout, prev
 
 
 class Reviewer:
@@ -1552,7 +1525,7 @@ class Reviewer:
         return verdict
 
     def previous_review(self, job, token):
-        """Return (head, review body, base) of the newest still-valid clean or findings review of another head."""
+        """Return (head, review body, base, verdict) of the newest still-valid concluded review of another head."""
         for head, review_id, base in self.store.concluded(job.full_name, job.number, job.head):
             try:
                 review = self.github.review(job.full_name, job.number, review_id, token)
@@ -1562,7 +1535,7 @@ class Reviewer:
                 raise
             match = MARKER_RE.search(review.get('body') or '')
             if match and match.group(1) == head and match.group(2) in CONCLUDED:
-                return head, review['body'], base
+                return head, review['body'], base, match.group(2)
         return None
 
     def plan(self, job, base, previous, scratch):
@@ -1575,20 +1548,14 @@ class Reviewer:
             tree, why = self.git.delta_tree(job.full_name, base, previous[0], job.head, scratch / 'delta-base')
             if tree:
                 files = self.git.diff_files(job.full_name, tree, job.head)
-                carried = [] if files else blocking_items(previous[1])
-                touched = self.git.diff_files(job.full_name, previous[0], tree) if carried else []
-                stale = [item for item in carried if blocker_path(item) is None or blocker_path(item) in touched]
-                if not files and ('\n\n[truncated' in previous[1] or 'unparsed finding(s)**' in previous[1]):
-                    why = (f'the delta since {previous[0][:12]} is empty but the previous review text is truncated '
-                           'or holds unparsed findings, so its blockers cannot be carried over')
-                elif stale:
-                    why = (f'the delta since {previous[0][:12]} is empty but the merge from origin/{base} changed the '
-                           f'files of {len(stale)} earlier blocking finding(s), so they are reviewed again')
-                else:
+                if files or (previous[3] == 'clean' and '\n\n[truncated' not in previous[1]):
                     effort = choose_effort(self.config.effort_rules, job.full_name, files)
                     sections = delta_prompt(base, previous[0], tree, files, previous[1])
                     return Plan('delta', why, files, effort, [('复审', sections)], self.config.timeout_seconds,
-                                previous[0], carried)
+                                previous[0])
+                why = (f'the delta since {previous[0][:12]} is empty but the review of that head was '
+                       f'{previous[3]}{" and truncated" if "[truncated" in previous[1] else ""}, so it is not '
+                       'known to be clean')
         files = self.git.changed_files(job.full_name, base, job.head)
         return Plan('full', why, files, FIRST_ROUND_EFFORT,
                     [(label, first_prompt(base, lens)) for label, lens in LENSES], self.config.first_timeout_seconds)
@@ -1642,9 +1609,8 @@ class Reviewer:
             token, outcome = self.recheck(job, base)
             if token is None:
                 return outcome
-            verdict = 'findings' if plan.carried else 'clean'
-            return self.publish(job, verdict, review_body(
-                job.head, verdict, '', [], effort='none', mode='delta', carried=plan.carried, scope=(
+            return self.publish(job, 'clean', review_body(
+                job.head, 'clean', '', [], effort='none', mode='delta', scope=(
                     f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
                     '合入的改动），未调用 codex。')), [], token)
         runs = []
