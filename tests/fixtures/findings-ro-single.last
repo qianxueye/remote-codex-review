@@ -1,0 +1,7 @@
+The pagination helper skips the first item and returns oversized, overlapping pages. 本次为只读审查，未运行测试 (read-only review; no tests were run).
+VERDICT: FINDINGS
+
+Review comment:
+
+- [P2] Correct both pagination slice bounds — /var/lib/codex-review/work/7/tree/paging.py:8-9
+  For example, `page([0, 1, 2, 3, 4], 0, 2)` returns `[1, 2, 3]` instead of `[0, 1]`. The start offset skips the first item, while the extra increment in the stop bound allows `size + 1` items and causes adjacent pages to overlap. Use `start = number * size` and slice through `start + size` to honor the documented contract.

@@ -51,10 +51,10 @@ VERDICT_RE = re.compile(r'^[\s`*_]*VERDICT:\s*([A-Z]+)[\s`*_.]*$', re.M)
 FAILURE_SIGNAL_RE = re.compile(
     r'\bblocked\b|placeholder|\bunverified\b|Reviewer failed to output a response|no such file or directory'
     r'|failed to spawn|\b(?:unable|could not|couldn\'t|cannot|can\'t|failed) to '
-    r'(?:review|inspect|read|access|run|execute|open|view|examine|load)\b'
+    r'(?:review|inspect|read|access|open|view|examine|load)\b'
     r'|\b(?:tool|command|executable|binary|host|helper|sandbox|component|program|mode)s? '
     r'(?:is |was |are |were )?(?:missing|unavailable|not found|not installed)'
-    r'|(?:无法|未能)(?:检查|审查|读取|运行|执行|查看|访问)|工具缺失|缺少(?:组件|工具|程序)', re.I)
+    r'|(?:无法|未能)(?:检查|审查|读取|查看|访问)|工具缺失|缺少(?:组件|工具|程序)', re.I)
 TRANSIENT_RE = re.compile(
     r'at capacity|overloaded|rate.?limit|usage limit|too many requests|\b429\b|\b5\d\d\b|service unavailable'
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
@@ -182,6 +182,9 @@ class Config:
         self.state_dir = Path(values.get('CODEX_REVIEW_STATE_DIR', '/var/lib/codex-review'))
         self.codex = values.get('CODEX_REVIEW_CODEX_BIN', 'codex')
         self.effort_rules = load_effort_rules(values.get('CODEX_REVIEW_EFFORT_RULES', ''))
+        self.tier = values.get('CODEX_REVIEW_TIER', 'auto')
+        if self.tier not in ('auto', 'read-only'):
+            raise ConfigError('CODEX_REVIEW_TIER must be auto or read-only')
 
     def excluded(self, full_name):
         return any(same_name(full_name, item) for item in self.exclude)
@@ -569,7 +572,7 @@ def parse_review(message, worktree_roots=()):
         elif current is not None:
             if line.strip():
                 current.lines.append(line)
-        elif line.strip() not in ('Full review comments:', 'Review comments:'):
+        elif line.strip() not in ('Full review comments:', 'Review comments:', 'Review comment:'):
             summary.append(line)
     verdict = 'findings' if findings or PRIORITY_RE.search(message) else 'clean'
     return verdict, '\n'.join(summary).strip(), findings
@@ -1240,7 +1243,8 @@ class Reviewer:
                 raise RuntimeError(f'fetched head {fetched[:12]} differs from the queued head')
             changed = self.git.changed_files(job.full_name, base, job.head)
             effort = choose_effort(self.config.effort_rules, job.full_name, changed)
-            tier = choose_tests(self.config.effort_rules, job.full_name, changed)
+            tier = ('read-only' if self.config.tier == 'read-only'
+                    else choose_tests(self.config.effort_rules, job.full_name, changed))
             shutil.rmtree(scratch, ignore_errors=True)
             self.git.add_worktree(job.full_name, worktree, job.head)
         try:

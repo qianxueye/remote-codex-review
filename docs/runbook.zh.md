@@ -16,7 +16,7 @@ GitHub App webhook
   -> cloudflared（codex-review-tunnel.service，审查主机只有出站连接）
   -> http://127.0.0.1:8787/webhook                    （codex-review.service）
   -> /var/lib/codex-review/state.sqlite 中的任务队列
-  -> worker（并发上限 2）：bare 镜像 fetch -> detached 工作树 -> codex exec review -> 发 review
+  -> worker（并发数见 §2.6.3，默认 2）：bare 镜像 fetch -> detached 工作树 -> codex exec review -> 发 review
 ```
 
 ## 2. 行为约定
@@ -161,7 +161,9 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 
 #### 2.6.2 测试档位
 
-同一个表中的 `tests` 列出高风险路径。档位按同一份改动文件决定：
+`CODEX_REVIEW_TIER` 决定是否分档：`auto`（默认）按下列规则分档；`read-only` 时所有 PR 都走 `read-only` 档，不看改动路径，标记照常写 `tests=read-only`。测试改由本地审查和 CI 负责时，设为 `read-only`。
+
+`auto` 时，同一个表中的 `tests` 列出高风险路径。档位按同一份改动文件决定：
 
 - 有一个改动文件匹配 `tests` 中的模式，用 `tests` 档：命令同 §2.6，codex 可以运行测试；
 - 没有任何改动文件、或该表没有 `tests` 键时，也用 `tests` 档；
@@ -170,6 +172,10 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 默认表中的 `tests` 是通用示例：`**/migrations/**`、`deploy/**`、`.github/workflows/**`、`**/*secret*`、`**/*credential*`。各仓库的实际清单写在 `repos` 下。
 
 `read-only` 档的提示另加 `READ_ONLY_RULE`：要求 codex 不运行 pytest、vitest 或其他测试套件，不启动数据库或其他服务，结论中写明「本次为只读审查，未运行测试」。该档的沙箱为 `--sandbox read-only`。选中的档位写在 review 标记的 `tests=` 中。
+
+#### 2.6.3 并发
+
+`CODEX_REVIEW_CONCURRENCY` 是同时运行的 codex 审查数。按「单个审查的内存峰值 × N ≤ 可用内存的 70%」取 N，上限 6，并且 N × 峰值要低于单元的 `MemoryMax=3G`。峰值的测法：用 `systemd-run` 以服务账号和同样的加固参数运行一次审查，每 0.5 秒读取该临时单元 cgroup 的 `memory.current`，取最大值；可用内存取 `free -m` 的 available 列。`read-only` 档不运行测试，峰值主要是 codex 进程本身。
 
 ### 2.7 为什么用常驻服务
 

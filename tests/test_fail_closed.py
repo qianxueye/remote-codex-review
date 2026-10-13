@@ -57,6 +57,16 @@ class RealOutputTests(unittest.TestCase):
                 self.assertEqual([(f.priority, f.path, f.start) for f in findings],
                                  [('P2', 'paging.py', 8), ('P2', 'paging.py', 9)])
 
+    def test_real_single_finding_read_only_run_drops_the_block_header(self):
+        last = (FIXTURES / 'findings-ro-single.last').read_text(encoding='utf-8')
+        verdict, summary, findings, _ = judge(fixture('findings-ro')[0], last)
+        self.assertEqual(verdict, 'findings')
+        self.assertEqual([(f.priority, f.title, f.path, f.start, f.end) for f in findings],
+                         [('P2', 'Correct both pagination slice bounds', 'paging.py', 8, 9)])
+        self.assertIn('page([0, 1, 2, 3, 4], 0, 2)', findings[0].text)
+        self.assertNotIn('Review comment', summary)
+        self.assertNotIn('VERDICT', summary)
+
     def test_real_run_without_code_mode_host_is_failed(self):
         verdict, _, findings, reasons = judge(*fixture('broken-tests'))
         self.assertEqual((verdict, findings), ('failed', []))
@@ -288,6 +298,41 @@ class TransientRetryTests(Harness):
 
 def cr_clean():
     return 'The change is consistent with its callers.\nVERDICT: CLEAN'
+
+
+REAL_CLEAN_WITHOUT_PYTEST = (
+    '未发现符合报告标准的新缺陷；diff 检查和合约清单校验通过。环境仅有 Python 3.10 且缺少 pytest，未能执行项目测试。\n'
+    'VERDICT: CLEAN',
+    '未发现此次变更引入的明确缺陷。合约清单校验通过；当前环境缺少 pytest，未能运行测试。\nVERDICT: CLEAN',
+    'No defects found. I was unable to run the test suite because pytest is not installed.\nVERDICT: CLEAN')
+
+
+class TestRunLimitTests(unittest.TestCase):
+    def test_not_running_tests_is_not_a_tool_failure(self):
+        stdout, _ = fixture('clean-tests')
+        for message in REAL_CLEAN_WITHOUT_PYTEST:
+            with self.subTest(message[:20]):
+                self.assertEqual(judge(stdout, message)[0], 'clean')
+
+
+class TierSettingTests(Harness):
+    def test_read_only_setting_overrides_high_risk_paths(self):
+        self.reviewer.config = config(CODEX_REVIEW_STATE_DIR=str(self.root), CODEX_REVIEW_TIER='read-only')
+        self.git.files = ['deploy/install.sh', '.github/workflows/ci.yml']
+        self.deliver(pull_payload())
+        self.run_next()
+        self.assertEqual(self.codex.calls[0][4], 'read-only')
+        self.assertIn('verdict=clean effort=high tests=read-only -->', self.github.posted[0]['body'])
+
+    def test_auto_setting_keeps_path_based_tiers(self):
+        self.git.files = ['deploy/install.sh']
+        self.deliver(pull_payload())
+        self.run_next()
+        self.assertEqual(self.codex.calls[0][4], 'tests')
+
+    def test_unknown_setting_is_rejected(self):
+        with self.assertRaises(cr.ConfigError):
+            config(CODEX_REVIEW_TIER='none')
 
 
 class FakeTransport:
