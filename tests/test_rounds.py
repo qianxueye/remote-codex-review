@@ -249,6 +249,46 @@ class ConfidenceTests(Rounds):
         status, _ = self.review_once(message(finding('P1', 'Guess', 'src/a.py', 3, 10)))
         self.assertEqual(status, 'failed')
 
+    def test_spaced_backticked_path_p1_with_a_low_finding_is_findings(self):
+        p1 = '- [P1] Order is sent twice — `src/order handler.py:12-14`\n  No idempotency key.\n  Confidence: 90\n'
+        self.github.files = [{'filename': 'src/order handler.py', 'patch': '@@ -10,6 +10,6 @@\n a\n b\n+c\n+d\n+e\n f'}]
+        status, post = self.review_once(message(p1, finding('P3', 'Weak guess', 'src/a.py', 3, 20)))
+        self.assertEqual(status, 'findings')
+        self.assertIn('**[P1] Order is sent twice** — `src/order handler.py:12-14` · 置信度 90', post['body'])
+        self.assertEqual(post['comments'][0]['path'], 'src/order handler.py')
+
+    def test_unparseable_header_with_a_low_finding_is_findings_with_the_raw_text(self):
+        broken = '- [P1] Order is sent twice — src/order handler.py\n  No line number.\n  Confidence: 90\n'
+        status, post = self.review_once(message(broken, finding('P3', 'Weak guess', 'src/a.py', 3, 20)))
+        self.assertEqual(status, 'findings')
+        self.assertIn('Order is sent twice — src/order handler.py', post['body'])
+
+    def test_unparseable_p2_with_a_normal_finding_is_findings_with_the_raw_text(self):
+        broken = '- [P2] Cache never expires (see the loader)\n  Confidence: 80\n'
+        for normal in (finding('P3', 'Typo', 'src/a.py', 3, 70), finding('P3', 'Typo', 'src/a.py', 3, 10)):
+            with self.subTest(normal.splitlines()[-1]):
+                self.github.posted.clear()
+                self.github.markers.clear()
+                self.store.db.execute('DELETE FROM jobs')
+                self.store.db.execute('DELETE FROM deliveries')
+                status, post = self.review_once(message(normal, broken))
+                self.assertEqual(status, 'findings')
+                self.assertIn('Cache never expires (see the loader)', post['body'])
+                if '**[P3] Typo**' in post['body']:
+                    self.assertLess(post['body'].index('Cache never expires'), post['body'].index('**[P3] Typo**'))
+
+    def test_register_line_without_a_priority_tag_counts_when_confident(self):
+        harness = DeltaTests('test_out_of_delta_findings_are_registered_and_do_not_count')
+        harness.setUp()
+        try:
+            harness.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+            item = '- Retry bound is off by one — src/hook.py:9: the loop runs once more. Confidence: 80'
+            status, body = harness.second_head(message(verdict='CLEAN', register=[item]))
+        finally:
+            harness.tearDown()
+        self.assertEqual(status, 'findings')
+        self.assertIn('## 增量外但阻塞的问题', body)
+
     def test_floor_is_compared_before_rounding(self):
         for line, posted in (('Confidence: 49.6', False), ('confidence_score: 0.496', False),
                              ('Confidence: 50.0', True), ('confidence_score: 0.5', True)):

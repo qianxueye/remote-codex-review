@@ -123,7 +123,9 @@ ISSUE_LINK_RE = re.compile(r'github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issue
 GOVERNANCE_LIMIT = 20
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
-FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
+FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+)\s+(?:—|–|--|-)\s+`?([^`]+?)`?:(\d+)(?:-(\d+))?`?\s*$')
+# A line that opens like a finding; one FINDING_RE cannot read keeps the review from being clean.
+HEADER_RE = re.compile(r'^\s*(?:[-*]\s*|\d+[.)]\s*)?(?:\*\*)?\[P[0-3]\]')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
 SELF_CHECK_FAILED = 3
@@ -558,7 +560,7 @@ def split_register(message):
             inside = False
             kept.append(line)
         elif inside:
-            if re.match(r'^\s*[-*]\s', line):
+            if re.match(r'^\s*[-*]\s', line) or HEADER_RE.match(line) or (not items and PRIORITY_RE.search(line)):
                 items.append(line.strip())
             elif line.strip() and items:
                 items[-1] += ' ' + line.strip()
@@ -666,14 +668,16 @@ def failure_reasons(rc, events, message):
 def assess(rc, events, message, worktree_roots=(), uncounted=0):
     """Return (verdict, summary, posted findings, unposted findings, reasons).
 
-    Clean needs every check to pass and `VERDICT: CLEAN`, or `VERDICT: FINDINGS` when every finding went uncounted.
+    Clean needs every check to pass and `VERDICT: CLEAN`, or `VERDICT: FINDINGS` when every finding went uncounted;
+    any finding-like line that does not parse makes it findings.
     """
     verdict, summary, findings = parse_review(message, worktree_roots)
     posted = [finding for finding in findings if finding.published()]
     unposted = [finding for finding in findings if not finding.published()]
     declared = VERDICT_RE.findall(message)
     summary = VERDICT_RE.sub('', summary).strip()
-    unparsed = not findings and (verdict == 'findings' or ('FINDINGS' in declared and not uncounted))
+    unparsed = bool(unmatched_headers(message)) or (
+        not findings and (verdict == 'findings' or ('FINDINGS' in declared and not uncounted)))
     if rc == 0 and message and (posted or unparsed):
         return 'findings', summary, posted, unposted, []
     reasons = failure_reasons(rc, events, message)
@@ -681,6 +685,11 @@ def assess(rc, events, message, worktree_roots=(), uncounted=0):
         reasons.append('the final message carries no single `VERDICT: CLEAN` line'
                        + (f' (found {", ".join(declared)})' if declared else ''))
     return ('failed' if reasons else 'clean'), summary, [], unposted, reasons
+
+
+def unmatched_headers(message):
+    """Return the finding-like lines of a message that FINDING_RE cannot parse."""
+    return [line for line in message.splitlines() if HEADER_RE.match(line) and not FINDING_RE.match(line)]
 
 
 def strip_prefix(path, worktree_roots):
@@ -696,7 +705,10 @@ def parse_review(message, worktree_roots=()):
     findings, summary, current, seen = [], [], None, set()
     for line in message.splitlines():
         match = FINDING_RE.match(line)
-        if match:
+        if HEADER_RE.match(line) and not match:
+            current = None
+            summary.append(line)
+        elif match:
             priority, title, path, start, end = match.groups()
             current = Finding(priority, title, strip_prefix(path, worktree_roots), int(start), int(end or start))
             key = (current.priority, current.title, current.location())
@@ -1697,7 +1709,7 @@ class Reviewer:
                 score = confidence(item)
                 if score is None or score < CONFIDENCE_FLOOR:
                     unposted.append(f'{label}: {item}')
-                elif BLOCKING_RE.search(item):
+                elif BLOCKING_RE.search(item) or not PRIORITY_RE.search(item):
                     promoted.append(item)
                 else:
                     register.append(item)
