@@ -397,6 +397,9 @@ class GitHub:
     def issue(self, full_name, number, token):
         return self.call('GET', f'/repos/{full_name}/issues/{number}', token)
 
+    def issue_comments(self, full_name, number, token):
+        return list(self.paged(f'/repos/{full_name}/issues/{number}/comments', token))
+
     def existing_marker(self, full_name, number, head, token):
         """Return (verdict, review id) this App already posted for head, or None."""
         bot = self.bot_login()
@@ -1010,7 +1013,7 @@ def governance_links(text):
 
 
 def prefetch_governance(github, token, worktree, target):
-    """Save the body of every issue linked from the worktree's AGENTS.md under target as a 0444 file.
+    """Save every issue linked from the worktree's AGENTS.md, with its comments, as target/owner/repo/N.md (0444).
 
     A failed fetch is recorded on its GovernanceDoc instead of raised, so the review still runs.
     """
@@ -1024,12 +1027,14 @@ def prefetch_governance(github, token, worktree, target):
         docs.append(doc)
         try:
             issue = github.issue(full_name, number, token)
-            content = f"# {issue['title']}\n\n{issue.get('body') or ''}\n"
+            content = f"# {issue['title']}\n\n{issue.get('body') or ''}\n" + ''.join(
+                f"\n## Comment by {(item.get('user') or {}).get('login', '?')} at {item.get('created_at', '?')}\n\n"
+                f"{item.get('body') or ''}\n" for item in github.issue_comments(full_name, number, token))
         except (GitHubError, OSError, KeyError, TypeError) as exc:
             doc.error = str(exc)[:200] or type(exc).__name__
             continue
-        target.mkdir(mode=0o700, parents=True, exist_ok=True)
-        doc.path = target / f"{full_name.replace('/', '-')}-{number}.md"
+        doc.path = target / full_name / f'{number}.md'
+        doc.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         doc.path.write_text(content, encoding='utf-8')
         doc.path.chmod(0o444)
     return docs

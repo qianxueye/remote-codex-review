@@ -16,10 +16,8 @@ AGENTS = ('# Guidance\n\nBefore any work, read https://github.com/qianxueye/llm-
           'again: https://github.com/qianxueye/llm-trading/issues/1859\n')
 ISSUE = {'title': '代理工作流约束', 'body': '先读本 issue，再动手。'}
 REF = 'qianxueye/llm-trading#1859'
-INCIDENT_TAILS = (
-    '未发现达到报告标准的新增缺陷，拒绝码、API 契约及前端映射一致。工作流 issue #1859 因访问限制未能读取；'
-    '本次为只读审查，未运行测试 (read-only review; no tests were run)。\nVERDICT: CLEAN',
-    '审查中断：未能读取 diff，无法确认改动内容。\nVERDICT: CLEAN')
+JOB_85_TAIL = ('未发现达到报告标准的新增缺陷，拒绝码、API 契约及前端映射一致。工作流 issue #1859 因访问限制未能读取；'
+               '本次为只读审查，未运行测试 (read-only review; no tests were run)。\nVERDICT: CLEAN')
 
 
 class GovernancePrefetchTests(Harness):
@@ -28,6 +26,8 @@ class GovernancePrefetchTests(Harness):
         self.git.agents = AGENTS
         self.github.issues[('qianxueye/llm-trading', 1859)] = ISSUE
         self.github.issues[('Example-Org/Rules', 12)] = {'title': 'Rules', 'body': None}
+        self.github.comments[('qianxueye/llm-trading', 1859)] = [
+            {'user': {'login': 'qianxueye'}, 'created_at': '2026-10-01T00:00:00Z', 'body': '补充：先跑测试。'}]
 
     def test_linked_issues_are_saved_outside_the_worktree_and_named_in_the_prompt(self):
         self.deliver(pull_payload())
@@ -37,7 +37,10 @@ class GovernancePrefetchTests(Harness):
         worktree = self.codex.calls[0][1]
         (ref, path, text, error), second = self.codex.governance
         self.assertEqual((ref, error), (REF, None))
-        self.assertEqual(text, '# 代理工作流约束\n\n先读本 issue，再动手。\n')
+        self.assertEqual(text, '# 代理工作流约束\n\n先读本 issue，再动手。\n'
+                               '\n## Comment by qianxueye at 2026-10-01T00:00:00Z\n\n补充：先跑测试。\n')
+        self.assertEqual(path.relative_to(self.root / 'work').parts[1:], ('governance', 'qianxueye', 'llm-trading',
+                                                                          '1859.md'))
         self.assertFalse(path.is_relative_to(worktree))
         self.assertEqual(second[2], '# Rules\n\n\n')
         prompt = cr.review_prompt('main', [cr.GovernanceDoc(ref, path)])
@@ -86,6 +89,16 @@ class GovernancePrefetchTests(Harness):
         self.assertEqual(self.run_next()[1], 'clean')
         self.assertEqual(self.github.issue_calls, [])
 
+    def test_issues_whose_dashed_names_coincide_get_distinct_files(self):
+        self.git.agents = 'https://github.com/a-b/c/issues/12 https://github.com/a/b-c/issues/12\n'
+        self.github.issues[('a-b/c', 12)] = {'title': 'first', 'body': ''}
+        self.github.issues[('a/b-c', 12)] = {'title': 'second', 'body': ''}
+        self.deliver(pull_payload())
+        self.assertEqual(self.run_next()[1], 'clean')
+        (_, first, first_text, _), (_, second, second_text, _) = self.codex.governance
+        self.assertNotEqual(first, second)
+        self.assertEqual((first_text[:8], second_text[:9]), ('# first\n', '# second\n'))
+
     def test_links_with_dot_repository_names_are_ignored(self):
         self.assertEqual(cr.governance_links('github.com/a/../issues/1 github.com/a/.x/issues/2'), [])
 
@@ -96,14 +109,13 @@ class GovernancePrefetchTests(Harness):
         return worktree
 
 
-class FailureSignalUnchangedTests(unittest.TestCase):
-    def test_message_saying_it_could_not_read_is_still_failed(self):
+class FailureSignalTests(unittest.TestCase):
+    def test_unread_diff_is_failed_and_an_unread_governance_issue_is_not(self):
         stdout, _ = fixture('clean-ro')
-        for message in INCIDENT_TAILS:
-            with self.subTest(message[:20]):
-                verdict, _, _, reasons = judge(stdout, message)
-                self.assertEqual(verdict, 'failed')
-                self.assertTrue(any('未能读取' in reason for reason in reasons))
+        verdict, _, _, reasons = judge(stdout, '审查中断：未能读取 diff，无法确认改动内容。\nVERDICT: CLEAN')
+        self.assertEqual(verdict, 'failed')
+        self.assertTrue(any('未能读取 diff' in reason for reason in reasons))
+        self.assertEqual(judge(stdout, JOB_85_TAIL)[0], 'clean')
 
 
 if __name__ == '__main__':

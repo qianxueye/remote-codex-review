@@ -94,6 +94,7 @@ class FakeGitHub:
         self.base = 'main'
         self.draft = False
         self.issues = {}
+        self.comments = {}
         self.issue_calls = []
 
     def token(self, installation):
@@ -116,6 +117,9 @@ class FakeGitHub:
         if isinstance(result, Exception):
             raise result
         return result
+
+    def issue_comments(self, full_name, number, token):
+        return self.comments.get((full_name, number), [])
 
     def post_review(self, full_name, number, head, body, comments, token):
         self.posted.append({'number': number, 'head': head, 'body': body, 'comments': comments})
