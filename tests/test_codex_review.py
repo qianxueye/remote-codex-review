@@ -79,12 +79,14 @@ class FakeGitHub:
         self.markers = {}
         self.files = []
         self.base = 'main'
+        self.draft = False
 
     def token(self, installation):
         return 'installation-token'
 
     def pull(self, full_name, number, token):
-        payload = pull_payload(head=self.heads.get(number, HEAD), number=number, state=self.state, base=self.base)
+        payload = pull_payload(head=self.heads.get(number, HEAD), number=number, state=self.state, base=self.base,
+                               draft=self.draft)
         return dict(payload['pull_request'], base=payload['pull_request']['base'])
 
     def pull_files(self, full_name, number, token):
@@ -406,6 +408,30 @@ class ReviewTests(Harness):
         self.assertEqual((status, self.github.posted), (None, []))
         self.assertEqual([(j.head, j.status) for j in self.store.queued()], [(HEAD, 'queued')])
 
+    def test_repository_excluded_after_queueing_is_not_reviewed(self):
+        self.deliver(pull_payload())
+        self.reviewer.config = config(CODEX_REVIEW_EXCLUDE_REPOS=REPO.lower())
+        _, status = self.run_next()
+        self.assertEqual((status, self.codex.calls, self.github.posted), ('skipped', [], []))
+        self.assertEqual(self.store.queued(), [])
+
+    def test_queued_pr_now_draft_is_not_reviewed_when_drafts_are_off(self):
+        self.deliver(pull_payload())
+        self.reviewer.config = config(CODEX_REVIEW_INCLUDE_DRAFTS='false')
+        self.github.draft = True
+        _, status = self.run_next()
+        self.assertEqual((status, self.codex.calls, self.github.posted), ('skipped', [], []))
+
+    def test_pr_turned_draft_during_review_is_not_published(self):
+        self.reviewer.config = config(CODEX_REVIEW_INCLUDE_DRAFTS='false')
+        self.deliver(pull_payload())
+
+        def to_draft():
+            self.github.draft = True
+        self.codex.during = to_draft
+        _, status = self.run_next()
+        self.assertEqual((status, len(self.codex.calls), self.github.posted), ('skipped', 1, []))
+
     def test_findings_posted_inline_and_in_body(self):
         self.codex.message = FINDINGS
         self.github.files = [{'filename': 'src/worker.py', 'patch': '@@ -40,3 +44,3 @@\n a\n+b\n c'}]
@@ -452,6 +478,15 @@ class ReviewTests(Harness):
             statuses.append(self.run_next()[1])
         self.assertEqual(statuses, [None] * (self.config.max_attempts - 1) + ['failed'])
         self.assertIn('fetch refused', self.github.posted[0]['body'])
+
+    def test_give_up_path_skips_repository_excluded_meanwhile(self):
+        def broken(*_):
+            self.reviewer.config = config(CODEX_REVIEW_MAX_ATTEMPTS='1', CODEX_REVIEW_EXCLUDE_REPOS=REPO)
+            raise RuntimeError('fetch refused')
+        self.git.fetch = broken
+        self.reviewer.config = config(CODEX_REVIEW_MAX_ATTEMPTS='1')
+        self.deliver(pull_payload())
+        self.assertEqual((self.run_next()[1], self.github.posted), ('skipped', []))
 
     def test_worker_survives_error_on_give_up_path(self):
         def broken(*_):

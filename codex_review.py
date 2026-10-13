@@ -889,6 +889,18 @@ class Reviewer:
             self.on_queued(running)
         return 'superseded'
 
+    def gate(self, job, pull):
+        """Return the job's outcome when the live PR no longer matches it or fails admission, else None."""
+        if pull.get('state') != 'open' or pull['head']['sha'] != job.head:
+            log(f'{job}: head moved or PR closed; not reviewed')
+            return self.follow_head(job, pull)
+        reason = admission(self.config, pull['base']['repo'], pull)
+        if reason is not None:
+            log(f'{job}: no longer admitted: {reason}')
+            self.store.finish(job.id, 'skipped')
+            return 'skipped'
+        return None
+
     def work_forever(self):
         while not self.stop.is_set():
             if not self.work_once():
@@ -924,8 +936,12 @@ class Reviewer:
                 self.store.retry(job.id, 300 * (job.attempts + 1))
                 return None
             log(f'{job}: giving up after {job.attempts + 1} attempts: {exc}')
+            token = self.github.token(job.installation)
+            outcome = self.gate(job, self.github.pull(job.full_name, job.number, token))
+            if outcome is not None:
+                return outcome
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
-                f'review infrastructure error after {job.attempts + 1} attempts: {exc}')), [])
+                f'review infrastructure error after {job.attempts + 1} attempts: {exc}')), [], token)
 
     def publish(self, job, verdict, body, comments, token=None):
         token = token or self.github.token(job.installation)
@@ -947,9 +963,9 @@ class Reviewer:
             self.store.finish(job.id, existing[0], existing[1])
             return existing[0]
         pull = self.github.pull(job.full_name, job.number, token)
-        if pull.get('state') != 'open' or pull['head']['sha'] != job.head:
-            log(f'{job}: head moved or PR closed before review')
-            return self.follow_head(job, pull)
+        outcome = self.gate(job, pull)
+        if outcome is not None:
+            return outcome
         base = pull['base']['ref']
         scratch = self.git.work / f'{job.id}'
         worktree = scratch / 'tree'
@@ -982,9 +998,9 @@ class Reviewer:
             return None
         token = self.github.token(job.installation)
         pull = self.github.pull(job.full_name, job.number, token)
-        if pull.get('state') != 'open' or pull['head']['sha'] != job.head:
-            log(f'{job}: head moved or PR closed during review; result discarded')
-            return self.follow_head(job, pull)
+        outcome = self.gate(job, pull)
+        if outcome is not None:
+            return outcome
         if pull['base']['ref'] != base:
             log(f'{job}: base changed to {pull["base"]["ref"]} during review; requeued')
             self.store.retry(job.id, 0, count_attempt=False)
