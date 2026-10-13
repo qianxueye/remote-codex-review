@@ -1,0 +1,10 @@
+The new pagination helper skips the first item and can return oversized, overlapping pages. Both boundary errors were reproduced; existing tests do not cover pagination.
+VERDICT: FINDINGS
+
+Full review comments:
+
+- [P2] Start each page at its zero-based offset — /var/lib/codex-review/work/7/tree/paging.py:8-8
+  Adding 1 to the start offset skips the first item and shifts every page forward. For example, `page([0], 0, 1)` returns `[]` instead of `[0]`. Compute the start as `number * size` to honor the documented zero-based pagination.
+
+- [P2] Limit the slice to the requested page size — /var/lib/codex-review/work/7/tree/paging.py:9-9
+  When enough items remain, the exclusive stop index `start + size + 1` returns `size + 1` items, violating the documented maximum and overlapping adjacent pages. For example, with `list(range(10))` and size 3, pages 0 and 1 both contain item 4. Use `start + size` as the stop index.

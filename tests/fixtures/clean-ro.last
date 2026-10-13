@@ -1,0 +1,2 @@
+The pagination helper correctly implements zero-based slicing and rejects negative page numbers and nonpositive page sizes. 本次为只读审查，未运行测试 (read-only review; no tests were run).
+VERDICT: CLEAN

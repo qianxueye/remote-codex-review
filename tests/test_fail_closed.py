@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Tests for the fail-closed verdict, startup self-check, invalidation and manual enqueue."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import codex_review as cr  # noqa: E402
+from test_codex_review import HEAD, NEW_HEAD, REPO, WORKTREE, FakeCodex, Harness, config, pull_payload  # noqa: E402
+
+FIXTURES = Path(__file__).resolve().parent / 'fixtures'
+ROOT = Path(__file__).resolve().parent.parent
+INCIDENT_MESSAGE = ('Review blocked: the execution tool failed because /usr/local/bin/codex-code-mode-host is missing, '
+                    'so I could not inspect the diff or repository instructions. The verdict is a placeholder.')
+
+
+def fixture(name):
+    """Return (JSONL stdout, last message) of a real codex 0.160.1 run recorded on the review host."""
+    return (FIXTURES / f'{name}.jsonl').read_text(encoding='utf-8'), (FIXTURES / f'{name}.last').read_text(
+        encoding='utf-8')
+
+
+def judge(stdout, last, rc=0):
+    events = cr.read_events(stdout)
+    return cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
+
+
+def without(stdout, predicate):
+    return ''.join(line + '\n' for line in stdout.splitlines() if not predicate(json.loads(line)))
+
+
+def is_command(event):
+    return (event.get('item') or {}).get('type') == 'command_execution'
+
+
+class RealOutputTests(unittest.TestCase):
+    def test_real_clean_runs_are_clean_in_both_tiers(self):
+        for name in ('clean-tests', 'clean-ro'):
+            with self.subTest(name):
+                verdict, summary, findings, reasons = judge(*fixture(name))
+                self.assertEqual((verdict, findings, reasons), ('clean', [], []))
+                self.assertNotIn('VERDICT', summary)
+                self.assertIn('pagination helper', summary)
+
+    def test_real_findings_runs_are_findings_in_both_tiers(self):
+        for name in ('findings-tests', 'findings-ro'):
+            with self.subTest(name):
+                verdict, _, findings, _ = judge(*fixture(name))
+                self.assertEqual(verdict, 'findings')
+                self.assertEqual([(f.priority, f.path, f.start) for f in findings],
+                                 [('P2', 'paging.py', 8), ('P2', 'paging.py', 9)])
+
+    def test_real_run_without_code_mode_host_is_failed(self):
+        verdict, _, findings, reasons = judge(*fixture('broken-tests'))
+        self.assertEqual((verdict, findings), ('failed', []))
+        text = '\n'.join(reasons)
+        self.assertIn('codex-code-mode-host', text)
+        self.assertIn('no command with exit code 0', text)
+        self.assertIn('found BLOCKED', text)
+
+    def test_incident_message_with_no_priority_tag_is_failed_not_clean(self):
+        stdout, _ = fixture('clean-ro')
+        self.assertEqual(cr.parse_review(INCIDENT_MESSAGE)[0], 'clean')
+        verdict, _, _, reasons = judge(stdout, INCIDENT_MESSAGE)
+        self.assertEqual(verdict, 'failed')
+        self.assertTrue(any('reports a failure' in reason for reason in reasons))
+
+
+class SingleConditionTests(unittest.TestCase):
+    """Each case breaks exactly one clean-verdict condition of a real clean run."""
+
+    def setUp(self):
+        self.stdout, self.last = fixture('clean-tests')
+        self.assertEqual(judge(self.stdout, self.last)[0], 'clean')
+
+    def assert_failed(self, verdict_tuple, phrase):
+        verdict, _, _, reasons = verdict_tuple
+        self.assertEqual(verdict, 'failed')
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn(phrase, reasons[0])
+
+    def test_nonzero_exit(self):
+        self.assert_failed(judge(self.stdout, self.last, rc=1), 'codex exited 1')
+
+    def test_no_successful_command(self):
+        self.assert_failed(judge(without(self.stdout, is_command), self.last), 'no command with exit code 0')
+
+    def test_only_failed_commands(self):
+        stdout = without(self.stdout, lambda e: is_command(e) and e['item'].get('exit_code') == 0)
+        self.assertIn('"exit_code":127', stdout)
+        self.assert_failed(judge(stdout, self.last), 'no command with exit code 0')
+
+    def test_error_item(self):
+        error = {'type': 'item.completed', 'item': {'id': 'e', 'type': 'error', 'message': 'Code Mode is off'}}
+        self.assert_failed(judge(json.dumps(error) + '\n' + self.stdout, self.last), 'error item: Code Mode is off')
+
+    def test_turn_failed_event(self):
+        failed = {'type': 'turn.failed', 'error': {'message': 'stream disconnected'}}
+        self.assert_failed(judge(self.stdout + json.dumps(failed) + '\n', self.last), 'turn.failed')
+
+    def test_no_completed_turn(self):
+        self.assert_failed(judge(without(self.stdout, lambda e: e['type'] == 'turn.completed'), self.last),
+                           'no completed turn')
+
+    def test_failure_signal_in_message(self):
+        for text in ('The verdict is a placeholder.', 'I was unable to read the diff.',
+                     'The code-mode host is missing.', 'Reviewer failed to output a response.',
+                     '工具缺失，无法检查代码。'):
+            with self.subTest(text):
+                self.assert_failed(judge(self.stdout, text + '\nVERDICT: CLEAN'), 'reports a failure')
+
+    def test_missing_verdict_line(self):
+        message = self.last.replace('VERDICT: CLEAN', '')
+        self.assert_failed(judge(self.stdout, message), 'no single `VERDICT: CLEAN`')
+
+    def test_blocked_verdict_line(self):
+        message = self.last.replace('VERDICT: CLEAN', 'VERDICT: BLOCKED')
+        verdict, _, _, reasons = judge(self.stdout, message)
+        self.assertEqual(verdict, 'failed')
+        self.assertTrue(any('found BLOCKED' in reason for reason in reasons))
+
+    def test_empty_message(self):
+        stdout = without(self.stdout, lambda e: (e.get('item') or {}).get('type') == 'agent_message')
+        verdict, _, _, reasons = judge(stdout, '')
+        self.assertEqual(verdict, 'failed')
+        self.assertIn('codex wrote no final message', reasons)
+
+    def test_stderr_noise_in_stdout_is_skipped(self):
+        noise = (FIXTURES / 'clean-tests.stderr').read_text(encoding='utf-8')
+        self.assertEqual(judge(noise + self.stdout + noise, self.last)[0], 'clean')
+
+    def test_last_agent_message_is_used_without_output_file(self):
+        self.assertEqual(judge(self.stdout, '')[0], 'clean')
+
+
+class ReviewerFailClosedTests(Harness):
+    def test_broken_codex_output_posts_failed_with_reasons(self):
+        self.codex.events, self.codex.message = fixture('broken-tests')
+        self.deliver(pull_payload())
+        job, status = self.run_next()
+        body = self.github.posted[0]['body']
+        self.assertEqual(status, 'failed')
+        self.assertIn(f'head={HEAD} verdict=failed', body)
+        self.assertIn('not a pass', body)
+        self.assertIn('codex-code-mode-host', body)
+        kept = (self.root / 'output' / f'{job.id}.log').read_text()
+        self.assertIn('--- stderr ---', kept)
+
+    def test_incident_message_is_not_posted_as_clean(self):
+        self.codex.message = INCIDENT_MESSAGE
+        self.deliver(pull_payload())
+        self.assertEqual(self.run_next()[1], 'failed')
+
+
+class FakeTransport:
+    def __init__(self, review):
+        self.review, self.calls = review, []
+
+    def __call__(self, method, url, token, body):
+        self.calls.append((method, url.replace(cr.API, ''), body))
+        if url.endswith('/app'):
+            return 200, {'slug': 'remote-review'}, ''
+        if url.endswith('/installation'):
+            return 200, {'id': 99}, ''
+        if '/app/installations/' in url and method == 'GET':
+            return 200, {'id': 99, 'account': {'login': 'Example-Org'}}, ''
+        if url.endswith('/access_tokens'):
+            return 201, {'token': 'tok', 'expires_at': '2099-01-01T00:00:00Z'}, ''
+        if method == 'GET':
+            return 200, self.review, ''
+        return 200, dict(self.review, body=body['body']), ''
+
+
+class InvalidateTests(unittest.TestCase):
+    def review(self, login='remote-review[bot]', verdict='clean'):
+        marker = cr.MARKER.format(head=HEAD, verdict=verdict, effort=' effort=high', tests=' tests=tests')
+        return {'id': 5, 'user': {'login': login}, 'body': f'{marker}\n\n**Remote codex review: no findings**'}
+
+    def test_rewrites_body_and_marks_verdict_invalid(self):
+        transport = FakeTransport(self.review())
+        github = cr.GitHub(config(), transport=transport, jwt_factory=lambda: 'jwt')
+        self.assertEqual(github.invalidate_review(REPO, 7, 5, 'Void.'), (HEAD, 'clean'))
+        method, path, body = transport.calls[-1]
+        self.assertEqual((method, path), ('PUT', f'/repos/{REPO}/pulls/7/reviews/5'))
+        self.assertEqual(body['body'], f'<!-- remote-codex-review head={HEAD} verdict=invalid effort=high '
+                                       'tests=tests -->\n\nVoid.')
+
+    def test_refuses_reviews_of_other_authors_and_unmarked_reviews(self):
+        for review in (self.review(login='someone'), dict(self.review(), body='plain text')):
+            transport = FakeTransport(review)
+            github = cr.GitHub(config(), transport=transport, jwt_factory=lambda: 'jwt')
+            with self.assertRaises(ValueError):
+                github.invalidate_review(REPO, 7, 5, 'Void.')
+            self.assertNotIn('PUT', [call[0] for call in transport.calls])
+
+    def test_invalid_marker_does_not_count_as_reviewed(self):
+        reviews = [{'user': {'login': 'remote-review[bot]'}, 'id': 3,
+                    'body': cr.MARKER.format(head=HEAD, verdict='invalid', effort='', tests='')}]
+
+        def transport(method, url, token, body):
+            return 200, ({'slug': 'remote-review'} if url.endswith('/app') else reviews), ''
+        github = cr.GitHub(config(), transport=transport, jwt_factory=lambda: 'jwt')
+        self.assertIsNone(github.existing_marker(REPO, 7, HEAD, 't'))
+        reviews.append({'user': {'login': 'remote-review[bot]'}, 'id': 4,
+                        'body': cr.MARKER.format(head=HEAD, verdict='clean', effort='', tests='')})
+        self.assertEqual(github.existing_marker(REPO, 7, HEAD, 't'), ('clean', 4))
+
+
+class EnqueueTests(Harness):
+    def finished_job(self, head=HEAD):
+        self.store.enqueue(REPO, 7, head, 'main', 99)
+        job = self.store.claim_next()
+        self.store.finish(job.id, 'clean', 5)
+        return job
+
+    def test_force_enqueue_requeues_a_finished_head(self):
+        job = self.finished_job()
+        self.assertFalse(self.store.enqueue(REPO, 7, HEAD, 'main', 99)[0])
+        self.assertTrue(self.store.force_enqueue(REPO, 7, HEAD, 'main', 99))
+        self.assertEqual(self.store.status(job.id), 'queued')
+        self.assertEqual([j.id for j in self.store.queued()], [job.id])
+
+    def test_force_enqueue_supersedes_other_live_heads_and_keeps_a_live_one(self):
+        self.store.enqueue(REPO, 7, NEW_HEAD, 'main', 99)
+        self.assertTrue(self.store.force_enqueue(REPO, 7, HEAD, 'main', 99))
+        self.assertEqual([j.head for j in self.store.queued()], [HEAD])
+        self.assertFalse(self.store.force_enqueue(REPO, 7, HEAD, 'main', 99))
+
+    def test_enqueue_command_uses_live_base_and_checks_admission(self):
+        github = mock.Mock()
+        github.repo_installation.return_value = 99
+        github.pull.return_value = dict(pull_payload(base='release')['pull_request'])
+        self.assertEqual(cr.enqueue_command(self.config, github, self.store, f'{REPO}#7@{HEAD}'), 0)
+        self.assertEqual([(j.head, j.base, j.installation) for j in self.store.queued()], [(HEAD, 'release', 99)])
+
+    def test_enqueue_command_refuses_a_pr_that_fails_admission(self):
+        github = mock.Mock()
+        github.repo_installation.return_value = 99
+        github.pull.return_value = dict(pull_payload(state='closed')['pull_request'])
+        self.assertEqual(cr.enqueue_command(self.config, github, self.store, f'{REPO}#7@{HEAD}'), 1)
+        self.assertEqual(self.store.queued(), [])
+
+    def test_reenqueued_head_is_reviewed_after_invalidation(self):
+        self.finished_job()
+        self.github.markers[(7, HEAD)] = None
+        self.store.force_enqueue(REPO, 7, HEAD, 'main', 99)
+        self.assertEqual(self.run_next()[1], 'clean')
+        self.assertEqual(len(self.codex.calls), 1)
+
+
+FAKE_CODEX = '''#!{python}
+import json, os, sys
+args = sys.argv[1:]
+last = args[args.index('-o') + 1]
+mode = {mode!r}
+if mode == 'exit':
+    sys.exit(4)
+events = [{{'type': 'thread.started'}}, {{'type': 'turn.started'}}]
+token = open('token.txt').read().strip() if mode != 'blind' else ''
+if mode == 'error':
+    events.append({{'type': 'item.completed', 'item': {{'type': 'error', 'message': 'host executable was not found'}}}})
+else:
+    events.append({{'type': 'item.completed', 'item': {{'type': 'command_execution', 'command': 'cat token.txt',
+                   'aggregated_output': token + '\\n', 'exit_code': 0, 'status': 'completed'}}}})
+reply = token if mode != 'mute' else 'done'
+events.append({{'type': 'item.completed', 'item': {{'type': 'agent_message', 'text': reply}}}})
+events.append({{'type': 'turn.completed'}})
+open(last, 'w').write(reply)
+print('2026-01-01T00:00:00Z ERROR rmcp: noise', file=sys.stderr)
+print('\\n'.join(json.dumps(e) for e in events))
+'''
+
+
+class SelfCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def codex(self, mode):
+        path = self.root / f'codex-{mode}'
+        path.write_text(FAKE_CODEX.format(python=sys.executable, mode=mode))
+        path.chmod(0o755)
+        return str(path)
+
+    def test_passes_when_codex_reads_the_token(self):
+        self.assertIsNone(cr.self_check(self.codex('ok'), self.root / 'work'))
+        self.assertEqual(list((self.root / 'work').iterdir()), [])
+
+    def test_fails_for_each_missing_piece(self):
+        for mode, phrase in (('exit', 'codex exited 4'), ('error', 'host executable was not found'),
+                             ('blind', 'no command codex ran printed the token'),
+                             ('mute', 'final message does not contain the token')):
+            with self.subTest(mode):
+                reason = cr.self_check(self.codex(mode), self.root / 'work')
+                self.assertIsNotNone(reason)
+                self.assertIn(phrase, reason)
+
+    def test_missing_codex_binary_fails(self):
+        self.assertIn('could not run codex', cr.self_check(str(self.root / 'absent'), self.root / 'work'))
+
+    def test_service_refuses_to_start_and_systemd_does_not_restart_it(self):
+        secret = self.root / 'secret'
+        secret.write_text('s')
+        secret.chmod(0o600)
+        env = self.root / 'env'
+        env.write_text(textwrap.dedent(f'''\
+            CODEX_REVIEW_APP_ID=42
+            CODEX_REVIEW_PRIVATE_KEY={self.root / 'key'}
+            CODEX_REVIEW_WEBHOOK_SECRET_FILE={secret}
+            CODEX_REVIEW_ACCOUNTS=example-owner
+            CODEX_REVIEW_AUTHORS=example-owner
+            CODEX_REVIEW_STATE_DIR={self.root}
+            CODEX_REVIEW_CODEX_BIN={self.codex('blind')}
+            '''))
+        (self.root / 'work').mkdir()
+        (self.root / 'mirrors').mkdir()
+        with mock.patch.object(cr, 'serve') as serve:
+            self.assertEqual(cr.main(['--config', str(env)]), cr.SELF_CHECK_FAILED)
+        serve.assert_not_called()
+        unit = (ROOT / 'deploy' / 'codex-review.service').read_text()
+        self.assertIn(f'RestartPreventExitStatus={cr.SELF_CHECK_FAILED}\n', unit)
+
+
+class InstallScriptTests(unittest.TestCase):
+    def package_ok(self, directory):
+        script = (ROOT / 'deploy' / 'install.sh').read_text()
+        assignments = '\n'.join(line for line in script.splitlines()
+                                if line.startswith(('CODEX_VERSION=', 'CODEX_REQUIRED=')))
+        function = script[script.index('package_ok() {'):script.index('\n}\n', script.index('package_ok() {')) + 3]
+        return subprocess.run(['bash', '-c', f'{assignments}\n{function}\npackage_ok "$1"', 'x', str(directory)],
+                              capture_output=True, text=True)
+
+    def test_package_check_requires_every_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'codex-package.json').write_text('{"version": "0.160.1"}')
+            files = ['bin/codex', 'bin/codex-code-mode-host', 'codex-resources/bwrap', 'codex-resources/zsh/bin/zsh',
+                     'codex-path/rg']
+            for name in files:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text('')
+                (root / name).chmod(0o755)
+            self.assertEqual(self.package_ok(root).returncode, 0)
+            for name in files:
+                with self.subTest(name):
+                    (root / name).chmod(0o644)
+                    result = self.package_ok(root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(name, result.stderr)
+                    (root / name).chmod(0o755)
+            (root / 'codex-package.json').write_text('{"version": "0.159.0"}')
+            self.assertNotEqual(self.package_ok(root).returncode, 0)
+
+
+if __name__ == '__main__':
+    unittest.main()

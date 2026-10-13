@@ -1,0 +1,10 @@
+The pagination helper skips the first item and returns oversized, overlapping pages. 本次为只读审查，未运行测试 (read-only review; no tests were run).
+VERDICT: FINDINGS
+
+Full review comments:
+
+- [P2] Start each page at its zero-based offset — /var/lib/codex-review/work/7/tree/paging.py:8-8
+  For any nonempty sequence, page 0 starts at index 1 rather than index 0, so the first item is never returned. Remove the extra `+ 1` from the start calculation to match the documented zero-based pagination.
+
+- [P2] Limit the slice to the requested page size — /var/lib/codex-review/work/7/tree/paging.py:9-9
+  When enough items remain, this slice returns `size + 1` items, violating the documented maximum and causing consecutive pages to overlap by one item. Since the slice end is exclusive, use `start + size` without the extra `+ 1`.
