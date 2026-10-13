@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for prefetching the governance issues that AGENTS.md links."""
+import json
 from pathlib import Path
 import stat
 import sys
@@ -9,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import codex_review as cr  # noqa: E402
 from test_codex_review import Harness, pull_payload  # noqa: E402
-from test_fail_closed import fixture, judge  # noqa: E402
+from test_fail_closed import CAPACITY, fixture, judge  # noqa: E402
 
 AGENTS = ('# Guidance\n\nBefore any work, read https://github.com/qianxueye/llm-trading/issues/1859 and\n'
           'https://github.com/Example-Org/Rules/issues/12;\n'
@@ -99,14 +100,39 @@ class GovernancePrefetchTests(Harness):
         self.assertNotEqual(first, second)
         self.assertEqual((first_text[:8], second_text[:9]), ('# first\n', '# second\n'))
 
-    def test_links_with_dot_repository_names_are_ignored(self):
-        self.assertEqual(cr.governance_links('github.com/a/../issues/1 github.com/a/.x/issues/2'), [])
+    def test_dot_and_dotdot_are_rejected_but_dot_prefixed_repositories_are_kept(self):
+        links = cr.governance_links('github.com/a/../issues/1 github.com/a/./issues/2 github.com/a/.github/issues/3')
+        self.assertEqual(links, [('a/.github', 3)])
+
+    def test_dot_github_issue_is_saved_under_its_own_directory(self):
+        self.git.agents = 'Read https://github.com/Example-Org/.github/issues/4 first.\n'
+        self.github.issues[('Example-Org/.github', 4)] = {'title': 'org rules', 'body': 'x'}
+        self.deliver(pull_payload())
+        self.assertEqual(self.run_next()[1], 'clean')
+        ((ref, path, text, error),) = self.codex.governance
+        self.assertEqual((ref, path.parts[-3:], text[:12], error),
+                         ('Example-Org/.github#4', ('Example-Org', '.github', '4.md'), '# org rules\n', None))
 
     def _worktree(self):
         worktree = self.root / 'tree'
         worktree.mkdir()
         (worktree / 'AGENTS.md').write_text(AGENTS, encoding='utf-8')
         return worktree
+
+
+class TransientGiveUpTests(Harness):
+    def test_window_spent_body_names_the_issue_that_was_not_prefetched(self):
+        self.config.retry_window = 0
+        self.git.agents = AGENTS
+        self.github.issues[('qianxueye/llm-trading', 1859)] = cr.GitHubError(403, 'Resource not accessible')
+        self.github.issues[('Example-Org/Rules', 12)] = {'title': 'Rules', 'body': ''}
+        self.codex.rc = 1
+        self.codex.events = json.dumps({'type': 'turn.failed', 'error': {'message': CAPACITY}}) + '\n'
+        self.deliver(pull_payload())
+        self.assertEqual(self.run_next()[1], 'failed')
+        body = self.github.posted[0]['body']
+        self.assertIn('transient upstream errors', body)
+        self.assertIn(f'Governance issue `{REF}` linked from AGENTS.md could not be prefetched', body)
 
 
 class FailureSignalTests(unittest.TestCase):

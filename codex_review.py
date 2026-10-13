@@ -70,7 +70,7 @@ TRANSIENT_RE = re.compile(
     r'|bad gateway|gateway time-?out|internal server error|stream disconnected|disconnected before completion'
     r'|connection (?:reset|closed|refused|error)|timed out|timeout|temporarily unavailable|network error'
     r'|error sending request', re.I)
-ISSUE_LINK_RE = re.compile(r'github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9][A-Za-z0-9._-]*)/issues/(\d+)')
+ISSUE_LINK_RE = re.compile(r'github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issues/(\d+)')
 GOVERNANCE_LIMIT = 20
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
@@ -1011,6 +1011,8 @@ def governance_links(text):
     """Return the distinct (owner/repo, number) issue links in text, in order, at most GOVERNANCE_LIMIT."""
     links = []
     for owner, repo, number in ISSUE_LINK_RE.findall(text):
+        if repo in ('.', '..'):
+            continue
         link = (f'{owner}/{repo}', int(number))
         if not any(same_name(link[0], seen[0]) and link[1] == seen[1] for seen in links):
             links.append(link)
@@ -1257,7 +1259,7 @@ class Reviewer:
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
                 f'review infrastructure error after {job.attempts + 1} attempts: {exc}')), [], token)
 
-    def defer_or_give_up(self, job, error, effort, kept):
+    def defer_or_give_up(self, job, error, effort, kept, governance=()):
         """Requeue with backoff after a transient upstream error; once the window is spent, return a failed body."""
         now = self.store.clock()
         count, since, _ = self.store.transient_state(job.id) or (0, now, '')
@@ -1268,7 +1270,7 @@ class Reviewer:
             return None
         log(f'{job}: transient codex failure #{count + 1}, {self.config.retry_window} s retry window spent: {error}')
         self.store.clear_transient(job.id)
-        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, reason=(
+        return review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance, reason=(
             f'codex failed with transient upstream errors {count + 1} time(s) over {int(now - since)} s and the '
             f'{self.config.retry_window} s retry window is spent'), reasons=[f'last error: {error}'])
 
@@ -1345,7 +1347,7 @@ class Reviewer:
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
         upstream = None if timed_out else transient_error(rc, events)
         if upstream is not None:
-            body = self.defer_or_give_up(job, upstream, effort, kept)
+            body = self.defer_or_give_up(job, upstream, effort, kept, governance)
             if body is None:
                 return None
             self.keep_output(job, output, stderr, last)

@@ -170,10 +170,10 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 
 被审仓库根目录的 `AGENTS.md` 可能要求先读某些 GitHub issue，而 codex 的只读沙箱不能访问网络。因此服务在启动 codex 之前代为读取：
 
-- 从工作树的 `AGENTS.md` 中找出所有 `github.com/<owner>/<repo>/issues/<n>` 链接，去重后最多取 20 个；没有 `AGENTS.md` 或其中没有链接时跳过这一步。
+- 从工作树的 `AGENTS.md` 中找出所有 `github.com/<owner>/<repo>/issues/<n>` 链接（仓库名可以以点开头，例如 `.github`；`.` 和 `..` 不算），去重后最多取 20 个；没有 `AGENTS.md` 或其中没有链接时跳过这一步。
 - 用本仓库的 installation token 调 `GET /repos/<owner>/<repo>/issues/<n>`，再用 `GET /repos/<owner>/<repo>/issues/<n>/comments` 取全部评论，把标题、正文和评论写到 `work/<任务 id>/governance/<owner>/<repo>/<n>.md`（权限 0444）。目录按 owner 和 repo 分层，不同仓库的同号 issue 不会写到同一个文件。该目录在工作树之外，随任务目录一起删除。请求地址只由链接中匹配到的 owner、repo 和编号拼成，令牌只发往 `api.github.com`。
 - 提示中列出每个 issue 对应的文件路径，并要求 codex 读取这些文件，不要从网络获取。
-- 某个 issue 读取失败（403、404、网络错误等）时，审查照常进行：提示中把它列为不可用，发布的 review 正文写明 `Governance issue <owner>/<repo>#<n> linked from AGENTS.md could not be prefetched (<错误>)`，日志另记一行。结论仍按 §2.4.1 判定：codex 只说某个 issue 没读到不算审查失败，说读不到 diff 或代码才算。
+- 某个 issue 读取失败（403、404、网络错误等）时，审查照常进行：提示中把它列为不可用，发布的 review 正文（包括超时、判定失败和临时故障重试用尽后的 failed 正文）写明 `Governance issue <owner>/<repo>#<n> linked from AGENTS.md could not be prefetched (<错误>)`，日志另记一行。结论仍按 §2.4.1 判定：codex 只说某个 issue 没读到不算审查失败，说读不到 diff 或代码才算。
 - App 没有 `issues: read` 权限时，每次读取都会得到 403。补授权限的步骤见 §4.1。
 
 ### 2.7 为什么用常驻服务
