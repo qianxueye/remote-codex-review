@@ -55,9 +55,13 @@ App 要安装到多个账户，所以 manifest 里 `public: true`。这意味着
 
 ### 2.3 新 head 取代旧 head
 
-同一个 PR 收到新 head 时，该 PR 尚在排队的旧任务标为 `superseded`，正在审查的旧任务会被终止（向 codex 进程组发 SIGTERM，5 秒后发 SIGKILL）。旧 head 的结果一律不发。原因：推送很频繁，旧 head 的审查结果已经没有用。
+同一个 PR 收到新 head 时，该 PR 尚在排队的旧任务标为 `superseded`，正在审查的旧任务会被终止（向 codex 进程组发 SIGTERM，5 秒后发 SIGKILL）。取消请求在 codex 进程登记之前到达时也不会丢失：worker 在启动 codex 的同一把锁内先检查任务状态，任务已不是 `running` 就不启动。旧 head 的结果一律不发。原因：推送很频繁，旧 head 的审查结果已经没有用。
 
 worker 在审查开始前和结束后各向 GitHub 查一次 PR。PR 已关闭或 head 已变时丢弃本次结果，不发 review。如果当前 head 能通过准入过滤，就把它补进队列，以免漏投时最新 head 没人审。
+
+两次查询还会用当前配置对实时 PR 重新执行 §2.2 的准入过滤（排除仓库、草稿开关、作者白名单等）。不再满足条件的任务以 `skipped` 结束，不启动 codex，也不发 review。基础设施错误重试用尽、准备发 `failed` 之前，同样先做这项检查。
+
+fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分支，而不是入队时记下的 base。审查结束时 base 又变了的，任务重新排队，不计入失败次数，下次按新 base 审查。
 
 ### 2.4 发布与幂等
 
@@ -306,7 +310,7 @@ sudo -u codex-review sqlite3 /var/lib/codex-review/state.sqlite \
 ```
 
 - `--dry-run` 列出排队中和运行中的任务，以及补投扫描将要请求重新投递的投递，不改动任何状态。它需要私钥和 webhook secret 都已就位。
-- 任务状态：`queued`、`running`、`clean`、`findings`、`failed`、`superseded`、`rejected`（安装所属账户不在白名单，见 §2.2.1）。
+- 任务状态：`queued`、`running`、`clean`、`findings`、`failed`、`superseded`、`rejected`（安装所属账户不在白名单，见 §2.2.1）、`skipped`（入队后不再满足准入条件，见 §2.3）。
 - 重新审查某个 head（例如 `failed` 之后）：
 
   ```
