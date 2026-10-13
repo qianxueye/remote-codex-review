@@ -126,6 +126,8 @@ GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
 FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+)\s+(?:—|–|--|-)\s+`?([^`]+?)`?:(\d+)(?:-(\d+))?`?\s*$')
 # A line that opens like a finding; one FINDING_RE cannot read keeps the review from being clean.
 HEADER_RE = re.compile(r'^\s*(?:[-*]\s*|\d+[.)]\s*)?(?:\*\*)?\[P[0-3]\]')
+REGISTER_LINE_RE = re.compile(r'^\s*(?:#+\s*)?\**\s*' + re.escape(REGISTER_HEADING) + r'\s*\**\s*[:：]?\s*$')
+COMMENT_HEADERS = ('Full review comments:', 'Review comments:', 'Review comment:')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
 SELF_CHECK_FAILED = 3
@@ -550,25 +552,6 @@ def confidence(text):
     return None if number > 100 else number
 
 
-def split_register(message):
-    """Remove the out-of-delta register section; return (remaining message, register items)."""
-    kept, items, inside = [], [], False
-    for line in message.splitlines():
-        if REGISTER_HEADING in line:
-            inside = True
-        elif inside and (VERDICT_RE.match(line) or line.strip() in ('Full review comments:', 'Review comments:')):
-            inside = False
-            kept.append(line)
-        elif inside:
-            if re.match(r'^\s*[-*]\s', line) or HEADER_RE.match(line) or (not items and PRIORITY_RE.search(line)):
-                items.append(line.strip())
-            elif line.strip() and items:
-                items[-1] += ' ' + line.strip()
-        else:
-            kept.append(line)
-    return '\n'.join(kept), list(dict.fromkeys(items))
-
-
 def merge_findings(passes):
     """Fold findings of several (label, findings) passes; one at an overlapping location of the same file joins it."""
     merged = []
@@ -665,31 +648,23 @@ def failure_reasons(rc, events, message):
     return reasons
 
 
-def assess(rc, events, message, worktree_roots=(), uncounted=0):
-    """Return (verdict, summary, posted findings, unposted findings, reasons).
+def assess(rc, events, message, worktree_roots=(), delta=False):
+    """Return (verdict, Review, reasons) for one pass; docs/runbook.zh.md §2.4.1 lists the rules.
 
-    Clean needs every check to pass and `VERDICT: CLEAN`, or `VERDICT: FINDINGS` when every finding went uncounted;
-    any finding-like line that does not parse makes it findings.
+    Findings: a posted or unparsed finding, a promoted register item, or a tag/FINDINGS line with nothing parsed.
     """
-    verdict, summary, findings = parse_review(message, worktree_roots)
-    posted = [finding for finding in findings if finding.published()]
-    unposted = [finding for finding in findings if not finding.published()]
+    review = read_review(message, worktree_roots, delta)
     declared = VERDICT_RE.findall(message)
-    summary = VERDICT_RE.sub('', summary).strip()
-    unparsed = bool(unmatched_headers(message)) or (
-        not findings and (verdict == 'findings' or ('FINDINGS' in declared and not uncounted)))
-    if rc == 0 and message and (posted or unparsed):
-        return 'findings', summary, posted, unposted, []
+    untagged = not review.findings and not review.items
+    counted = (review.posted or review.unparsed or review.promoted
+               or (untagged and (PRIORITY_RE.search(review.text) or 'FINDINGS' in declared)))
+    if rc == 0 and message and counted:
+        return 'findings', review, []
     reasons = failure_reasons(rc, events, message)
-    if declared not in ((['CLEAN'], ['FINDINGS']) if unposted or uncounted else (['CLEAN'],)):
+    if declared not in ((['CLEAN'], ['FINDINGS']) if not untagged else (['CLEAN'],)):
         reasons.append('the final message carries no single `VERDICT: CLEAN` line'
                        + (f' (found {", ".join(declared)})' if declared else ''))
-    return ('failed' if reasons else 'clean'), summary, [], unposted, reasons
-
-
-def unmatched_headers(message):
-    """Return the finding-like lines of a message that FINDING_RE cannot parse."""
-    return [line for line in message.splitlines() if HEADER_RE.match(line) and not FINDING_RE.match(line)]
+    return ('failed' if reasons else 'clean'), review, reasons
 
 
 def strip_prefix(path, worktree_roots):
@@ -700,30 +675,78 @@ def strip_prefix(path, worktree_roots):
     return path[2:] if path.startswith('./') else path
 
 
-def parse_review(message, worktree_roots=()):
-    """Split a final codex message into (verdict, summary, findings)."""
-    findings, summary, current, seen = [], [], None, set()
+class Review:
+    """One pass's final message split into summary lines, findings, unparsed finding blocks and register items."""
+
+    def __init__(self):
+        self.summary, self.findings, self.unparsed, self.items = [], [], [], []
+
+    @property
+    def text(self):
+        return VERDICT_RE.sub('', '\n'.join(self.summary)).strip()
+
+    @property
+    def posted(self):
+        return [finding for finding in self.findings if finding.published()]
+
+    @property
+    def low(self):
+        return [finding for finding in self.findings if not finding.published()]
+
+    def _scored(self, keep):
+        return [item for item in self.items if keep((confidence(item) or 0) >= CONFIDENCE_FLOOR, item)]
+
+    @property
+    def low_items(self):
+        return self._scored(lambda sure, _: not sure)
+
+    @property
+    def promoted(self):
+        """Confident register items that still block: P0/P1, the BLOCKING_RE classes, or no priority tag."""
+        return self._scored(lambda sure, item: sure and (BLOCKING_RE.search(item) or not PRIORITY_RE.search(item)))
+
+    @property
+    def registered(self):
+        return [item for item in self._scored(lambda sure, _: sure) if item not in self.promoted]
+
+
+def read_review(message, worktree_roots=(), delta=False):
+    """Split a final codex message; a finding-like line FINDING_RE cannot read becomes an unparsed block."""
+    review, current, seen, register = Review(), None, set(), False
     for line in message.splitlines():
+        stripped = line.strip()
+        if delta and REGISTER_LINE_RE.match(line):
+            register, current = True, None
+            continue
+        if register and not (VERDICT_RE.match(line) or stripped in COMMENT_HEADERS):
+            starts = re.match(r'^\s*[-*]\s', line) or HEADER_RE.match(line)
+            if starts or (not review.items and PRIORITY_RE.search(line)):
+                review.items.append(stripped)
+            elif stripped and review.items:
+                review.items[-1] += ' ' + stripped
+            continue
+        register = False
         match = FINDING_RE.match(line)
-        if HEADER_RE.match(line) and not match:
-            current = None
-            summary.append(line)
-        elif match:
+        if match:
             priority, title, path, start, end = match.groups()
-            current = Finding(priority, title, strip_prefix(path, worktree_roots), int(start), int(end or start))
-            key = (current.priority, current.title, current.location())
-            if key in seen:
-                current = Finding(priority, title, path, 0, 0)
-            else:
+            finding = Finding(priority, title, strip_prefix(path, worktree_roots), int(start), int(end or start))
+            key = (finding.priority, finding.title, finding.location())
+            current = finding.lines
+            if key not in seen:
                 seen.add(key)
-                findings.append(current)
+                review.findings.append(finding)
+        elif HEADER_RE.match(line):
+            current = [line]
+            if line not in [block[0] for block in review.unparsed]:
+                review.unparsed.append(current)
         elif current is not None:
-            if line.strip():
-                current.lines.append(line)
-        elif line.strip() not in ('Full review comments:', 'Review comments:', 'Review comment:'):
-            summary.append(line)
-    verdict = 'findings' if findings or PRIORITY_RE.search(message) else 'clean'
-    return verdict, '\n'.join(summary).strip(), findings
+            if stripped:
+                current.append(line)
+        elif stripped not in COMMENT_HEADERS:
+            review.summary.append(line)
+    review.items = list(dict.fromkeys(review.items))
+    review.unparsed = ['\n'.join(block) for block in review.unparsed]
+    return review
 
 
 def diff_lines(files):
@@ -758,7 +781,7 @@ def inline_comments(findings, diff):
     return comments
 
 
-def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, reasons=(),
+def review_body(head, verdict, summary, findings, unparsed=(), reason='', effort=None, kept=None, reasons=(),
                 governance=(), mode=None, scope='', promoted=(), register=(), unposted=0):
     """Render the review body; it always carries the marker and every posted finding in full.
 
@@ -773,7 +796,7 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
     elif verdict == 'clean':
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
     else:
-        count = len(findings) + len(promoted)
+        count = len(findings) + len(promoted) + len(unparsed)
         parts.append(f'**Remote codex review: {count or "unparsed"} finding(s)** for `{head}`.')
     if effort and effort != 'none':
         parts.append('Read-only review: codex was told not to run tests or start services.')
@@ -789,8 +812,8 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
             block += ['', f'  同一位置另一遍（{label}）的报告：{other.heading()}',
                       *('    ' + line for line in other.text.splitlines())]
         parts.append('\n'.join(block))
-    if verdict == 'findings' and raw:
-        parts.append(raw)
+    if unparsed:
+        parts.append('## 未能解析的发现（按发现处理）\n\n' + '\n\n'.join(unparsed))
     if promoted:
         parts.append(f'## {PROMOTED_HEADING}\n\n' + '\n'.join(promoted))
     if register:
@@ -1631,15 +1654,16 @@ class Reviewer:
             for doc in governance:
                 if doc.error:
                     log(f'{job}: governance issue {doc.ref} not prefetched: {doc.error}')
+            running = lambda: not self.stop.is_set() and self.store.status(job.id) == 'running'  # noqa: E731
             for index, (label, sections) in enumerate(plan.passes, 1):
-                if self.store.status(job.id) != 'running':
+                if not running():
                     break
                 directory = scratch / f'pass{index}'
                 directory.mkdir(parents=True, exist_ok=True)
                 log(f'{job}: codex {plan.mode} pass {label} started against origin/{base} effort={plan.effort}')
                 started = time.time()
-                result = self.codex(job.id, worktree, sections, plan.effort, plan.timeout, directory,
-                                    lambda: self.store.status(job.id) == 'running', governance)
+                result = self.codex(job.id, worktree, sections, plan.effort, plan.timeout, directory, running,
+                                    governance)
                 log(f'{job}: codex pass {label} finished rc={result[0]} timed_out={result[4]} '
                     f'after {int(time.time() - started)} s')
                 runs.append((label, *result))
@@ -1652,12 +1676,12 @@ class Reviewer:
         if self.store.status(job.id) == 'superseded':
             log(f'{job}: superseded by a newer head; result discarded')
             return 'superseded'
-        if not runs or any(run[1] is None for run in runs):
-            log(f'{job}: codex not started; job is {self.store.status(job.id)}')
-            return self.store.status(job.id)
         if self.stop.is_set():
             self.store.retry(job.id, 0, count_attempt=False)
             return None
+        if not runs or any(run[1] is None for run in runs):
+            log(f'{job}: codex not started; job is {self.store.status(job.id)}')
+            return self.store.status(job.id)
         token, outcome = self.recheck(job, base)
         if token is None:
             return outcome
@@ -1689,41 +1713,28 @@ class Reviewer:
     def conclude(self, job, plan, runs, worktree, common):
         """Assess every pass and merge them; returns (verdict, body, posted findings, unposted count)."""
         roots = (str(worktree), os.path.realpath(worktree))
-        merged, reasons, summaries, raws, unposted = [], [], [], [], []
-        promoted, register, verdicts = [], [], []
+        verdicts, reasons, summaries, posted, unposted, unparsed, promoted, registered = ([] for _ in range(8))
         for label, rc, output, _, last, _ in runs:
             events = read_events(output)
-            message = final_message(events, last)
-            items = []
-            if plan.mode == 'delta':
-                message, items = split_register(message)
-            verdict, summary, posted, low, why = assess(rc, events, message, roots, uncounted=len(items))
+            verdict, review, why = assess(rc, events, final_message(events, last), roots, plan.mode == 'delta')
             verdicts.append(verdict)
             reasons += [f'{label}: {reason}' for reason in why]
-            merged.append((label, posted))
-            unposted += [f'{label}: {f.heading()}' for f in low]
-            summaries.append(f'**{label}**\n\n{summary}' if len(runs) > 1 and summary else summary)
-            if verdict == 'findings' and not posted:
-                raws.append(message)
-            for item in items:
-                score = confidence(item)
-                if score is None or score < CONFIDENCE_FLOOR:
-                    unposted.append(f'{label}: {item}')
-                elif BLOCKING_RE.search(item) or not PRIORITY_RE.search(item):
-                    promoted.append(item)
-                else:
-                    register.append(item)
+            posted.append((label, review.posted))
+            unposted += [f'{label}: {f.heading()}' for f in review.low] + [f'{label}: {i}' for i in review.low_items]
+            summaries.append(f'**{label}**\n\n{review.text}' if len(runs) > 1 and review.text else review.text)
+            unparsed += review.unparsed
+            promoted += review.promoted
+            registered += review.registered
         for line in unposted:
             log(f'{job}: not posted, confidence missing or below {CONFIDENCE_FLOOR}: {line[:300]}')
         if 'failed' in verdicts:
             log(f'{job}: codex output rejected: {"; ".join(reasons)}')
             return 'failed', review_body(job.head, 'failed', '', [], reasons=reasons,
                                          reason='codex output did not pass the review checks', **common), [], 0
-        findings = merge_findings(merged)
-        verdict = 'findings' if findings or promoted or 'findings' in verdicts else 'clean'
-        body = review_body(job.head, verdict, '\n\n'.join(s for s in summaries if s), findings,
-                           raw='\n\n'.join(raws), promoted=promoted, register=register, unposted=len(unposted),
-                           **common)
+        findings = merge_findings(posted)
+        verdict = 'findings' if 'findings' in verdicts else 'clean'
+        body = review_body(job.head, verdict, '\n\n'.join(s for s in summaries if s), findings, unparsed=unparsed,
+                           promoted=promoted, register=registered, unposted=len(unposted), **common)
         return verdict, body, findings, len(unposted)
 
 

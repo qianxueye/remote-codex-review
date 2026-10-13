@@ -31,7 +31,8 @@ def fixture(name):
 def judge_all(stdout, last, rc=0):
     """Return assess()'s (verdict, summary, posted, unposted, reasons)."""
     events = cr.read_events(stdout)
-    return cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
+    verdict, review, reasons = cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
+    return verdict, review.text, review.posted if verdict == 'findings' else [], review.low, reasons
 
 
 def judge(stdout, last, rc=0):
@@ -105,7 +106,7 @@ class RealOutputTests(unittest.TestCase):
 
     def test_incident_message_with_no_priority_tag_is_failed_not_clean(self):
         stdout, _ = fixture('clean-ro')
-        self.assertEqual(cr.parse_review(INCIDENT_MESSAGE)[0], 'clean')
+        self.assertEqual((cr.read_review(INCIDENT_MESSAGE).findings, cr.read_review(INCIDENT_MESSAGE).unparsed), ([], []))
         verdict, _, _, reasons = judge(stdout, INCIDENT_MESSAGE)
         self.assertEqual(verdict, 'failed')
         self.assertTrue(any('reports a failure' in reason for reason in reasons))

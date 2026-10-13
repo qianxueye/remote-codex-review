@@ -174,6 +174,8 @@ class FakeCodex:
         self.governance = None
 
     def __call__(self, job_id, worktree, sections, effort, timeout, scratch, proceed, governance=()):
+        if getattr(self, 'before_proceed', None):
+            self.before_proceed()
         if not proceed():
             return None, '', '', '', False
         self.calls.append((job_id, worktree, cr.review_prompt(sections, governance), effort))
@@ -222,26 +224,28 @@ class Harness(unittest.TestCase):
 
 class ParseTests(unittest.TestCase):
     def test_no_findings_is_clean(self):
-        verdict, summary, findings = cr.parse_review(CLEAN)
-        self.assertEqual((verdict, summary, findings), ('clean', CLEAN, []))
+        review = cr.read_review(CLEAN)
+        self.assertEqual((review.text, review.findings, review.unparsed), (CLEAN.replace('\nVERDICT: CLEAN', ''), [], []))
 
     def test_multiple_findings_with_range_and_prefix_stripped(self):
-        verdict, summary, findings = cr.parse_review(FINDINGS, (WORKTREE,))
-        self.assertEqual(verdict, 'findings')
-        self.assertEqual(summary, 'Two defects remain.')
+        review = cr.read_review(FINDINGS, (WORKTREE,))
+        findings = review.findings
+        self.assertEqual(review.text, 'Two defects remain.')
         self.assertEqual([(f.priority, f.path, f.start, f.end) for f in findings],
                          [('P1', 'src/service.py', 5388, 5389), ('P3', 'src/worker.py', 45, 45)])
         self.assertEqual(findings[0].text, 'The resume command opens the gate.\nA later tick treats it as known.')
         self.assertIn('[AGENTS.md:56](AGENTS.md#L56)', findings[1].text)
 
     def test_repeated_final_block_is_deduplicated(self):
-        _, _, findings = cr.parse_review(FINDINGS + '\n' + FINDINGS, (WORKTREE,))
-        self.assertEqual(len(findings), 2)
+        review = cr.read_review(FINDINGS + '\n' + FINDINGS, (WORKTREE,))
+        self.assertEqual(len(review.findings), 2)
+        self.assertEqual(review.findings[0].text, 'The resume command opens the gate.\nA later tick treats it as known.')
 
     def test_priority_tag_without_location_still_counts_as_findings(self):
-        verdict, _, findings = cr.parse_review('One issue: [P2] the retry loop never ends.')
-        self.assertEqual((verdict, findings), ('findings', []))
-        body = cr.review_body(HEAD, verdict, '', findings, raw='One issue: [P2] the retry loop never ends.')
+        message = 'One issue: [P2] the retry loop never ends.'
+        verdict, review, _ = cr.assess(0, cr.read_events(events_jsonl(message)), message)
+        self.assertEqual((verdict, review.findings), ('findings', []))
+        body = cr.review_body(HEAD, verdict, review.text, review.findings)
         self.assertIn('[P2] the retry loop never ends.', body)
 
     def test_final_message_prefers_output_file_then_last_agent_message(self):
@@ -251,7 +255,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(cr.final_message(cr.read_events('codex\nnot json'), ''), '')
 
     def test_inline_comments_only_for_lines_in_the_diff(self):
-        _, _, findings = cr.parse_review(FINDINGS, (WORKTREE,))
+        findings = cr.read_review(FINDINGS, (WORKTREE,)).findings
         files = [{'filename': 'src/service.py', 'patch': '@@ -5380,4 +5385,6 @@\n ctx\n ctx\n+a\n+b\n+c\n ctx'}]
         comments = cr.inline_comments(findings, cr.diff_lines(files))
         self.assertEqual(comments, [{'path': 'src/service.py', 'line': 5389, 'side': 'RIGHT',
@@ -707,7 +711,7 @@ class GitHubClientTests(unittest.TestCase):
                 raise cr.GitHubError(422, 'Line could not be resolved')
             return 200, {'id': 11}, ''
         github = cr.GitHub(config(), transport=transport, jwt_factory=lambda: 'jwt')
-        body = cr.review_body(HEAD, 'findings', '', cr.parse_review(FINDINGS, (WORKTREE,))[2])
+        body = cr.review_body(HEAD, 'findings', '', cr.read_review(FINDINGS, (WORKTREE,)).findings)
         result = github.post_review(REPO, 7, HEAD, body, [{'path': 'x', 'line': 1, 'body': 'b'}], 't')
         self.assertEqual(result, (11, 0))
         self.assertEqual(len(calls), 2)

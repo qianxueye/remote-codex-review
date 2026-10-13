@@ -116,6 +116,22 @@ class DeltaTests(Rounds):
                 self.assertIn(item, body)
                 self.assertNotIn('## 登记项', body)
 
+    def test_register_heading_inside_a_finding_body_is_not_a_section(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        mention = finding('P2', 'Prompt text drifted', 'src/prompt.py', 4, 80,
+                          body=f'The prompt still names {cr.REGISTER_HEADING} twice.')
+        status, body = self.second_head(message(mention))
+        self.assertEqual(status, 'findings')
+        self.assertIn('**[P2] Prompt text drifted** — `src/prompt.py:4` · 置信度 80', body)
+
+    def test_decorated_standalone_register_heading_is_a_section(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        item = '- [P2] Stale comment — src/old.py:4: names a removed flag. Confidence: 80'
+        msg = message(verdict='FINDINGS', register=[item]).replace(cr.REGISTER_HEADING, f'**{cr.REGISTER_HEADING}**')
+        status, body = self.second_head(msg)
+        self.assertEqual(status, 'clean')
+        self.assertIn('## 登记项', body)
+
     def test_force_push_falls_back_to_a_full_first_round(self):
         self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
         self.git.delta = (None, f'last reviewed head {HEAD[:12]} is not an ancestor of {NEW_HEAD[:12]}')
@@ -273,9 +289,9 @@ class ConfidenceTests(Rounds):
                 self.store.db.execute('DELETE FROM deliveries')
                 status, post = self.review_once(message(normal, broken))
                 self.assertEqual(status, 'findings')
-                self.assertIn('Cache never expires (see the loader)', post['body'])
-                if '**[P3] Typo**' in post['body']:
-                    self.assertLess(post['body'].index('Cache never expires'), post['body'].index('**[P3] Typo**'))
+                self.assertIn('## 未能解析的发现（按发现处理）\n\n- [P2] Cache never expires (see the loader)\n'
+                              '  Confidence: 80', post['body'])
+                self.assertEqual(post['body'].count('Cache never expires'), 1)
 
     def test_register_line_without_a_priority_tag_counts_when_confident(self):
         harness = DeltaTests('test_out_of_delta_findings_are_registered_and_do_not_count')
@@ -288,6 +304,16 @@ class ConfidenceTests(Rounds):
             harness.tearDown()
         self.assertEqual(status, 'findings')
         self.assertIn('## 增量外但阻塞的问题', body)
+
+    def test_unparsed_fallback_does_not_repost_low_findings(self):
+        broken = '- [P1] Order is sent twice — src/order handler.py\n  No line number.\n  Confidence: 90\n'
+        status, post = self.review_once(message(broken, finding('P3', 'Weak guess', 'src/a.py', 3, 20),
+                                                finding('P3', 'Other guess', 'src/b.py', 4)))
+        self.assertEqual(status, 'findings')
+        self.assertIn('Order is sent twice — src/order handler.py', post['body'])
+        self.assertNotIn('Weak guess', post['body'])
+        self.assertNotIn('Other guess', post['body'])
+        self.assertTrue(post['body'].endswith('另有 2 条置信度低于 50 的发现未提交。'))
 
     def test_floor_is_compared_before_rounding(self):
         for line, posted in (('Confidence: 49.6', False), ('confidence_score: 0.496', False),
@@ -425,3 +451,27 @@ class DeltaTreeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ShutdownTests(Rounds):
+    def test_shutdown_after_the_first_pass_requeues_without_a_second_pass(self):
+        invoked = []
+        self.codex.before_proceed = lambda: invoked.append(1)
+        self.codex.during = self.reviewer.stop.set
+        self.deliver(pull_payload())
+        job, status = self.run_next()
+        self.assertEqual((status, len(invoked), len(self.codex.calls), self.github.posted), (None, 1, 1, []))
+        self.assertEqual(self.store.status(job.id), 'queued')
+
+    def test_proceed_refuses_a_pass_once_shutdown_began(self):
+        starts = []
+
+        def stop_on_second():
+            starts.append(1)
+            if len(starts) == 2:
+                self.reviewer.stop.set()
+        self.codex.before_proceed = stop_on_second
+        self.deliver(pull_payload())
+        job, status = self.run_next()
+        self.assertEqual((status, len(starts), len(self.codex.calls)), (None, 2, 1))
+        self.assertEqual(self.store.status(job.id), 'queued')
