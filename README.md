@@ -43,7 +43,7 @@ Self-hosted Codex PR reviewer triggered by GitHub App webhooks.
 | `deploy/install.sh` | idempotent installer |
 | `deploy/*.service` | systemd units for the service and the tunnel |
 | `deploy/codex-review.env.example` | every configuration key with its default; no secrets |
-| `deploy/effort-rules.json` | default reasoning-effort and test-tier tables, overridable per repository |
+| `deploy/effort-rules.json` | default reasoning-effort tables, overridable per repository |
 | `deploy/codex-config.toml` | codex model/provider configuration template |
 | `deploy/app-manifest.json` | GitHub App manifest (placeholders for owner and hostname) |
 | `deploy/cloudflared-ingress.json` | tunnel ingress rule for the Cloudflare API |
