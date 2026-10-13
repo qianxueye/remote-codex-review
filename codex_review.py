@@ -41,6 +41,7 @@ READ_ONLY_PROMPT = (
     'or any other service. Read the code; use grep and git to view context. State in your conclusion: '
     '本次为只读审查，未运行测试 (read-only review; no tests were run).')
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
+GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
 FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
@@ -72,7 +73,12 @@ def log(message):
 
 
 def utc_epoch(text):
-    return calendar.timegm(time.strptime(text, '%Y-%m-%dT%H:%M:%SZ'))
+    """Parse a GitHub UTC timestamp; delivery times carry fractional seconds, token expiries do not."""
+    match = GITHUB_TIME_RE.fullmatch(text)
+    if not match:
+        raise ValueError(f'unrecognised GitHub timestamp {text!r}')
+    whole = calendar.timegm(time.strptime(match.group(1), '%Y-%m-%dT%H:%M:%S'))
+    return whole + float(match.group(2)) if match.group(2) else whole
 
 
 # ---- configuration ---------------------------------------------------------

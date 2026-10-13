@@ -802,6 +802,30 @@ class RedeliveryTests(unittest.TestCase):
             self.assertEqual(cr.redeliver_failed(github, store, 86400, clock=lambda: now), [])
             store.db.close()
 
+    def test_github_timestamps_with_and_without_milliseconds_are_utc(self):
+        self.assertEqual(cr.utc_epoch('2026-10-13T05:11:43Z'), 1791868303)
+        self.assertAlmostEqual(cr.utc_epoch('2026-10-13T05:11:43.903Z'), 1791868303.903, places=6)
+        with self.assertRaises(ValueError):
+            cr.utc_epoch('2026-10-13T05:11:43+08:00')
+
+    def test_millisecond_delivered_at_does_not_abort_the_scan(self):
+        deliveries = [{'id': 21, 'guid': 'ms', 'event': 'pull_request', 'status_code': 502,
+                       'delivered_at': '2026-10-13T05:11:43.903Z', 'installation_id': 99}]
+        posted = []
+
+        def transport(method, url, token, body):
+            if method == 'POST':
+                posted.append(url)
+                return 202, {}, ''
+            if url.endswith('/app/installations/99'):
+                return 200, {'id': 99, 'account': {'login': 'Example-Org'}}, ''
+            return 200, deliveries, ''
+        with tempfile.TemporaryDirectory() as tmp:
+            store = cr.Store(Path(tmp) / 'state.sqlite')
+            github = cr.GitHub(config(), transport=transport, jwt_factory=lambda: 'jwt')
+            self.assertEqual(cr.redeliver_failed(github, store, 86400, clock=lambda: 1791868303 + 60), [21])
+            store.db.close()
+
     def test_redelivered_fork_event_is_still_filtered(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = cr.Store(Path(tmp) / 'state.sqlite')
