@@ -27,11 +27,11 @@ FINDINGS = f"""Two defects remain.
 
 Full review comments:
 
-- [P1] Close the gate after the control pass — {WORKTREE}/src/app/daemon.py:5388-5389
+- [P1] Close the gate after the control pass — {WORKTREE}/src/service.py:5388-5389
   The resume command opens the gate.
   A later tick treats it as known.
 
-- [P3] Keep the cancel obligation — {WORKTREE}/src/app/stop_entry_cancel.py:45
+- [P3] Keep the cancel obligation — {WORKTREE}/src/worker.py:45
   Closing the incident drops the order. See [AGENTS.md:56](AGENTS.md#L56).
 """
 
@@ -174,7 +174,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(verdict, 'findings')
         self.assertEqual(summary, 'Two defects remain.')
         self.assertEqual([(f.priority, f.path, f.start, f.end) for f in findings],
-                         [('P1', 'src/app/daemon.py', 5388, 5389), ('P3', 'src/app/stop_entry_cancel.py', 45, 45)])
+                         [('P1', 'src/service.py', 5388, 5389), ('P3', 'src/worker.py', 45, 45)])
         self.assertEqual(findings[0].text, 'The resume command opens the gate.\nA later tick treats it as known.')
         self.assertIn('[AGENTS.md:56](AGENTS.md#L56)', findings[1].text)
 
@@ -195,9 +195,9 @@ class ParseTests(unittest.TestCase):
 
     def test_inline_comments_only_for_lines_in_the_diff(self):
         _, _, findings = cr.parse_review(FINDINGS, (WORKTREE,))
-        files = [{'filename': 'src/app/daemon.py', 'patch': '@@ -5380,4 +5385,6 @@\n ctx\n ctx\n+a\n+b\n+c\n ctx'}]
+        files = [{'filename': 'src/service.py', 'patch': '@@ -5380,4 +5385,6 @@\n ctx\n ctx\n+a\n+b\n+c\n ctx'}]
         comments = cr.inline_comments(findings, cr.diff_lines(files))
-        self.assertEqual(comments, [{'path': 'src/app/daemon.py', 'line': 5389, 'side': 'RIGHT',
+        self.assertEqual(comments, [{'path': 'src/service.py', 'line': 5389, 'side': 'RIGHT',
                                      'start_line': 5388, 'start_side': 'RIGHT',
                                      'body': comments[0]['body']}])
 
@@ -370,13 +370,13 @@ class ReviewTests(Harness):
 
     def test_findings_posted_inline_and_in_body(self):
         self.codex.message = FINDINGS
-        self.github.files = [{'filename': 'src/app/stop_entry_cancel.py', 'patch': '@@ -40,3 +44,3 @@\n a\n+b\n c'}]
+        self.github.files = [{'filename': 'src/worker.py', 'patch': '@@ -40,3 +44,3 @@\n a\n+b\n c'}]
         self.deliver(pull_payload())
         _, status = self.run_next()
         post = self.github.posted[0]
         self.assertEqual(status, 'findings')
-        self.assertEqual([(c['path'], c['line']) for c in post['comments']], [('src/app/stop_entry_cancel.py', 45)])
-        self.assertIn('`src/app/daemon.py:5388-5389`', post['body'])
+        self.assertEqual([(c['path'], c['line']) for c in post['comments']], [('src/worker.py', 45)])
+        self.assertIn('`src/service.py:5388-5389`', post['body'])
         self.assertIn('The resume command opens the gate.', post['body'])
         self.assertNotIn(str(self.git.work), post['body'])
 
@@ -450,7 +450,7 @@ class EffortTests(unittest.TestCase):
         self.assertEqual(self.effort(['docs/runbooks/README.md']), 'high')
 
     def test_wiki_plus_source_is_high(self):
-        self.assertEqual(self.effort(['docs/wiki/a.md', 'src/app/daemon.py']), 'high')
+        self.assertEqual(self.effort(['docs/wiki/a.md', 'src/service.py']), 'high')
 
     def test_readme_only_is_medium(self):
         self.assertEqual(self.effort(['README.md', 'deploy/README.md']), 'medium')
