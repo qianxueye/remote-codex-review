@@ -148,6 +148,8 @@ class FakeGit:
 
     def delta_tree(self, full_name, base, prev, head, scratch):
         self.delta_calls = getattr(self, 'delta_calls', []) + [(prev, head)]
+        if getattr(self, 'during_delta', None):
+            self.during_delta()
         return getattr(self, 'delta', ('c' * 40, f'delta from reviewed head {prev[:12]}'))
 
     def diff_files(self, full_name, tree, head):

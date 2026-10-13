@@ -186,12 +186,13 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 同一个 PR 的第一次审查做全面首轮，之后的 head 只审修复增量。
 
 - 上一个已审 head：`state.sqlite` 的 `jobs` 表中，同一仓库、同一 PR、不同于当前 head、状态为 `clean` 或 `findings` 且有 review id 的任务，按完成时间取最新的一条（最多看 5 条）。服务再用 `GET /repos/<owner>/<repo>/pulls/<n>/reviews/<review id>` 读回该条 review：标记的 head 必须一致，verdict 必须仍是 `clean` 或 `findings`；被 `--invalidate` 作废或已删除（404）的跳过，看下一条。`failed`、`superseded`、`skipped` 的任务不算已审。同一 head 作废后重新入队时，它自己不会被当成上一个已审 head。
-- 首轮（`mode=full`）：找不到上一个已审 head、它已不在 bare 镜像中、它不是新 head 的祖先（例如 force-push 或 rebase），或计算增量基准失败时，做首轮。首轮跑两遍独立审查，档位 `xhigh`，每遍的超时为 `CODEX_REVIEW_FIRST_TIMEOUT_SECONDS`（默认 3600 秒）。第一遍侧重改动本身的正确性，第二遍侧重调用方与边界输入。两遍都通过 §2.4.1 的检查后合并：同一文件中行号范围重叠的发现折叠为一条，另一遍的报告附在其下；按优先级排序。任一遍判为 `failed`，或超时，整轮发 `failed`；第一遍 codex 退出码非 0 或超时时，不再跑第二遍。正文写明选择首轮的原因。
+- 每次审查开始时，把实际使用的 base 分支（从实时 PR 读取）写入该任务的 `jobs.base_ref`。
+- 首轮（`mode=full`）：找不到上一个已审 head、PR 的 base 分支与上一个已审 head 审查时的 base 不同（PR 改了目标分支）、上一个已审 head 已不在 bare 镜像中、它不是新 head 的祖先（例如 force-push 或 rebase），或计算增量基准失败时，做首轮。首轮跑两遍独立审查，档位 `xhigh`，每遍的超时为 `CODEX_REVIEW_FIRST_TIMEOUT_SECONDS`（默认 3600 秒）。第一遍侧重改动本身的正确性，第二遍侧重调用方与边界输入。两遍都通过 §2.4.1 的检查后合并：同一文件中行号范围重叠的发现折叠为一条，另一遍的报告附在其下；按优先级排序。任一遍判为 `failed`，或超时，整轮发 `failed`；第一遍 codex 退出码非 0 或超时时，不再跑第二遍。正文写明选择首轮的原因。
 - 复审（`mode=delta`）：只跑一遍，超时为 `CODEX_REVIEW_TIMEOUT_SECONDS`。增量基准树按以下步骤计算：
   1. 在 `refs/remotes/origin/<base>` 的第一父链上，取新 head 已包含的最新提交 M（新 head 一个都不包含时做首轮）；
   2. 在 `work/<任务 id>/delta-base` 建一个停在上一个已审 head 的临时工作树，执行 `git merge --no-commit --no-ff M`。有冲突时保留带冲突标记的文件；`git add --all` 后用 `git write-tree` 得到基准树，再删除临时工作树。
   3. 交给 codex 的是 `git diff <基准树> HEAD`：从 base 合入的改动已在基准树中，不出现在增量里；解冲突的改动仍在增量里（删除冲突标记的 hunk 即解冲突结果）。这里不用 `git merge-tree --write-tree`，因为 Ubuntu 22.04 自带的 git 2.34 还没有这个选项（2.38 起才有）。
-- 增量为空（新 head 相对上一个已审 head 只有从 base 合入的改动）时不调用 codex，直接发 `verdict=clean effort=none tests=read-only mode=delta`，正文写明原因。
+- 增量为空（新 head 相对上一个已审 head 只有从 base 合入的改动）时不调用 codex。发布前与普通审查一样重新读取实时 PR：PR 已关闭、head 已变、不再满足准入条件（例如变成被排除的草稿）时不发布；base 已变时重新排队。然后从上一条 review 正文中取出已发布的阻塞项（P0/P1，或涉及资金、止损、凭据、安全边界的发现，「登记项」一节除外），原文沿用到本次正文的「上一轮仍未处理的阻塞项（增量为空）」一节，发 `verdict=findings effort=none tests=read-only mode=delta`；没有阻塞项时发 `verdict=clean effort=none tests=read-only mode=delta`。其余非阻塞发现不沿用：它们已在上一个 head 上裁决过，本 head 没有改动相关代码。
 - 复审提示附上上一条 review 的正文（最多 20000 字符），要求报告：增量引入的问题；增量中对上次发现修得不完整或不对的地方。增量之外、本次未改动代码中的问题写进 `增量外问题（登记，不阻塞）` 一节。服务把这一节从最终消息中拆出：
   - 置信度 ≥ 50，并且是 P0/P1，或涉及资金、止损、凭据、安全边界的，列入正文「增量外但阻塞的问题」一节，结论计为 `findings`；
   - 置信度 ≥ 50 的其余条目列入正文「登记项」一节，不计入 verdict；这些条目需要登记为 issue 并在 PR 上回复，不阻塞合并；

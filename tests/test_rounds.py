@@ -142,6 +142,65 @@ class DeltaTests(Rounds):
         self.assertIn(f'head={NEW_HEAD} verdict=clean effort=none tests=read-only mode=delta -->', body)
         self.assertNotIn('codex was told', body)
 
+    def test_empty_delta_keeps_unresolved_p1_of_the_previous_review_blocking(self):
+        self.first_round(message(finding('P1', 'Order is sent twice', 'src/order.py', 7, 90),
+                                 finding('P3', 'Typo in log', 'src/log.py', 2, 80)), message(verdict='CLEAN'))
+        self.git.delta_files = []
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual((status, len(self.codex.calls)), ('findings', 2))
+        self.assertIn(f'head={NEW_HEAD} verdict=findings effort=none tests=read-only mode=delta -->', body)
+        self.assertIn('## ' + cr.CARRIED_HEADING, body)
+        self.assertIn('**[P1] Order is sent twice** — `src/order.py:7` · 置信度 90', body)
+        self.assertNotIn('Typo in log', body)
+        self.git.head = THIRD_HEAD
+        status, body = self.second_head(message(verdict='CLEAN'), guid='d-3', head=THIRD_HEAD)
+        self.assertEqual(status, 'findings')
+        self.assertIn('**[P1] Order is sent twice**', body)
+
+    def test_empty_delta_after_only_non_blocking_findings_is_clean(self):
+        self.first_round(message(finding('P2', 'Slow loop', 'src/app.py', 7, 90)), message(verdict='CLEAN'))
+        self.git.delta_files = []
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual(status, 'clean')
+        self.assertNotIn('Slow loop', body)
+
+    def test_base_change_falls_back_to_a_full_round(self):
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        self.github.base = 'release'
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual(status, 'clean')
+        self.assertEqual(getattr(self.git, 'delta_calls', []), [])
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 4)
+        self.assertIn('git diff origin/release...HEAD', self.codex.calls[2][2])
+        self.assertIn('mode=full -->', body)
+        self.assertIn('the base branch changed from main to release', body)
+
+    def test_the_recorded_base_is_the_live_base_the_review_used(self):
+        self.github.base = 'release'
+        self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+        status, body = self.second_head(message(verdict='CLEAN'))
+        self.assertEqual(self.store.concluded(REPO, 7, NEW_HEAD)[0][2], 'release')
+        self.assertIn('mode=delta -->', body)
+
+    def test_empty_delta_rechecks_the_live_pr_before_publishing(self):
+        def close():
+            self.github.state = 'closed'
+
+        def retarget():
+            self.github.base = 'release'
+        for guid, head, change, expected in (('d-2', NEW_HEAD, close, 'superseded'),
+                                             ('d-3', THIRD_HEAD, retarget, None)):
+            with self.subTest(expected):
+                if guid == 'd-2':
+                    self.first_round(message(verdict='CLEAN'), message(verdict='CLEAN'))
+                self.github.state, self.github.base = 'open', 'main'
+                self.git.delta_files, self.git.during_delta = [], change
+                self.github.heads[7], self.git.head = head, head
+                self.deliver(pull_payload(head=head), guid=guid)
+                _, status = self.run_next()
+                self.assertEqual(status, expected)
+                self.assertEqual(len(self.github.posted), 1)
+
 
 class ConfidenceTests(Rounds):
     def review_once(self, msg):

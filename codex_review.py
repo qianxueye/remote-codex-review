@@ -84,6 +84,9 @@ DELTA_PROMPT = (
     "orders, credentials or a security boundary, is reported as a regular finding even when it lies outside the "
     "delta. Problems listed only in that section do not count as findings for the VERDICT line.")
 PREVIOUS_LIMIT_CHARS = 20000
+PROMOTED_HEADING = '增量外但阻塞的问题（P0/P1 或资金、止损、凭据、安全边界）'
+CARRIED_HEADING = '上一轮仍未处理的阻塞项（增量为空）'
+
 # Out-of-delta items that still block: P0/P1 or the funds, stop-loss, credential and security classes.
 BLOCKING_RE = re.compile(
     r'\[P[01]\]|资金|止损|凭据|密钥|安全边界|credential|secret|password|private key|api[ _-]?key|stop[- ]?loss'
@@ -563,6 +566,23 @@ def split_register(message):
     return '\n'.join(kept), list(dict.fromkeys(items))
 
 
+def blocking_items(body):
+    """Return the posted P0/P1, funds, stop-loss, credential or security findings of a review body, verbatim."""
+    items, current, section = [], None, ''
+    for line in body.splitlines():
+        if line.startswith('## '):
+            section, current = line[3:].strip(), None
+        elif re.match(r'^- (?:\*\*)?\[P[0-3]\]', line) and section != '登记项':
+            current = [line]
+            items.append(current)
+        elif current is not None and (line.startswith(' ') or not line.strip()):
+            current.append(line)
+        else:
+            current = None
+    blocks = ['\n'.join(item).strip() for item in items]
+    return [block for block in blocks if BLOCKING_RE.search(block)]
+
+
 def merge_findings(passes):
     """Fold findings of several (label, findings) passes; one at an overlapping location of the same file joins it."""
     merged = []
@@ -743,7 +763,7 @@ def inline_comments(findings, diff):
 
 
 def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, reasons=(),
-                governance=(), mode=None, scope='', promoted=(), register=(), unposted=0):
+                governance=(), mode=None, scope='', promoted=(), register=(), unposted=0, carried=()):
     """Render the review body; it always carries the marker and every posted finding in full.
 
     effort is set once a review was decided (`none` when codex had nothing to read); kept names the kept output.
@@ -757,7 +777,8 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
     elif verdict == 'clean':
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
     else:
-        parts.append(f'**Remote codex review: {len(findings) + len(promoted) or "unparsed"} finding(s)** for `{head}`.')
+        count = len(findings) + len(promoted) + len(carried)
+        parts.append(f'**Remote codex review: {count or "unparsed"} finding(s)** for `{head}`.')
     if effort and effort != 'none':
         parts.append('Read-only review: codex was told not to run tests or start services.')
     if scope:
@@ -775,7 +796,10 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
     if verdict == 'findings' and raw:
         parts.append(raw)
     if promoted:
-        parts.append('## 增量外但阻塞的问题（P0/P1 或资金、止损、凭据、安全边界）\n\n' + '\n'.join(promoted))
+        parts.append(f'## {PROMOTED_HEADING}\n\n' + '\n'.join(promoted))
+    if carried:
+        parts.append(f'## {CARRIED_HEADING}\n\n上一条 review 的这些阻塞项（P0/P1 或资金、止损、凭据、安全边界）所在代码在本 head '
+                     '没有改动，沿用为本次发现。\n\n' + '\n\n'.join(carried))
     if register:
         parts.append('## 登记项\n\n复审增量之外的问题：登记为 issue 并在 PR 上回复，不阻塞合并，不计入 verdict。\n\n'
                      + '\n'.join(register))
@@ -936,12 +960,17 @@ class Store:
                                    'WHERE repo = ? AND pr = ? AND head_sha = ?', (repo, pr, head)).rowcount
 
     def concluded(self, repo, pr, head):
-        """Return (head, review id) of this PR's clean or findings reviews of other heads, newest first."""
+        """Return (head, review id, base) of this PR's clean or findings reviews of other heads, newest first."""
         with self.lock:
             return self.db.execute(
-                f"SELECT head_sha, review_id FROM jobs WHERE repo = ? AND pr = ? AND head_sha != ? "
+                f"SELECT head_sha, review_id, base_ref FROM jobs WHERE repo = ? AND pr = ? AND head_sha != ? "
                 f"AND status IN {CONCLUDED!r} AND review_id IS NOT NULL ORDER BY updated_at DESC, id DESC LIMIT ?",
                 (repo, pr, head, PREVIOUS_LIMIT)).fetchall()
+
+    def record_base(self, job_id, base):
+        """Store the base branch the running review actually uses."""
+        with self.lock:
+            self.db.execute('UPDATE jobs SET base_ref = ? WHERE id = ?', (base, job_id))
 
     def queued(self):
         with self.lock:
@@ -1489,8 +1518,8 @@ class Reviewer:
         return verdict
 
     def previous_review(self, job, token):
-        """Return (head, review body) of the newest still-valid clean or findings review of another head, or None."""
-        for head, review_id in self.store.concluded(job.full_name, job.number, job.head):
+        """Return (head, review body, base) of the newest still-valid clean or findings review of another head."""
+        for head, review_id, base in self.store.concluded(job.full_name, job.number, job.head):
             try:
                 review = self.github.review(job.full_name, job.number, review_id, token)
             except GitHubError as exc:
@@ -1499,13 +1528,15 @@ class Reviewer:
                 raise
             match = MARKER_RE.search(review.get('body') or '')
             if match and match.group(1) == head and match.group(2) in CONCLUDED:
-                return head, review['body']
+                return head, review['body'], base
         return None
 
     def plan(self, job, base, previous, scratch):
         """Choose a full first round or a delta re-review; returns a Plan."""
         if previous is None:
             why = 'no earlier clean or findings review of another head of this PR'
+        elif previous[2] != base:
+            why = f'the base branch changed from {previous[2]} to {base} since head {previous[0][:12]} was reviewed'
         else:
             tree, why = self.git.delta_tree(job.full_name, base, previous[0], job.head, scratch / 'delta-base')
             if tree:
@@ -1517,6 +1548,19 @@ class Reviewer:
         files = self.git.changed_files(job.full_name, base, job.head)
         return Plan('full', why, files, FIRST_ROUND_EFFORT,
                     [(label, first_prompt(base, lens)) for label, lens in LENSES], self.config.first_timeout_seconds)
+
+    def recheck(self, job, base):
+        """Return (token, None) when the live PR still matches the job and its base, else (None, outcome)."""
+        token = self.github.token(job.installation)
+        pull = self.github.pull(job.full_name, job.number, token)
+        outcome = self.gate(job, pull)
+        if outcome is not None:
+            return None, outcome
+        if pull['base']['ref'] != base:
+            log(f'{job}: base changed to {pull["base"]["ref"]} during review; requeued')
+            self.store.retry(job.id, 0, count_attempt=False)
+            return None, None
+        return token, None
 
     def scope(self, plan, job, base, passes=()):
         if plan.mode == 'delta':
@@ -1536,6 +1580,7 @@ class Reviewer:
         if outcome is not None:
             return outcome
         base = pull['base']['ref']
+        self.store.record_base(job.id, base)
         previous = self.previous_review(job, token)
         scratch = self.git.work / f'{job.id}'
         worktree = scratch / 'tree'
@@ -1550,8 +1595,13 @@ class Reviewer:
                 self.git.add_worktree(job.full_name, worktree, job.head)
         if plan.mode == 'delta' and not plan.files:
             shutil.rmtree(scratch, ignore_errors=True)
-            return self.publish(job, 'clean', review_body(
-                job.head, 'clean', '', [], effort='none', mode='delta', scope=(
+            token, outcome = self.recheck(job, base)
+            if token is None:
+                return outcome
+            carried = blocking_items(previous[1])
+            verdict = 'findings' if carried else 'clean'
+            return self.publish(job, verdict, review_body(
+                job.head, verdict, '', [], effort='none', mode='delta', carried=carried, scope=(
                     f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
                     '合入的改动），未调用 codex。')), [], token)
         runs = []
@@ -1587,15 +1637,9 @@ class Reviewer:
         if self.stop.is_set():
             self.store.retry(job.id, 0, count_attempt=False)
             return None
-        token = self.github.token(job.installation)
-        pull = self.github.pull(job.full_name, job.number, token)
-        outcome = self.gate(job, pull)
-        if outcome is not None:
+        token, outcome = self.recheck(job, base)
+        if token is None:
             return outcome
-        if pull['base']['ref'] != base:
-            log(f'{job}: base changed to {pull["base"]["ref"]} during review; requeued')
-            self.store.retry(job.id, 0, count_attempt=False)
-            return None
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
         common = dict(effort=plan.effort, kept=kept, governance=governance, mode=plan.mode,
                       scope=self.scope(plan, job, base, plan.passes))
