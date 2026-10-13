@@ -32,7 +32,7 @@ def events_jsonl(message, read=True):
     if read:
         events.append({'type': 'item.completed', 'item': {
             'id': 'item_0', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff origin/main...HEAD'",
-            'aggregated_output': 'diff --git a/x b/x\n', 'exit_code': 0, 'status': 'completed'}})
+            'aggregated_output': 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n', 'exit_code': 0, 'status': 'completed'}})
     events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
     events.append({'type': 'turn.completed', 'usage': {}})
     return '\n'.join(json.dumps(event) for event in events) + '\n'

@@ -82,7 +82,7 @@ codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独
 - 同时满足以下全部条件时，判为 `clean`：
   1. codex 退出码为 0；
   2. 事件流中有 `turn.completed`，没有 `turn.failed`、`error` 条目和顶层 `error` 事件。例外：回合正常完成时，内容属于临时故障的顶层 `error` 事件（例如 `Reconnecting... 2/5 (unexpected status 503 …)`）只是 codex 自动重连的通知，不计；
-  3. 至少有一条运行 `git diff` 或 `git show` 的 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，即事件流证明 codex 读过 diff。只认真正的 git 子命令：命令行按 shell 规则（`shlex`）切分，按 `;`、`&&`、`||`、`|` 分段，`sh`/`bash`/`zsh -c` 的内层命令再递归切分；某段的程序是 `git`，跳过全局选项（`-c`、`-C`、`--git-dir` 等带值选项连同其值，值可以带引号和空格）后，第一个子命令是 `diff` 或 `show`。无法按 shell 规则切分的命令不算。只成功运行过 `ls`、`git status`、`git show-ref`、`git difftool`、`git config --get diff.*` 之类命令的不算；
+  3. 至少有一条 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，并且它的 `aggregated_output` 含有统一 diff 的结构：一行以 `diff --git a/` 开头，另有至少一行以 `@@ ` 开头的 hunk 头。这一条只看命令的输出，不分析命令怎么写；输出被截断时，只要剩下的部分仍有这两种行就算。只跑过 `git status`、`ls`、`git -v`、`echo`、`git diff --stat` 的不算。与 base 没有任何差别的 PR，`git diff` 输出为空，也按这一条判 `failed`，原因中写明这种情况；服务目前没有单独的「无改动」处理。只改二进制文件或只改名的 PR 没有 hunk 头，同样判 `failed`；
   4. 最终消息中没有 codex 说自己没能完成审查的语句。这一条只拦截意思明确的说法：`Reviewer failed to output a response.`、`Review blocked`、`the verdict is a placeholder`、`I could not read`、`The reviewer was unable to read`、`unable to read the diff`、`the review is incomplete`、`codex-code-mode-host is missing`、「我无法读取」、「本次审查无法读取文件」、「审查未完成」、「未能读取 diff」，完整列表见 `codex_review.py` 的 `FAILURE_SIGNAL_RE`。结论描述被审代码时也会用到的词不在列表中，例如单独的 blocked、placeholder、cannot view、no such file or directory、工具缺失；工具坏到读不了 diff 的情况由第 3 条判定；
   5. 最终消息中恰好有一行 `VERDICT: CLEAN`。
 - 其余情况一律判为 `failed`。
