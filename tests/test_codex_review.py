@@ -41,10 +41,14 @@ def events_jsonl(message, read=True, outputs=None, exit_code=0):
     events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
     events.append({'type': 'turn.completed', 'usage': {}})
     return '\n'.join(json.dumps(event) for event in events) + '\n'
-def session_item(output, exit_code=0, truncated=False):
-    """Return one code-mode tool-output item as codex records it in the session rollout."""
-    chunk = json.dumps({'chunk_id': 'c1', 'exit_code': exit_code, 'original_token_count': 1, 'output': output,
-                        'wall_time_seconds': 0.1})
+def session_item(output, exit_code=0, truncated=False, session_id=None):
+    """Return one code-mode tool-output item as codex records it in the session rollout.
+
+    A chunk of a command still running carries `session_id` and no `exit_code` (exit_code=None).
+    """
+    chunk = {'chunk_id': 'c1', 'wall_time_seconds': 0.1}
+    chunk.update({'exit_code': exit_code} if exit_code is not None else {'session_id': session_id})
+    chunk = json.dumps({**chunk, 'original_token_count': 1, 'output': output})
     warning = 'Warning: truncated output (original token count: 9999)\nTotal output lines: 1\n\n' if truncated else ''
     return [{'type': 'input_text', 'text': 'Script completed\nWall time 0.1 seconds\nOutput:\n'},
             {'type': 'input_text', 'text': warning + chunk}]

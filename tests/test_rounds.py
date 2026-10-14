@@ -252,6 +252,59 @@ class SessionLogTests(unittest.TestCase):
         self.assertEqual(cr.evidence_lines([session_item('x\ny\n')], cr.read_events(events_jsonl('', outputs=['x\ny\n'], exit_code=1))), set())
 
 
+class CoverageEvidenceTests(unittest.TestCase):
+    """Coverage is per file and per occurrence; truncation is read from the tool wrapper; streamed chunks count."""
+
+    WARNING = 'Warning: truncated output (original token count: 12)\nTotal output lines: 3\n\n'
+
+    def unread(self, expected, items, printed):
+        return cr.unread_files(expected, cr.evidence_lines(items, cr.read_events(events_jsonl('', outputs=printed))))
+
+    def diff(self, path, *rows):
+        return f'diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{len(rows)} @@\n' + ''.join(
+            f'+{row}\n' for row in rows)
+
+    def test_a_diff_quoting_the_truncation_warning_read_in_full_counts(self):
+        text = self.diff('codex_review.py', "TRUNCATION_RE = re.compile(r'Warning: truncated output|x')",
+                         "    warning = 'Warning: truncated output (original token count: 9999)\\nTotal output lines: 1'",
+                         'Warning: truncated output (original token count: 12)')
+        self.assertEqual(self.unread({'codex_review.py': text}, [session_item(text)], [text]), [])
+
+    def test_a_chunk_whose_output_the_tool_truncated_is_not_evidence(self):
+        text = self.diff('a.py', 'one', 'two')
+        self.assertEqual(self.unread({'a.py': text}, [session_item(self.WARNING + text)], [text]), [('a.py', '未读')])
+        self.assertEqual(self.unread({'a.py': text}, [session_item(text, truncated=True)], [text]), [('a.py', '未读')])
+
+    def test_repeated_rows_need_every_occurrence(self):
+        text = self.diff('rows.csv', *['same'] * 100)
+        shown = self.diff('rows.csv', 'same').replace('+1,1', '+1,100')
+        self.assertEqual(self.unread({'rows.csv': text}, [session_item(shown)], [shown]), [('rows.csv', '部分')])
+
+    def test_lines_read_in_another_file_do_not_cover_this_one(self):
+        a, b = self.diff('a.py', 'shared', 'tail'), self.diff('b.py', 'shared', 'tail')
+        header = ''.join(b.splitlines(keepends=True)[:4])
+        items = [session_item(a), session_item(header), session_item('+tail\n')]
+        self.assertEqual(self.unread({'a.py': a, 'b.py': b}, items, [a, header, '+tail\n']), [('b.py', '部分')])
+
+    def test_pages_across_outputs_with_repeated_rows_and_a_folded_line_count(self):
+        long_row = 'x' * 9000
+        text = self.diff('data.txt', *['same'] * 6, long_row, *['same'] * 3)
+        lines = text.splitlines(keepends=True)
+        pages = [''.join(lines[:7]), ''.join(lines[7:10]),
+                 '\n'.join(cr.fold('+' + long_row)) + '\n', ''.join(lines[11:])]
+        self.assertEqual(self.unread({'data.txt': text}, [session_item(page) for page in pages], pages), [])
+
+    def test_a_streamed_command_counts_once_it_exits_zero(self):
+        text = self.diff('s.py', 'first row', 'second row')
+        cut = text.index('second') + 3
+        items = [session_item(text[:cut], exit_code=None, session_id=41),
+                 {'type': 'CommandExecution', 'process_id': '41', 'exit_code': 0, 'aggregated_output': text},
+                 session_item(text[cut:])]
+        self.assertEqual(self.unread({'s.py': text}, items, [text]), [])
+        failed = [items[0], {**items[1], 'exit_code': 1}, items[2]]
+        self.assertEqual(self.unread({'s.py': text}, failed, [text]), [('s.py', '未读')])
+
+
 class ManifestTests(unittest.TestCase):
     """The changed-file list reaches codex through a file, so a huge PR cannot overflow one argv entry."""
 
