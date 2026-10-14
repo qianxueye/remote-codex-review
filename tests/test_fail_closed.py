@@ -28,16 +28,11 @@ def fixture(name):
         encoding='utf-8')
 
 
-def judge_all(stdout, last, rc=0):
-    """Return assess()'s (verdict, summary, posted, unposted, reasons)."""
+def judge(stdout, last, rc=0):
+    """Return assess()'s (verdict, summary, findings, reasons)."""
     events = cr.read_events(stdout)
     verdict, review, reasons = cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
-    return verdict, review.text, review.posted if verdict == 'findings' else [], review.low, reasons
-
-
-def judge(stdout, last, rc=0):
-    """Return (verdict, summary, posted findings, reasons)."""
-    verdict, summary, posted, _, reasons = judge_all(stdout, last, rc)
+    return verdict, review.text, review.findings if verdict == 'findings' else [], reasons
     return verdict, summary, posted, reasons
 
 
@@ -89,12 +84,12 @@ class RealOutputTests(unittest.TestCase):
         self.assertNotIn('Review comment', summary)
         self.assertNotIn('VERDICT', summary)
 
-    def test_real_findings_without_confidence_are_not_posted_and_the_run_is_clean(self):
+    def test_real_findings_without_confidence_are_posted_and_the_run_is_findings(self):
         for name in ('findings-tests', 'findings-ro'):
             with self.subTest(name):
-                verdict, _, posted, unposted, reasons = judge_all(*fixture(name))
-                self.assertEqual((verdict, posted, reasons), ('clean', [], []))
-                self.assertEqual([(f.priority, f.confidence) for f in unposted], [('P2', None), ('P2', None)])
+                verdict, _, findings, reasons = judge(*fixture(name))
+                self.assertEqual((verdict, reasons), ('findings', []))
+                self.assertEqual([(f.priority, f.confidence) for f in findings], [('P2', None), ('P2', None)])
 
     def test_real_run_without_code_mode_host_is_failed(self):
         verdict, _, findings, reasons = judge(*fixture('broken-tests'))
@@ -532,7 +527,7 @@ class EnqueueTests(Harness):
         self.github.markers[(7, HEAD)] = None
         self.store.force_enqueue(REPO, 7, HEAD, 'main', 99)
         self.assertEqual(self.run_next()[1], 'clean')
-        self.assertEqual(len(self.codex.calls), 2)
+        self.assertEqual(len(self.codex.calls), 1)
         self.assertIn('mode=full -->', self.github.posted[-1]['body'])
 
 

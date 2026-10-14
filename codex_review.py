@@ -38,8 +38,8 @@ PREVIOUS_LIMIT = 5
 DEFAULT_EFFORT_RULES = {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**']}
 RULE_KEYS = frozenset({'medium', 'high'})
 BASE_PROMPT = (
-    "Review the code changes against the base branch 'origin/{base}'. Run `git diff origin/{base}...HEAD` to "
-    "inspect the changes relative to origin/{base}. Provide prioritized, actionable findings.")
+    "Review the code changes against the base branch 'origin/{base}', from their merge base {merge_base}. Run "
+    "`git diff {merge_base}...HEAD` to inspect the changes. Provide prioritized, actionable findings.")
 READ_ONLY_RULE = (
     'This is a read-only review: do not run pytest, vitest or any other test suite, and do not start a database '
     'or any other service. Read the code; use grep and git to view context. State in your conclusion: '
@@ -54,28 +54,52 @@ GOVERNANCE_RULE = (
 GOVERNANCE_MISSING_RULE = (
     'These issues linked from AGENTS.md could not be fetched by the review host and are not available; do not '
     'try to fetch them:')
-LENSES = (
-    ('正确性', 'Focus of this pass: correctness of the changed code itself: logic and conditions, state transitions, '
-              'error and failure paths, concurrency and ordering, data integrity, and whether the tests would fail '
-              'if the new behaviour were wrong.'),
-    ('调用方与边界', 'Focus of this pass: callers and edge cases. Find every caller and consumer of the changed '
-                'functions, types, config keys, schemas, messages and files (grep the whole repository) and check '
-                'that each still works; check boundary inputs: empty, missing, null, zero, negative, duplicate, '
-                'out-of-order, timeout, partial failure, restart and retry.'))
+FIRST_ROUND_LENS = (
+    'Review both of these in full. (1) Correctness of the changed code itself: logic and conditions, state '
+    'transitions, error and failure paths, concurrency and ordering, data integrity, and whether the tests would '
+    'fail if the new behaviour were wrong. (2) Callers and edge cases: find every caller and consumer of the changed '
+    'functions, types, config keys, schemas, messages and files (grep the whole repository) and check that each '
+    'still works; check boundary inputs: empty, missing, null, zero, negative, duplicate, out-of-order, timeout, '
+    'partial failure, restart and retry.')
 EXHAUSTIVE = (
     'Report every problem you find, including P3, with no limit on the number of findings. Do not drop a '
     'finding because it is minor or uncertain; state the uncertainty in its body.')
-CONFIDENCE_FLOOR = 50
 CONFIDENCE_RULE = (
     'End the body of every finding with a line that reads `Confidence: <0-100>`, your confidence that the problem '
-    'is real; end every register line the same way. Findings below 50 are not posted.')
+    'is real; end every register line the same way.')
+READ_LIMIT = 20000
+READ_LINES = 150
+FOLD_WIDTH = 4000
+COVERAGE_GRAM = 8
+HASH_BASE, HASH_MOD = 1_000_003, (1 << 61) - 1
+READ_ATTEMPTS = 3
+READ_RETRY_RULE = (
+    'This is review {attempt} of at most {total} of this head: the previous review did not show the complete diff '
+    'of {count} changed file(s), listed one per line in `{path}`. Read that list first, then each listed file in '
+    'full as described below, before anything else.')
+READ_RULE = (
+    'Read the complete diff of every changed file. The {total} changed files are listed one per line in '
+    '`{manifest}` (the same list as `git diff --name-only --no-renames {range}`); read that file first, then read '
+    'each changed file with `git diff --no-renames {range} -- <path>` (several small files per command are fine). '
+    'Only output you saw in full counts: never lower the tool\'s output budget, keep each read under about {limit} '
+    'bytes, and when a file\'s diff is longer read it in parts with `git diff --no-renames {range} -- <path> | sed -n '
+    '\'<first>,<last>p\'`, at most {lines} lines per part, until the end; when a part holds a line longer than '
+    '{width} bytes, pipe it through `fold -b -w {width}` and read every segment. The review host checks, from the '
+    'record of what you actually saw, that every line of every file\'s diff appeared untruncated, and rejects a '
+    'pass that misses any file. State in your conclusion how many of the changed files you read in full and the '
+    'total, e.g. `已完整阅读 {total}/{total} 个改动文件`.')
+TRUNCATION_RE = re.compile(r'Warning: truncated output \(original token count: \d+\)\n')
+EXEC_TRUNCATION_RE = re.compile(r'Warning: truncated output \(original token count: \d+\)\nTotal output lines: \d+\n\n')
+ELISION_RE = re.compile(r'…\d+ (?:tokens|chars) truncated…')
+ROLLOUT_BOUNDARY = {'type': 'rollout_boundary'}
+TOOL_OUTPUT_TYPES = ('custom_tool_call_output', 'function_call_output')
 REGISTER_HEADING = '增量外问题（登记，不阻塞）'
 DELTA_PROMPT = (
     "This is a re-review: commit {prev} of this branch was already reviewed. Review only what changed since "
     "then: run `git diff {tree} HEAD`. Tree {tree} is {prev} with the base-branch changes this branch has "
     "since merged already applied, so the diff leaves out code brought in from origin/{base} and keeps edits "
     "made while resolving merge conflicts; where it removes conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), "
-    "the hunk is a conflict resolution: review the resolved code. Files in this delta:\n{files}\n\n"
+    "the hunk is a conflict resolution: review the resolved code.\n\n"
     "Report as findings: (1) problems introduced by this delta; (2) a fix in this delta that addresses a "
     "finding of the previous review only partly or incorrectly. Read any other code you need for context.\n\n"
     "A problem in code this delta did not change is not a finding. List such problems inside "
@@ -514,7 +538,6 @@ class Finding:
     def __init__(self, priority, title, path, start, end):
         self.priority, self.title, self.path, self.start, self.end = priority, title, path, start, end
         self.lines = []
-        self.also = []
 
     @property
     def text(self):
@@ -523,9 +546,6 @@ class Finding:
     @property
     def confidence(self):
         return confidence(' '.join([self.title, *self.lines]))
-
-    def published(self):
-        return (self.confidence or 0) >= CONFIDENCE_FLOOR
 
     def location(self):
         return f'{self.path}:{self.start}' + (f'-{self.end}' if self.end != self.start else '')
@@ -542,7 +562,7 @@ def shown(score):
 def confidence(text):
     """Return the last stated confidence as an exact 0-100 Decimal; `confidence_score: 0.NN` is on a 0-1 scale.
 
-    A value outside its scale counts as missing (None); the floor is compared before any rounding.
+    A value outside its scale counts as missing (None).
     """
     found = CONFIDENCE_RE.findall(text)
     if not found:
@@ -550,20 +570,6 @@ def confidence(text):
     scored, value = found[-1]
     number = Decimal(value) * (100 if scored else 1)
     return None if number > 100 else number
-
-
-def merge_findings(passes):
-    """Fold findings of several (label, findings) passes; one at an overlapping location of the same file joins it."""
-    merged = []
-    for label, findings in passes:
-        for finding in findings:
-            same = next((m for m in merged if m.path == finding.path and finding.start <= m.end
-                         and m.start <= finding.end), None)
-            if same is None:
-                merged.append(finding)
-            else:
-                same.also.append((label, finding))
-    return sorted(merged, key=lambda f: min([f.priority] + [o.priority for _, o in f.also]))
 
 
 def read_events(output):
@@ -603,6 +609,327 @@ def diff_commands(events):
     return [item for item in ran_commands(events)
             if DIFF_HEADER_RE.search(str(item.get('aggregated_output') or ''))
             and HUNK_HEADER_RE.search(str(item.get('aggregated_output') or ''))]
+
+
+def thread_id(events):
+    return next((str(event.get('thread_id') or '') for event in events if event.get('type') == 'thread.started'), '')
+
+
+def model_view(text):
+    """Return command output as the model saw it, or None when it carries a truncation warning of unknown shape.
+
+    The exec truncation header is dropped and the line holding the `…N tokens truncated…` cut becomes empty.
+    """
+    header = EXEC_TRUNCATION_RE.match(text)
+    if header:
+        return '\n'.join('' if ELISION_RE.search(line) else line for line in text[header.end():].split('\n'))
+    return None if TRUNCATION_RE.match(text) else text
+
+
+def json_chunks(text):
+    """Return the `{"chunk_id", ...}` objects serialized in text, or None when one does not decode."""
+    decoder, chunks, position = json.JSONDecoder(), [], 0
+    while True:
+        start = text.find('{"chunk_id"', position)
+        if start < 0:
+            return chunks
+        try:
+            chunk, position = decoder.raw_decode(text, start)
+        except ValueError:
+            return None
+        chunk['output'] = str(chunk.get('output') or '')
+        chunk['truncated'] = bool(TRUNCATION_RE.match(chunk['output']))
+        chunks.append(chunk)
+
+
+def output_chunks(output, formatted=None):
+    """Return the command chunks of one session tool-output item; [] when the wrapper truncated it or it is unreadable.
+
+    formatted maps each CommandExecution `formatted_output` of the rollout to its exit code; a plain text part equal
+    to one is that command's output. Any other part starting with the truncation warning means the wrapper cut it.
+    """
+    formatted = formatted or {}
+    if not isinstance(output, list):
+        return []
+    parts = [part.get('text', '') for part in output if isinstance(part, dict)]
+    if any(TRUNCATION_RE.match(part) and part not in formatted for part in parts):
+        return []
+    chunks, pending = [], ''
+    for part in [*parts, None]:
+        if part is not None and part not in formatted:
+            pending += part
+            continue
+        decoded = json_chunks(pending)
+        if decoded is None:
+            return []
+        chunks += decoded
+        pending = ''
+        if part is not None:
+            chunks.append({'exit_code': formatted[part], 'output': part, 'truncated': bool(TRUNCATION_RE.match(part))})
+    return chunks
+
+
+def streamed_texts(records):
+    """Return (chunk index, text) per command of one rollout file that exited 0, as the model saw it.
+
+    A yielded command's chunks carry `session_id` (its `process_id`); they count once its next completion exits 0.
+    """
+    chunks, exits, formatted = [], [], {}
+    for record in records:
+        if is_command(record) and isinstance(record.get('formatted_output'), str):
+            text = record['formatted_output']
+            formatted[text] = 0 if record.get('exit_code') == 0 or formatted.get(text) == 0 else 1
+    for position, record in enumerate(records):
+        if is_command(record):
+            exits.append((position, str(record.get('process_id')), record.get('exit_code'),
+                          str(record.get('aggregated_output') or '')))
+        else:
+            chunks.extend((position, chunk) for chunk in output_chunks(record, formatted))
+    groups = {}
+    for index, (position, chunk) in enumerate(chunks):
+        if 'exit_code' in chunk or chunk.get('session_id') is None:
+            continue
+        same = [done for done in exits if done[1] == str(chunk['session_id'])]
+        owner = next((done for done in same if done[0] > position), same[-1] if same else None)
+        if owner:
+            groups.setdefault(owner, []).append(index)
+    texts, used = [], set()
+    for (_, _, code, aggregated), members in groups.items():
+        streamed = ''.join(chunks[index][1]['output'] for index in members)
+        if code != 0 or any(chunks[index][1]['truncated'] for index in members) or not aggregated.startswith(streamed):
+            continue
+        rest = aggregated[len(streamed):]
+        final = next((index for index in range(members[-1] + 1, len(chunks)) if index not in used
+                      and chunks[index][1].get('exit_code') == 0 and not chunks[index][1]['truncated']
+                      and chunks[index][1]['output'] == rest), None)
+        if final is not None:
+            used.add(final)
+            streamed = aggregated
+        texts.append((members[0], streamed))
+    texts += [(index, model_view(chunk['output'])) for index, (_, chunk) in enumerate(chunks)
+              if index not in used and chunk.get('exit_code') == 0 and model_view(chunk['output']) is not None]
+    return sorted(texts, key=lambda item: item[0])
+
+
+def is_command(record):
+    return isinstance(record, dict) and record.get('type') == 'CommandExecution'
+
+
+def visible_texts(records):
+    """Return, in record order, each command output the model saw from a command that exited 0.
+
+    Without any tool-output item the model saw each command's `formatted_output` (docs/runbook.zh.md 完整阅读核验).
+    """
+    if all(is_command(record) or record == ROLLOUT_BOUNDARY for record in records):
+        return [text for text in (model_view(str(record.get('formatted_output') or '')) for record in records
+                                  if is_command(record) and record.get('exit_code') == 0) if text]
+    texts, current = [], []
+    for record in [*records, ROLLOUT_BOUNDARY]:
+        if record == ROLLOUT_BOUNDARY:
+            texts += [text for _, text in streamed_texts(current)]
+            current = []
+        else:
+            current.append(record)
+    return texts
+
+
+def evidence_lines(records, events):
+    """Return each visible text as its lines; a line no successful `--json` command printed becomes None."""
+    printed = set()
+    for item in ran_commands(events):
+        printed.update(str(item.get('aggregated_output') or '').split('\n'))
+    return [[line if line in printed else None for line in text.split('\n')] for text in visible_texts(records)]
+
+
+class SessionLog:
+    """Reads the tool outputs codex showed the model from `$CODEX_HOME/sessions/**/rollout-*.jsonl`."""
+
+    def __init__(self, home):
+        self.sessions = Path(home) / 'sessions'
+
+    def outputs(self, thread, since):
+        """Return (records of thread and its child threads started after since, error or None).
+
+        Records are tool outputs and CommandExecution items in file order, each file followed by ROLLOUT_BOUNDARY.
+        """
+        if not thread:
+            return [], 'the codex events carry no thread id'
+        if not self.sessions.is_dir():
+            return [], f'no sessions directory at {self.sessions}'
+        found, outputs = 0, []
+        for path in self.sessions.glob('*/*/*/rollout-*.jsonl'):
+            try:
+                if path.stat().st_mtime < since - 300:
+                    continue
+                with path.open(encoding='utf-8', errors='replace') as handle:
+                    meta = (json.loads(handle.readline()) or {}).get('payload') or {}
+                    if thread not in (meta.get('id'), meta.get('parent_thread_id')):
+                        continue
+                    found += 1
+                    for line in handle:
+                        try:
+                            payload = (json.loads(line) or {}).get('payload') or {}
+                        except ValueError:
+                            continue
+                        if payload.get('type') in TOOL_OUTPUT_TYPES:
+                            outputs.append(payload.get('output'))
+                        elif (payload.get('type') == 'item_completed' and isinstance(payload.get('item'), dict)
+                              and payload['item'].get('type') == 'CommandExecution'):
+                            outputs.append(payload['item'])
+                    outputs.append(ROLLOUT_BOUNDARY)
+            except (OSError, ValueError, AttributeError):
+                outputs.append(ROLLOUT_BOUNDARY)
+        if not found:
+            return [], f'no session record for thread {thread} under {self.sessions}'
+        return outputs, None
+
+
+def fold(line, width=FOLD_WIDTH):
+    """Split a line into the byte segments `fold -b -w <width>` prints for it."""
+    data = line.encode('utf-8', 'surrogatepass')
+    return [data[start:start + width].decode('utf-8', 'replace') for start in range(0, len(data), width)]
+
+
+class Coverage:
+    """Marks diff lines as read from contiguous runs of seen lines; each seen line covers at most one diff line.
+
+    Matching and tie-breaking are described in docs/runbook.zh.md (完整阅读核验).
+    """
+
+    def __init__(self, expected):
+        self.rows = {path: [line for line in text.split('\n') if line] for path, text in expected.items()}
+        self.whole = {path: [False] * len(lines) for path, lines in self.rows.items()}
+        self.parts, self.sequences = {}, []
+        for path, lines in self.rows.items():
+            self.parts[path] = {row: [False] * len(fold(line)) for row, line in enumerate(lines)
+                                if len(line.encode('utf-8', 'surrogatepass')) > FOLD_WIDTH}
+            self.sequences.append((path, [(line, row, None) for row, line in enumerate(lines)]))
+            if self.parts[path]:
+                self.sequences.append((path, [
+                    token for row, line in enumerate(lines)
+                    for token in ([(segment, row, part) for part, segment in enumerate(fold(line))]
+                                  if row in self.parts[path] else [(line, row, None)])]))
+        self.single, self.pairs, self.grams, self.where, self.ids, self.hashes = {}, {}, {}, {}, {}, []
+        self.frontier, self.continuing = set(), {}
+        for number, (_, tokens) in enumerate(self.sequences):
+            values = [token for token, _, _ in tokens]
+            self.hashes.append(self.prefix([self.ids.setdefault(token, len(self.ids) + 1) for token in values]))
+            for position, token in enumerate(values):
+                self.single.setdefault(token, []).append((number, position))
+                self.where.setdefault(self.place(number, position), []).append((number, position))
+                if position + 1 < len(values):
+                    self.pairs.setdefault(tuple(values[position:position + 2]), []).append((number, position))
+                if position + COVERAGE_GRAM <= len(values):
+                    self.grams.setdefault(tuple(values[position:position + COVERAGE_GRAM]), []).append(
+                        (number, position))
+
+    def place(self, number, position):
+        path, tokens = self.sequences[number]
+        if position == len(tokens):
+            return path, len(self.rows[path]), 0
+        _, row, part = tokens[position]
+        return path, row, part or 0
+
+    def covered(self, number, position):
+        path, tokens = self.sequences[number]
+        _, row, part = tokens[position]
+        return self.whole[path][row] or (part is not None and self.parts[path][row][part])
+
+    def prefix(self, ids):
+        hashes = [0]
+        for value in ids:
+            hashes.append((hashes[-1] * HASH_BASE + value) % HASH_MOD)
+        return hashes
+
+    @staticmethod
+    def span(hashes, start, length):
+        return (hashes[start + length] - hashes[start] * pow(HASH_BASE, length, HASH_MOD)) % HASH_MOD
+
+    def run(self, seen, index, start, limit):
+        """Return the matching length of seen from index against a sequence start, by binary search on hashes."""
+        number, position = start
+        low, high = 0, min(limit, len(seen) - index, len(self.sequences[number][1]) - position)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self.span(self.seen_hashes, index, middle) == self.span(self.hashes[number], position, middle):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    def longest(self, seen, index):
+        """Return (length, starts) of the longest runs of seen from index that match a diff sequence.
+
+        A run continuing where an earlier one ended wins once it spans COVERAGE_GRAM lines or the rest of seen.
+        """
+        window = seen[index:index + COVERAGE_GRAM]
+        following = [(self.run(seen, index, start, len(seen)), start)
+                     for start in self.continuing.get(seen[index], ())]
+        following = [(length, start) for length, start in following if length >= len(window)]
+        if following:
+            length = max(length for length, _ in following)
+            return length, [start for value, start in following if value == length]
+        starts, limit = self.grams.get(tuple(window), ()) if None not in window else (), len(seen)
+        if not starts and index + 1 < len(seen) and None not in seen[index:index + 2]:
+            starts, limit = self.pairs.get(tuple(seen[index:index + 2]), ()), COVERAGE_GRAM - 1
+        if not starts:
+            return (1, self.single[seen[index]]) if seen[index] in self.single else (0, [])
+        lengths = [(self.run(seen, index, start, limit), start) for start in starts]
+        length = max(length for length, _ in lengths)
+        return length, [start for value, start in lengths if value == length]
+
+    def read(self, seen):
+        self.seen_hashes, index = self.prefix([self.ids.get(token, 0) for token in seen]), 0
+        while index < len(seen):
+            length, starts = self.longest(seen, index)
+            if not length:
+                index += 1
+                continue
+            starts = [start for start in starts if self.place(*start) in self.frontier] or starts
+            number, position = min(starts, key=lambda start: (
+                -sum(not self.covered(start[0], at) for at in range(start[1], start[1] + length)), start))
+            path, tokens = self.sequences[number]
+            length = next((at for at in range(length) if seen[index + at] != tokens[position + at][0]), length)
+            if not length:
+                index += 1
+                continue
+            for at in range(position, position + length):
+                _, row, part = tokens[at]
+                if part is None:
+                    self.whole[path][row] = True
+                else:
+                    self.parts[path][row][part] = True
+            place = self.place(number, position + length)
+            self.frontier.add(place)
+            for start in self.where.get(place, ()):
+                self.continuing.setdefault(self.sequences[start[0]][1][start[1]][0], set()).add(start)
+            index += length
+
+    def unread(self):
+        def done(path, row):
+            return self.whole[path][row] or all(self.parts[path].get(row, [False]))
+        unread = []
+        for path, lines in self.rows.items():
+            if not all(done(path, row) for row in range(len(lines))):
+                unread.append((path, '部分' if done(path, 0) else '未读'))
+        return unread
+
+
+def unread_files(expected, seen):
+    """Return (path, 未读|部分) for each expected diff that the seen line lists do not cover line by line.
+
+    未读: its `diff --git` header line was not covered; 部分: the header was but some later line was not.
+    """
+    coverage = Coverage(expected)
+    for lines in seen:
+        coverage.read(lines)
+    return coverage.unread()
+
+
+def unread_note(unread, total, error=None):
+    listed = '、'.join(f'`{path}`（{state}）' for path, state in unread)
+    note = f'{len(unread)} 个改动文件（共 {total} 个）没有在模型看到的合格命令输出中读全：{listed}'
+    return note + (f'（codex 会话记录不可用，一律不算证据：{error}）' if error else '')
 
 
 def turn_completed(events):
@@ -648,15 +975,16 @@ def failure_reasons(rc, events, message):
     return reasons
 
 
-def assess(rc, events, message, worktree_roots=(), delta=False):
+def assess(rc, events, message, worktree_roots=(), delta=False, coverage=''):
     """Return (verdict, Review, reasons) for one pass; docs/runbook.zh.md §2.4.1 lists the rules.
 
-    Findings: a posted or unparsed finding, a promoted register item, or a tag/FINDINGS line with nothing parsed.
+    Findings: a parsed or unparsed finding, a promoted register item, or a tag/FINDINGS line with nothing parsed.
+    coverage is the unread_note() of the pass, empty when every file was read; it blocks clean, not findings.
     """
     review = read_review(message, worktree_roots, delta)
     declared = VERDICT_RE.findall(message)
     untagged = not review.findings and not review.items
-    counted = (review.posted or review.unparsed or review.promoted
+    counted = (review.findings or review.unparsed or review.promoted
                or (untagged and (PRIORITY_RE.search(review.text) or 'FINDINGS' in declared)))
     if rc == 0 and message and counted:
         return 'findings', review, []
@@ -664,6 +992,8 @@ def assess(rc, events, message, worktree_roots=(), delta=False):
     if declared not in ((['CLEAN'], ['FINDINGS']) if not untagged else (['CLEAN'],)):
         reasons.append('the final message carries no single `VERDICT: CLEAN` line'
                        + (f' (found {", ".join(declared)})' if declared else ''))
+    if coverage:
+        reasons.append(coverage)
     return ('failed' if reasons else 'clean'), review, reasons
 
 
@@ -686,28 +1016,13 @@ class Review:
         return VERDICT_RE.sub('', '\n'.join(self.summary)).strip()
 
     @property
-    def posted(self):
-        return [finding for finding in self.findings if finding.published()]
-
-    @property
-    def low(self):
-        return [finding for finding in self.findings if not finding.published()]
-
-    def _scored(self, keep):
-        return [item for item in self.items if keep((confidence(item) or 0) >= CONFIDENCE_FLOOR, item)]
-
-    @property
-    def low_items(self):
-        return self._scored(lambda sure, _: not sure)
-
-    @property
     def promoted(self):
-        """Confident register items that still block: P0/P1, the BLOCKING_RE classes, or no priority tag."""
-        return self._scored(lambda sure, item: sure and (BLOCKING_RE.search(item) or not PRIORITY_RE.search(item)))
+        """Register items that still block: P0/P1, the BLOCKING_RE classes, or no priority tag."""
+        return [item for item in self.items if BLOCKING_RE.search(item) or not PRIORITY_RE.search(item)]
 
     @property
     def registered(self):
-        return [item for item in self._scored(lambda sure, _: sure) if item not in self.promoted]
+        return [item for item in self.items if item not in self.promoted]
 
 
 def read_review(message, worktree_roots=(), delta=False):
@@ -782,8 +1097,8 @@ def inline_comments(findings, diff):
 
 
 def review_body(head, verdict, summary, findings, unparsed=(), reason='', effort=None, kept=None, reasons=(),
-                governance=(), mode=None, scope='', promoted=(), register=(), unposted=0):
-    """Render the review body; it always carries the marker and every posted finding in full.
+                governance=(), mode=None, scope='', promoted=(), register=(), coverage=''):
+    """Render the review body; it always carries the marker and every finding in full.
 
     effort is set once a review was decided (`none` when codex had nothing to read); kept names the kept output.
     """
@@ -802,16 +1117,14 @@ def review_body(head, verdict, summary, findings, unparsed=(), reason='', effort
         parts.append('Read-only review: codex was told not to run tests or start services.')
     if scope:
         parts.append(scope)
+    if coverage and verdict != 'failed':
+        parts.append(f'**阅读不完整**：{coverage}。')
     parts += [f'Governance issue `{doc.ref}` linked from AGENTS.md could not be prefetched ({doc.error}); '
               'codex reviewed without it.' for doc in governance if doc.error]
     if summary:
         parts.append(summary)
     for finding in findings:
-        block = [f'- {finding.heading()}', '', *('  ' + line for line in finding.text.splitlines())]
-        for label, other in finding.also:
-            block += ['', f'  同一位置另一遍（{label}）的报告：{other.heading()}',
-                      *('    ' + line for line in other.text.splitlines())]
-        parts.append('\n'.join(block))
+        parts.append('\n'.join([f'- {finding.heading()}', '', *('  ' + line for line in finding.text.splitlines())]))
     if unparsed:
         parts.append('## 未能解析的发现（按发现处理）\n\n' + '\n\n'.join(unparsed))
     if promoted:
@@ -823,8 +1136,6 @@ def review_body(head, verdict, summary, findings, unparsed=(), reason='', effort
     if len(body) > BODY_LIMIT:
         body = body[:BODY_LIMIT] + (f'\n\n[truncated; full text kept on the review host at `{kept}`]'
                                     if kept else '\n\n[truncated]')
-    if unposted:
-        body += f'\n\n另有 {unposted} 条置信度低于 {CONFIDENCE_FLOOR} 的发现未提交。'
     return body
 
 
@@ -1135,13 +1446,15 @@ class Git:
         self.mirrors = state_dir / 'mirrors'
         self.work = state_dir / 'work'
 
-    def run(self, args, env=None, timeout=900):
-        result = subprocess.run(['git', *args], env=env, capture_output=True, text=True,
-                                timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+    def run(self, args, env=None, timeout=900, raw=False):
+        """Run git; raw=True returns stdout decoded without newline translation or stripping."""
+        result = subprocess.run(['git', *args], env=env, capture_output=True, timeout=timeout, check=False,
+                                stdin=subprocess.DEVNULL)
         if result.returncode:
             raise RuntimeError(f'git {args[0]} {args[1] if len(args) > 1 else ""} failed: '
-                               f'{result.stderr.strip()[-500:]}')
-        return result.stdout.strip()
+                               f'{result.stderr.decode("utf-8", "replace").strip()[-500:]}')
+        stdout = result.stdout.decode('utf-8', 'replace')
+        return stdout if raw else stdout.replace('\r\n', '\n').strip()
 
     def mirror(self, full_name):
         return self.mirrors / f'{full_name}.git'
@@ -1157,9 +1470,12 @@ class Git:
                   f'+refs/heads/{base}:refs/remotes/origin/{base}'], env=auth_env(token))
         return self.run(['-C', str(mirror), 'rev-parse', f'refs/codex/pr/{number}'])
 
-    def changed_files(self, full_name, base, head):
+    def merge_base(self, full_name, base, head):
+        return self.run(['-C', str(self.mirror(full_name)), 'merge-base', f'refs/remotes/origin/{base}', head])
+
+    def changed_files(self, full_name, merge_base, head):
         out = self.run(['-C', str(self.mirror(full_name)), 'diff', '--name-only', '--no-renames', '-z',
-                        f'refs/remotes/origin/{base}...{head}'])
+                        f'{merge_base}...{head}'])
         return [name for name in out.split('\0') if name]
 
     def delta_tree(self, full_name, base, prev, head, scratch):
@@ -1198,6 +1514,11 @@ class Git:
     def diff_files(self, full_name, tree, head):
         out = self.run(['-C', str(self.mirror(full_name)), 'diff', '--name-only', '--no-renames', '-z', tree, head])
         return [name for name in out.split('\0') if name]
+
+    def file_diffs(self, worktree, range_args, files):
+        """Map each changed path to `git diff --no-renames <range> -- <path>` run in codex's worktree, bytes kept."""
+        return {path: self.run(['--literal-pathspecs', '-C', str(worktree), 'diff', '--no-renames', *range_args,
+                                '--', path], raw=True) for path in files}
 
     def status(self, args):
         """Run git and return its exit status; for checks whose non-zero answer is not an error."""
@@ -1296,16 +1617,26 @@ def prefetch_governance(github, token, worktree, target):
     return docs
 
 
-def first_prompt(base, lens):
-    """Return the prompt sections of one first-round pass over `origin/<base>...HEAD`."""
-    return [BASE_PROMPT.format(base=base), lens, EXHAUSTIVE]
+def read_rule(range_text, manifest, total):
+    """The reading instruction; the file list lives in manifest, never in the prompt (argv is bounded)."""
+    return READ_RULE.format(range=range_text, manifest=manifest, limit=READ_LIMIT, lines=READ_LINES,
+                            width=FOLD_WIDTH, total=total)
 
 
-def delta_prompt(base, prev, tree, files, previous):
+def read_retry_rule(attempt, path, count):
+    return READ_RETRY_RULE.format(attempt=attempt, total=READ_ATTEMPTS, path=path, count=count)
+
+
+def first_prompt(base, merge_base):
+    """Return the prompt sections of the first round over `<merge base>...HEAD`."""
+    return [BASE_PROMPT.format(base=base, merge_base=merge_base), FIRST_ROUND_LENS, EXHAUSTIVE]
+
+
+def delta_prompt(base, prev, tree, previous):
     """Return the prompt sections of a re-review of `git diff <tree> HEAD`, quoting the previous review."""
     quoted = previous.strip()[:PREVIOUS_LIMIT_CHARS]
-    return [DELTA_PROMPT.format(base=base, prev=prev, tree=tree, files='\n'.join(f'- {f}' for f in files)),
-            EXHAUSTIVE, f'Conclusion of the previous review ({prev}):\n<<<\n{quoted}\n>>>']
+    return [DELTA_PROMPT.format(base=base, prev=prev, tree=tree), EXHAUSTIVE,
+            f'Conclusion of the previous review ({prev}):\n<<<\n{quoted}\n>>>']
 
 
 def review_prompt(sections, governance=()):
@@ -1429,16 +1760,20 @@ def self_check(codex, work_dir, timeout=300):
 # ---- review worker ---------------------------------------------------------
 
 class Plan:
-    """How one head is reviewed: mode full or delta, the changed files, effort and (label, prompt sections) passes."""
+    """How one head is reviewed: mode, changed files, the diff range (git args and prompt text), effort, sections.
 
-    def __init__(self, mode, why, files, effort, passes, timeout, prev=None):
-        self.mode, self.why, self.files, self.effort = mode, why, files, effort
-        self.passes, self.timeout, self.prev = passes, timeout, prev
+    expected (path -> reference diff) is filled once the worktree exists, so it carries the worktree's attributes.
+    """
+
+    def __init__(self, mode, why, files, range_args, range_text, effort, sections, timeout, prev=None):
+        self.mode, self.why, self.files, self.range_args, self.range_text = mode, why, files, range_args, range_text
+        self.effort, self.sections, self.timeout, self.prev, self.expected = effort, sections, timeout, prev, {}
 
 
 class Reviewer:
-    def __init__(self, config, github, store, git, codex, stop=None):
+    def __init__(self, config, github, store, git, codex, stop=None, sessions=None):
         self.config, self.github, self.store, self.git, self.codex = config, github, store, git, codex
+        self.sessions = sessions or SessionLog(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
         self.stop = stop or threading.Event()
         self.wake = threading.Event()
         self.repo_locks = {}
@@ -1477,14 +1812,14 @@ class Reviewer:
         return None
 
     def keep_output(self, job, runs):
-        """Write every pass's codex output to state_dir/output/<job id>.log with mode 0600."""
+        """Write every review attempt's codex output to state_dir/output/<job id>.log with mode 0600."""
         path = self.config.state_dir / 'output' / f'{job.id}.log'
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             os.fchmod(handle.fileno(), 0o600)
-            for label, _, output, stderr, last, _ in runs:
-                handle.write(f'===== pass {label} =====\n' + output
+            for attempt, _, output, stderr, last, _ in runs:
+                handle.write(f'===== review {attempt} =====\n' + output
                              + ('\n--- stderr ---\n' + stderr if stderr else '')
                              + ('\n--- last message ---\n' + last + '\n' if last else '\n'))
 
@@ -1585,15 +1920,16 @@ class Reviewer:
                 files = self.git.diff_files(job.full_name, tree, job.head)
                 if files or (previous[3] == 'clean' and '\n\n[truncated' not in previous[1]):
                     effort = choose_effort(self.config.effort_rules, job.full_name, files)
-                    sections = delta_prompt(base, previous[0], tree, files, previous[1])
-                    return Plan('delta', why, files, effort, [('复审', sections)], self.config.timeout_seconds,
-                                previous[0])
+                    sections = delta_prompt(base, previous[0], tree, previous[1])
+                    return Plan('delta', why, files, [tree, job.head], f'{tree} HEAD', effort, sections,
+                                self.config.timeout_seconds, previous[0])
                 why = (f'the delta since {previous[0][:12]} is empty but the review of that head was '
                        f'{previous[3]}{" and truncated" if "[truncated" in previous[1] else ""}, so it is not '
                        'known to be clean')
-        files = self.git.changed_files(job.full_name, base, job.head)
-        return Plan('full', why, files, FIRST_ROUND_EFFORT,
-                    [(label, first_prompt(base, lens)) for label, lens in LENSES], self.config.first_timeout_seconds)
+        merge_base = self.git.merge_base(job.full_name, base, job.head)
+        files = self.git.changed_files(job.full_name, merge_base, job.head)
+        return Plan('full', why, files, [f'{merge_base}...{job.head}'], f'{merge_base}...HEAD',
+                    FIRST_ROUND_EFFORT, first_prompt(base, merge_base), self.config.first_timeout_seconds)
 
     def recheck(self, job, base):
         """Return (token, None) when the live PR still matches the job and its base, else (None, outcome)."""
@@ -1608,12 +1944,11 @@ class Reviewer:
             return None, None
         return token, None
 
-    def scope(self, plan, job, base, passes=()):
+    def scope(self, plan, job, base):
         if plan.mode == 'delta':
             return (f'复审：只审增量 `{plan.prev[:12]}..{job.head[:12]}`（不含从 origin/{base} 合入的改动，含解冲突的改动），'
                     f'{len(plan.files)} 个文件，effort={plan.effort}。')
-        return (f'首轮全面审查：{len(passes)} 遍独立审查（{"、".join(label for label, _ in passes)}），effort={plan.effort}，'
-                f'发现合并去重。选择首轮的原因：{plan.why}。')
+        return f'首轮全面审查：{len(plan.files)} 个文件，effort={plan.effort}。选择首轮的原因：{plan.why}。'
 
     def _review(self, job):
         token = self.github.token(job.installation)
@@ -1639,6 +1974,7 @@ class Reviewer:
             log(f'{job}: mode={plan.mode} effort={plan.effort} files={len(plan.files)}: {plan.why}')
             if plan.files or plan.mode == 'full':
                 self.git.add_worktree(job.full_name, worktree, job.head)
+                plan.expected = self.git.file_diffs(worktree, plan.range_args, plan.files)
         if plan.mode == 'delta' and not plan.files:
             shutil.rmtree(scratch, ignore_errors=True)
             token, outcome = self.recheck(job, base)
@@ -1648,27 +1984,44 @@ class Reviewer:
                 job.head, 'clean', '', [], effort='none', mode='delta', scope=(
                     f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
                     '合入的改动），未调用 codex。')), [], token)
-        runs = []
+        runs, unread_counts, coverage = [], [], ''
         try:
             governance = prefetch_governance(self.github, token, worktree, scratch / 'governance')
             for doc in governance:
                 if doc.error:
                     log(f'{job}: governance issue {doc.ref} not prefetched: {doc.error}')
             running = lambda: not self.stop.is_set() and self.store.status(job.id) == 'running'  # noqa: E731
-            for index, (label, sections) in enumerate(plan.passes, 1):
+            manifest = scratch / 'changed-files.txt'
+            manifest.write_text(''.join(f'{path}\n' for path in plan.files), encoding='utf-8')
+            sections = plan.sections + [read_rule(plan.range_text, manifest, len(plan.files))]
+            unread = []
+            for attempt in range(1, READ_ATTEMPTS + 1):
                 if not running():
                     break
-                directory = scratch / f'pass{index}'
+                directory = scratch / f'review{attempt}'
                 directory.mkdir(parents=True, exist_ok=True)
-                log(f'{job}: codex {plan.mode} pass {label} started against origin/{base} effort={plan.effort}')
+                if unread:
+                    listed = directory / 'unread-files.txt'
+                    listed.write_text(''.join(f'{path}\n' for path, _ in unread), encoding='utf-8')
+                    sections = sections[:len(plan.sections) + 1] + [read_retry_rule(attempt, listed, len(unread))]
+                log(f'{job}: codex {plan.mode} review {attempt}/{READ_ATTEMPTS} started against origin/{base} '
+                    f'effort={plan.effort}')
                 started = time.time()
                 result = self.codex(job.id, worktree, sections, plan.effort, plan.timeout, directory, running,
                                     governance)
-                log(f'{job}: codex pass {label} finished rc={result[0]} timed_out={result[4]} '
+                log(f'{job}: codex review {attempt} finished rc={result[0]} timed_out={result[4]} '
                     f'after {int(time.time() - started)} s')
-                runs.append((label, *result))
+                runs.append((attempt, *result))
                 if result[0] != 0 or result[4]:
                     break
+                events = read_events(result[1])
+                outputs, error = self.sessions.outputs(thread_id(events), started)
+                unread = unread_files(plan.expected, evidence_lines(outputs, events) if not error else [])
+                unread_counts.append(len(unread))
+                coverage = unread_note(unread, len(plan.expected), error) if unread else ''
+                if not unread:
+                    break
+                log(f'{job}: review {attempt}/{READ_ATTEMPTS}: {coverage}')
         finally:
             with self.repo_lock(job.full_name):
                 self.git.remove_worktree(job.full_name, worktree)
@@ -1679,63 +2032,51 @@ class Reviewer:
         if self.stop.is_set():
             self.store.retry(job.id, 0, count_attempt=False)
             return None
-        if not runs or any(run[1] is None for run in runs):
+        if not runs or runs[-1][1] is None:
             log(f'{job}: codex not started; job is {self.store.status(job.id)}')
             return self.store.status(job.id)
         token, outcome = self.recheck(job, base)
         if token is None:
             return outcome
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
+        attempt, rc, output, stderr, last, timed_out = runs[-1]
+        reads = (f'本 head 审查 {attempt} 次（上限 {READ_ATTEMPTS}）；各次未读全的文件数：'
+                 f'{"、".join(str(n) for n in unread_counts) or "未核验"}。')
         common = dict(effort=plan.effort, kept=kept, governance=governance, mode=plan.mode,
-                      scope=self.scope(plan, job, base, plan.passes))
-        for label, rc, output, stderr, last, timed_out in runs:
-            upstream = None if timed_out else transient_error(rc, read_events(output))
-            if upstream is not None:
-                body = self.defer_or_give_up(job, upstream, plan.effort, kept, governance, plan.mode)
-                if body is None:
-                    return None
-                self.keep_output(job, runs)
-                return self.publish(job, 'failed', body, [], token)
+                      scope=self.scope(plan, job, base) + reads)
+        events = read_events(output)
+        upstream = None if timed_out else transient_error(rc, events)
+        if upstream is not None:
+            body = self.defer_or_give_up(job, upstream, plan.effort, kept, governance, plan.mode)
+            if body is None:
+                return None
+            self.keep_output(job, runs)
+            return self.publish(job, 'failed', body, [], token)
         self.store.clear_transient(job.id)
-        timed = [label for label, *_, timed_out in runs if timed_out]
-        if timed:
+        if timed_out:
             self.keep_output(job, runs)
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
-                f'codex pass {timed[0]} timed out after {plan.timeout} s'), **common), [], token)
-        verdict, body, findings, unposted = self.conclude(job, plan, runs, worktree, common)
+                f'codex review {attempt} timed out after {plan.timeout} s'), **common), [], token)
+        verdict, body, findings = self.conclude(job, plan, rc, events, last, worktree, common, coverage)
         comments = []
         if findings:
             comments = inline_comments(findings, diff_lines(self.github.pull_files(job.full_name, job.number, token)))
-        if verdict == 'failed' or unposted or len(body) > BODY_LIMIT:
+        if verdict == 'failed' or coverage or len(body) > BODY_LIMIT:
             self.keep_output(job, runs)
         return self.publish(job, verdict, body, comments, token)
 
-    def conclude(self, job, plan, runs, worktree, common):
-        """Assess every pass and merge them; returns (verdict, body, posted findings, unposted count)."""
+    def conclude(self, job, plan, rc, events, last, worktree, common, coverage=''):
+        """Assess the codex output against the plan; returns (verdict, body, findings)."""
         roots = (str(worktree), os.path.realpath(worktree))
-        verdicts, reasons, summaries, posted, unposted, unparsed, promoted, registered = ([] for _ in range(8))
-        for label, rc, output, _, last, _ in runs:
-            events = read_events(output)
-            verdict, review, why = assess(rc, events, final_message(events, last), roots, plan.mode == 'delta')
-            verdicts.append(verdict)
-            reasons += [f'{label}: {reason}' for reason in why]
-            posted.append((label, review.posted))
-            unposted += [f'{label}: {f.heading()}' for f in review.low] + [f'{label}: {i}' for i in review.low_items]
-            summaries.append(f'**{label}**\n\n{review.text}' if len(runs) > 1 and review.text else review.text)
-            unparsed += review.unparsed
-            promoted += review.promoted
-            registered += review.registered
-        for line in unposted:
-            log(f'{job}: not posted, confidence missing or below {CONFIDENCE_FLOOR}: {line[:300]}')
-        if 'failed' in verdicts:
+        verdict, review, reasons = assess(rc, events, final_message(events, last), roots, plan.mode == 'delta',
+                                          coverage)
+        if verdict == 'failed':
             log(f'{job}: codex output rejected: {"; ".join(reasons)}')
             return 'failed', review_body(job.head, 'failed', '', [], reasons=reasons,
-                                         reason='codex output did not pass the review checks', **common), [], 0
-        findings = merge_findings(posted)
-        verdict = 'findings' if 'findings' in verdicts else 'clean'
-        body = review_body(job.head, verdict, '\n\n'.join(s for s in summaries if s), findings, unparsed=unparsed,
-                           promoted=promoted, register=registered, unposted=len(unposted), **common)
-        return verdict, body, findings, len(unposted)
+                                         reason='codex output did not pass the review checks', **common), []
+        body = review_body(job.head, verdict, review.text, review.findings, unparsed=review.unparsed,
+                           promoted=review.promoted, register=review.registered, coverage=coverage, **common)
+        return verdict, body, review.findings
 
 
 # ---- entry point -----------------------------------------------------------

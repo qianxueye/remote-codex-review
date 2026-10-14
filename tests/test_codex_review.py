@@ -19,6 +19,7 @@ import codex_review as cr  # noqa: E402
 
 HEAD = 'a' * 40
 NEW_HEAD = 'b' * 40
+MERGE_BASE = 'e' * 40
 SECRET = b'webhook-secret'
 REPO = 'Example-Org/Example-Repo'
 WORKTREE = '/var/lib/codex-review/work/7/tree'
@@ -26,16 +27,34 @@ WORKTREE = '/var/lib/codex-review/work/7/tree'
 CLEAN = 'The change is consistent with its callers; no defects found.\nVERDICT: CLEAN'
 
 
-def events_jsonl(message, read=True):
-    """Return a minimal `codex exec --json` stream: one successful command, the message, a completed turn."""
+def file_diff(path):
+    """Return the diff text FakeGit expects codex to show for path."""
+    return f'diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new {path}\n'
+
+
+def events_jsonl(message, read=True, outputs=None, exit_code=0):
+    """Return a minimal `codex exec --json` stream: commands, the message, a completed turn."""
     events = [{'type': 'thread.started', 'thread_id': 't-1'}, {'type': 'turn.started'}]
-    if read:
+    for index, output in enumerate(outputs if outputs is not None else [file_diff('x')] if read else []):
         events.append({'type': 'item.completed', 'item': {
-            'id': 'item_0', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff origin/main...HEAD'",
-            'aggregated_output': 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n', 'exit_code': 0, 'status': 'completed'}})
+            'id': f'item_{index}', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff'",
+            'aggregated_output': output, 'exit_code': exit_code, 'status': 'completed'}})
     events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
     events.append({'type': 'turn.completed', 'usage': {}})
     return '\n'.join(json.dumps(event) for event in events) + '\n'
+def session_item(output, exit_code=0, truncated=False, session_id=None):
+    """Return one code-mode tool-output item as codex records it in the session rollout.
+
+    A chunk of a command still running carries `session_id` and no `exit_code` (exit_code=None).
+    """
+    chunk = {'chunk_id': 'c1', 'wall_time_seconds': 0.1}
+    chunk.update({'exit_code': exit_code} if exit_code is not None else {'session_id': session_id})
+    chunk = json.dumps({**chunk, 'original_token_count': 1, 'output': output})
+    warning = 'Warning: truncated output (original token count: 9999)\nTotal output lines: 1\n\n' if truncated else ''
+    return [{'type': 'input_text', 'text': 'Script completed\nWall time 0.1 seconds\nOutput:\n'},
+            {'type': 'input_text', 'text': warning + chunk}]
+
+
 FINDINGS = f"""Two defects remain.
 
 Full review comments:
@@ -143,7 +162,12 @@ class FakeGit:
         self.fetched.append((full_name, number, base))
         return getattr(self, 'head', HEAD)
 
-    def changed_files(self, full_name, base, head):
+    def merge_base(self, full_name, base, head):
+        self.merge_base_of = (base, head)
+        return MERGE_BASE
+
+    def changed_files(self, full_name, merge_base, head):
+        self.changed_from = merge_base
         return getattr(self, 'files', ['src/app.py'])
 
     def delta_tree(self, full_name, base, prev, head, scratch):
@@ -154,6 +178,12 @@ class FakeGit:
 
     def diff_files(self, full_name, tree, head):
         return getattr(self, 'delta_files', ['src/fix.py'])
+
+    def file_diffs(self, worktree, range_args, files):
+        self.ranges = getattr(self, 'ranges', []) + [range_args]
+        self.diff_worktrees = getattr(self, 'diff_worktrees', []) + [worktree]
+        self.expected = {path: file_diff(path) for path in files}
+        return self.expected
 
     def add_worktree(self, full_name, path, head):
         path.mkdir(parents=True)
@@ -172,6 +202,15 @@ class FakeCodex:
         self.calls = []
         self.cancelled = []
         self.governance = None
+        self.git = None
+        self.read = None
+        self.reads = []
+        self.outputs = None
+        self.truncate = False
+        self.exit_code = 0
+        self.shown = []
+        self.manifests = []
+        self.unread_lists = []
 
     def __call__(self, job_id, worktree, sections, effort, timeout, scratch, proceed, governance=()):
         if getattr(self, 'before_proceed', None):
@@ -181,12 +220,27 @@ class FakeCodex:
         self.calls.append((job_id, worktree, cr.review_prompt(sections, governance), effort))
         if self.messages:
             self.message = self.messages.pop(0)
+        if self.reads:
+            self.read = self.reads.pop(0)
         self.governance = [(doc.ref, doc.path, doc.path.read_text() if doc.path else None, doc.error)
                            for doc in governance]
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))
-        events = self.events if self.events is not None else events_jsonl(message)
+        manifest, listed = Path(scratch).parent / 'changed-files.txt', Path(scratch) / 'unread-files.txt'
+        self.manifests.append(manifest.read_text(encoding='utf-8') if manifest.exists() else None)
+        self.unread_lists.append(listed.read_text(encoding='utf-8') if listed.exists() else None)
+        expected = getattr(self.git, 'expected', None)
+        if self.outputs is not None:
+            outputs = list(self.outputs)
+        elif expected is None:
+            outputs = [file_diff('x')]
+        else:
+            outputs = [expected[p] for p in (self.read if self.read is not None else expected)]
+        self.shown.append([session_item(text, self.exit_code, self.truncate) for text in outputs])
+        events = self.events
+        if events is None:
+            events = events_jsonl(message, outputs=outputs, exit_code=self.exit_code)
         return self.rc, events, 'progress\n', message, self.timed_out
 
     def cancel(self, job_ids):
@@ -194,6 +248,19 @@ class FakeCodex:
 
     def cancel_all(self):
         pass
+
+
+class FakeSessions:
+    """Hands back what FakeCodex showed the model in its latest call, or a configured read error."""
+
+    def __init__(self, codex):
+        self.codex, self.error, self.calls = codex, None, []
+
+    def outputs(self, thread, since):
+        self.calls.append((thread, since))
+        if self.error:
+            return [], self.error
+        return (self.codex.shown[-1] if self.codex.shown else []), None
 
 
 class Harness(unittest.TestCase):
@@ -205,7 +272,10 @@ class Harness(unittest.TestCase):
         self.github = FakeGitHub()
         self.git = FakeGit(self.root)
         self.codex = FakeCodex(CLEAN)
-        self.reviewer = cr.Reviewer(self.config, self.github, self.store, self.git, self.codex)
+        self.codex.git = self.git
+        self.sessions = FakeSessions(self.codex)
+        self.reviewer = cr.Reviewer(self.config, self.github, self.store, self.git, self.codex,
+                                    sessions=self.sessions)
         self.app = cr.WebhookApp(self.config, self.store, SECRET, on_queued=self.reviewer.on_queued)
 
     def tearDown(self):
@@ -373,8 +443,8 @@ class ReviewTests(Harness):
         post = self.github.posted[0]
         self.assertIn(f'<!-- remote-codex-review head={HEAD} verdict=clean effort=xhigh tests=read-only mode=full -->',
                       post['body'])
-        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh', 'xhigh'])
-        self.assertIn('git diff origin/main...HEAD', self.codex.calls[0][2])
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'])
+        self.assertIn(f'git diff {MERGE_BASE}...HEAD', self.codex.calls[0][2])
         self.assertEqual(self.git.removed, [self.git.work / str(job.id) / 'tree'])
 
     def test_existing_marker_on_github_skips_codex(self):
@@ -454,7 +524,8 @@ class ReviewTests(Harness):
         _, status = self.run_next()
         self.assertEqual(status, 'clean')
         self.assertEqual(self.git.fetched[0][2], 'develop')
-        self.assertIn('git diff origin/develop...HEAD', self.codex.calls[0][2])
+        self.assertEqual(self.git.merge_base_of, ('develop', HEAD))
+        self.assertIn("against the base branch 'origin/develop', from their merge base", self.codex.calls[0][2])
 
     def test_base_changed_during_review_requeues_without_posting(self):
         self.deliver(pull_payload())
@@ -488,7 +559,7 @@ class ReviewTests(Harness):
             self.github.draft = True
         self.codex.during = to_draft
         _, status = self.run_next()
-        self.assertEqual((status, len(self.codex.calls), self.github.posted), ('skipped', 2, []))
+        self.assertEqual((status, len(self.codex.calls), self.github.posted), ('skipped', 1, []))
 
     def test_findings_posted_inline_and_in_body(self):
         self.codex.message = FINDINGS
@@ -649,7 +720,7 @@ class EffortTests(unittest.TestCase):
             harness.git.delta_files = ['docs/wiki/a.md']
             harness.deliver(pull_payload(head=NEW_HEAD), guid='d-2')
             harness.run_next()
-            self.assertEqual([call[3] for call in harness.codex.calls], ['xhigh', 'xhigh', 'medium'])
+            self.assertEqual([call[3] for call in harness.codex.calls], ['xhigh', 'medium'])
             self.assertIn('verdict=clean effort=medium tests=read-only mode=delta -->',
                           harness.github.posted[1]['body'])
         finally:
@@ -688,14 +759,14 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(cr.MARKER_RE.search(body).group(1), HEAD)
 
     def test_command_is_read_only_and_forbids_tests(self):
-        sections = cr.first_prompt('main', cr.LENSES[0][1])
+        sections = cr.first_prompt('main', MERGE_BASE)
         command = cr.CodexRunner('codex').command(sections, '/w/last.txt', 'high')
         self.assertEqual(command, ['codex', 'exec', '--json', '--sandbox', 'read-only',
                                    '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
                                    'review', cr.review_prompt(sections), '-o', '/w/last.txt'])
         self.assertNotIn('--base', command)
         prompt = command[-3]
-        self.assertIn('git diff origin/main...HEAD', prompt)
+        self.assertIn(f'git diff {MERGE_BASE}...HEAD', prompt)
         self.assertIn('do not run pytest, vitest or any other test suite', prompt)
         self.assertIn('本次为只读审查，未运行测试', prompt)
         self.assertIn('`VERDICT: CLEAN`', prompt)
