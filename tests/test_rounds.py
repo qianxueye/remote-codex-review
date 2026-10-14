@@ -124,8 +124,9 @@ class ReadCoverageTests(Rounds):
         self.assertIn('**阅读不完整**：1 个改动文件（共 2 个）没有在合格的命令输出中读全：`src/b.py`（未读）。', body)
         self.assertIn('Retry never stops', body)
 
-    def test_output_over_the_limit_is_not_evidence(self):
-        padded = cr_file_diff('src/app.py') + '+' + 'x' * cr.READ_LIMIT + '\n'
+    def test_output_over_20000_bytes_is_not_evidence(self):
+        self.assertEqual(cr.READ_LIMIT, 20000)
+        padded = cr_file_diff('src/app.py') + '+' + 'x' * 20000 + '\n'
         self.codex.events = self.events([padded, cr_file_diff('src/b.py')])
         self.deliver(pull_payload())
         _, status = self.run_next()
