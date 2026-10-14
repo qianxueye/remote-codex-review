@@ -70,8 +70,8 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 - 正文包含结论摘要和每条发现的完整内容。发现中的 `路径:行号` 去掉工作树前缀后，如果该行在 PR diff 的右侧，再另外作为行内评论。GitHub 对整条 review 返回 422 时，去掉全部行内评论重发一次；因为正文本来就包含全部发现，所以不会丢失内容。
 - 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。`verdict=invalid` 的标记不算，所以作废后重新入队的 head 会再审一次。
 - 结论判定（§2.4.1）默认为 `failed`。最终消息优先取 `-o` 输出文件，取不到时取 `--json` 事件流中最后一条 `agent_message`。
-- codex 因上游临时故障失败时先按 §2.4.2 重试，不发 review。超时（复审每遍默认 40 分钟，首轮每遍默认 60 分钟，见 §2.6.5）或判定为 `failed` 时，发 `verdict=failed`，正文写明「This is not a pass」，并逐条列出未通过的检查。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--enqueue`。
-- 结论为 `failed`，有置信度不足而未发布的发现（§2.4.1），或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
+- codex 因上游临时故障失败时先按 §2.4.2 重试，不发 review。超时（复审默认 40 分钟，首轮默认 60 分钟，见 §2.6.5）或判定为 `failed` 时，发 `verdict=failed`，正文写明「This is not a pass」，并逐条列出未通过的检查。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--enqueue`。
+- 结论为 `failed`，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
 - GitHub 或 git 出错（不是 codex 本身失败）时，任务重新排队，等待 5 分钟乘以已失败次数后再试。累计 `CODEX_REVIEW_MAX_ATTEMPTS`（默认 3）次仍失败时，发 `failed` 标记。
 
 #### 2.4.1 结论判定
@@ -79,16 +79,18 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独保存。事件格式见 §9。
 
 - 每条发现必须带置信度（0–100）。提示要求 codex 在每条发现正文末尾写一行 `Confidence: <0-100>`；codex 0.160.1 的 `--json` 输出和最终消息都不含 review 模式的结构化 `confidence_score`，所以只能从文字中读。文字写成 `confidence_score: 0.8` 时按 0–1 刻度乘以 100；`Confidence:` 后的值超过 100、`confidence_score` 超过 1，或没有写，都按缺失处理。
-- 置信度 ≥ 50 的发现才发布到 PR（正文和行内评论都标出「置信度 NN」），并参与判定。比较用未取整的精确值，例如 `Confidence: 49.6`、`confidence_score: 0.496` 都低于 50，不发布；只有正文显示时取整。低于 50 或缺失的发现不发布、不计入判定：日志中每条记一行 `not posted, confidence missing or below 50`，完整输出按 §2.4 写入 `output/<任务 id>.log`，正文最后一行写「另有 N 条置信度低于 50 的发现未提交」。
-- codex 退出码为 0、有最终消息，并且有置信度 ≥ 50 的发现时，判为 `findings`。只要有一行看起来是发现标题（以 `[P0]` 到 `[P3]` 开头，前面可以有 `-`、`*`、序号或 `**`），却不符合 `- [P<n>] <标题> — <路径>:<行>[-<行>]` 的格式，就判为 `findings`，不论其余发现解析得怎样、置信度多少；这行原文留在正文的摘要里。路径可以用反引号包住，以容纳空格，例如 `` `src/order handler.py:12-14` ``。解析不了的条目连同其后的缩进正文，列在正文「未能解析的发现（按发现处理）」一节；置信度低于 50 的已解析发现不会因此重新出现在正文中，「另有 N 条…未提交」只统计这些已解析的低置信度发现和登记行。最终消息含 `[P0]` 到 `[P3]` 标记却解析不出任何一条发现，或者写了 `VERDICT: FINDINGS` 却没有任何发现时，也判为 `findings`，相关文字在正文摘要中。这些都是解析失败，不是「没写置信度的发现」，因此一律从严处理。
+- 能解析的发现全部发布到 PR 并参与判定，不设置信度门槛（业主 2026-10-14「只显示分数吧」，取代 10-13 的「置信度 50 以上才提交」）。正文和行内评论都标出「置信度 NN」，显示时取整；缺失的标「置信度未给出」。
+- codex 退出码为 0、有最终消息，并且有解析出的发现时，判为 `findings`。只要有一行看起来是发现标题（以 `[P0]` 到 `[P3]` 开头，前面可以有 `-`、`*`、序号或 `**`），却不符合 `- [P<n>] <标题> — <路径>:<行>[-<行>]` 的格式，就判为 `findings`，不论其余发现解析得怎样；这行原文留在正文的摘要里。路径可以用反引号包住，以容纳空格，例如 `` `src/order handler.py:12-14` ``。解析不了的条目连同其后的缩进正文，列在正文「未能解析的发现（按发现处理）」一节。最终消息含 `[P0]` 到 `[P3]` 标记却解析不出任何一条发现，或者写了 `VERDICT: FINDINGS` 却没有任何发现时，也判为 `findings`，相关文字在正文摘要中。这些都是解析失败，因此一律从严处理。
+- 完整阅读核验（业主 2026-10-14「同意补上完整阅读核验」）。服务在 bare 镜像中按这一遍的范围算出应读清单和每个文件的参考 diff：首轮是 `git diff --no-renames refs/remotes/origin/<base>...<head> -- <路径>`，复审是 `git diff --no-renames <增量基准树> <head> -- <路径>`，路径来自同一范围的 `--name-only --no-renames`（改名列为旧路径和新路径两个文件）。然后取事件流中 `status=completed`、`exit_code=0`、`aggregated_output` 按 UTF-8 不超过 `READ_LIMIT`（20000 字节）的命令，把它们的输出按行合并成集合；参考 diff 的每一行（`diff --git` 头、`index`、`old mode`/`new mode`、`Binary files … differ`、`deleted file mode`、hunk 头和每一行内容）都要出现在集合里，文件才算读全。二进制、只改权限、删除、改名的文件没有 `@@` 行，但同样有 `diff --git` 头和若干元数据行，按同一规则判定。头行都没出现的记为「未读」，头行出现但有行缺失的记为「部分」。限制 20000 字节的原因：codex 在 code-mode 下给模型看的单条命令输出约 1 万 token 就截断，而 `--json` 事件里的 `aggregated_output` 是完整输出，看不到截断；只承认整条输出不超过 20000 字节的命令，才能保证模型看到的与服务核对的是同一份文本。提示（`READ_RULE`）相应要求 codex 先列文件，再逐个文件 `git diff --no-renames <范围> -- <路径>`，过长的用 `| sed -n '<起>,<止>p'` 分段，每段不超过 150 行，并在结论里写明读过的文件数和总数（服务不解析这句话，只按上面的证据核对）。缺任何一个文件时：这一遍没有发现就判 `failed`，正文的检查清单中列出未读全的文件；有发现则照常发 `findings`，正文开头加一行「**阅读不完整**：…」列出这些文件。不设排除清单，生成文件、锁文件也要读。
 
-每一遍的最终消息只经过一次 `read_review()`，拆成摘要、已解析发现、未能解析的发现块、登记行四部分；`assess()` 据此判定，`conclude()` 只负责合并各遍结果和渲染正文。
+最终消息只经过一次 `read_review()`，拆成摘要、已解析发现、未能解析的发现块、登记行四部分；`assess()` 据此判定（含完整阅读核验），`conclude()` 只负责渲染正文。
 - 同时满足以下全部条件时，判为 `clean`：
   1. codex 退出码为 0；
   2. 事件流中有 `turn.completed`，没有 `turn.failed`、`error` 条目和顶层 `error` 事件。例外：回合正常完成时，内容属于临时故障的顶层 `error` 事件（例如 `Reconnecting... 2/5 (unexpected status 503 …)`）只是 codex 自动重连的通知，不计；
   3. 至少有一条 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，并且它的 `aggregated_output` 含有统一 diff 的结构：一行以 `diff --git a/` 或 `diff --git "a/` 开头（后者是 git 默认 `core.quotePath=true` 时非 ASCII 路径的写法），另有至少一行以 `@@ ` 开头的 hunk 头。合并提交的组合 diff（`diff --cc`、`diff --combined`，hunk 头为 `@@@ `）不算，因为它只含合并时的冲突处理，不是 PR 相对 base 的改动。这一条只看命令的输出，不分析命令怎么写；输出被截断时，只要剩下的部分仍有这两种行就算。只跑过 `git status`、`ls`、`git -v`、`echo`、`git diff --stat` 的不算。与 base 没有任何差别的 PR，`git diff` 输出为空，也按这一条判 `failed`，原因中写明这种情况；服务目前没有单独的「无改动」处理。只改二进制文件或只改名的 PR 没有 hunk 头，同样判 `failed`；
   4. 最终消息中没有 codex 说自己没能完成审查的语句。这一条只拦截意思明确的说法：`Reviewer failed to output a response.`、`Review blocked`、`the verdict is a placeholder`、`I could not read`、`The reviewer was unable to read`、`unable to read the diff`、`the review is incomplete`、`codex-code-mode-host is missing`、「我无法读取」、「本次审查无法读取文件」、「审查未完成」、「未能读取 diff」，完整列表见 `codex_review.py` 的 `FAILURE_SIGNAL_RE`。结论描述被审代码时也会用到的词不在列表中，例如单独的 blocked、placeholder、cannot view、no such file or directory、工具缺失；工具坏到读不了 diff 的情况由第 3 条判定；
-  5. 最终消息中恰好有一行 `VERDICT: CLEAN`。发现全部因置信度不足未发布，或复审中只有登记项（§2.6.5）时，恰好一行 `VERDICT: FINDINGS` 也可以；前 4 条照样全部要求。
+  5. 最终消息中恰好有一行 `VERDICT: CLEAN`。复审中只有登记项（§2.6.5）时，恰好一行 `VERDICT: FINDINGS` 也可以；前 4 条照样全部要求；
+  6. 完整阅读核验通过：应读清单中没有「未读」或「部分」的文件。
 - 其余情况一律判为 `failed`。
 
 第 5 条的结论行来自提示词：提示要求 codex 在 `overall_explanation` 末尾写 `VERDICT: CLEAN`、`VERDICT: FINDINGS` 或 `VERDICT: BLOCKED`。`--json` 事件流不包含 review 模式的结构化字段 `overall_correctness`，而且工具失败时 codex 仍可能把该字段填成占位值，所以不用它判定。结论行写在 `overall_explanation` 内，因为 codex 只取模型输出中的 JSON 对象，对象之外的文字会被丢弃。
@@ -103,8 +105,7 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 - 自第一次临时故障起，已过时间加下一次延迟超过 `CODEX_REVIEW_RETRY_WINDOW_SECONDS`（默认 7200）时不再重试，发 `failed`，正文写明临时故障次数、持续时间和最后一条错误原文。默认参数下最多运行 8 次 codex。
 - 重试状态存放在 `state.sqlite` 的 `retries` 表，任务以 `queued` 状态等待，服务重启后照常继续。
 - 等待重试期间 PR 收到新 head，或重试前查询发现 head 已变，旧任务按 §2.3 标为 `superseded`。同一 head 再次入队时重新计算重试时长。
-- 服务停机（SIGTERM）时，正在运行的 codex 进程被终止；每一遍开始前和启动 codex 的加锁检查中都会查看停机标志，停机后不再启动下一遍，任务回到队列。
-- 首轮的两遍中任何一遍遇到临时故障，整个任务按上述规则重新排队，重试时两遍都重新运行。
+- 服务停机（SIGTERM）时，正在运行的 codex 进程被终止；启动 codex 的加锁检查中会查看停机标志，停机后不再启动，任务回到队列。
 - 本服务自己的超时不算临时故障，直接发 `failed`：一次审查跑满超时后再重试，2 小时内最多再跑两次，代价高且多半同样超时。
 
 ### 2.5 漏投补救
@@ -123,7 +124,7 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 
 - 每个仓库在 `/var/lib/codex-review/mirrors/<owner>/<repo>.git` 维护一份 bare 镜像。每次 fetch 取回 `refs/pull/<n>/head` 和 base 分支，base 写到 `refs/remotes/origin/<base>`。
 - installation token 通过环境变量 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` 设置 `http.https://github.com/.extraheader`，不出现在命令行参数、URL 或日志里。
-- 每个任务在 `/var/lib/codex-review/work/<任务 id>/tree` 建一个 detached 工作树，结束后删除。每一遍 codex 的事件流和标准错误写在同一任务目录的 `pass<n>/events.jsonl`、`pass<n>/stderr.log`。服务启动时会清掉上次残留的工作树。需要保留的输出按 §2.4 另存到 `output/`，不随工作树删除。
+- 每个任务在 `/var/lib/codex-review/work/<任务 id>/tree` 建一个 detached 工作树，结束后删除。codex 的事件流和标准错误写在同一任务目录的 `codex/events.jsonl`、`codex/stderr.log`。服务启动时会清掉上次残留的工作树。需要保留的输出按 §2.4 另存到 `output/`，不随工作树删除。
 - codex 命令（`<effort>` 的取法见 §2.6.1，只读规则见 §2.6.2）：
 
   ```
@@ -133,14 +134,14 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
     review "<提示>" -o <工作目录>/last-message.txt
   ```
 
-  提示由 `codex_review.py` 的 `review_prompt()` 生成：首轮要求 codex 运行 `git diff origin/<base>...HEAD`，复审要求运行 `git diff <增量基准树> HEAD`（§2.6.5）；两者都要求列出全部发现、不设条数上限，每条带置信度，并按 §2.4.1 写结论行。`codex exec review` 不允许 `--base` 和自定义提示同时出现，所以命令不带 `--base`，改在提示中写明对比 `origin/<base>`；`origin/<base>` 是 bare 镜像中的 `refs/remotes/origin/<base>`，工作树可以直接引用。`read-only` 沙箱不允许 codex 执行的命令写文件，也不允许访问网络。`approval_policy="never"` 使 codex 不会停下来等待批准。配置键的出处见 §9。
+  提示由 `codex_review.py` 的 `review_prompt()` 生成：首轮要求 codex 运行 `git diff origin/<base>...HEAD`，复审要求运行 `git diff <增量基准树> HEAD`（§2.6.5）；两者都要求先列出改动文件再逐个读完 diff（§2.4.1 的完整阅读核验）、列出全部发现、不设条数上限，每条带置信度，并按 §2.4.1 写结论行。`codex exec review` 不允许 `--base` 和自定义提示同时出现，所以命令不带 `--base`，改在提示中写明对比 `origin/<base>`；`origin/<base>` 是 bare 镜像中的 `refs/remotes/origin/<base>`，工作树可以直接引用。`read-only` 沙箱不允许 codex 执行的命令写文件，也不允许访问网络。`approval_policy="never"` 使 codex 不会停下来等待批准。配置键的出处见 §9。
 - codex 自己的 `config.toml`（`/var/lib/codex-review/.codex/config.toml`）由 `deploy/codex-config.toml` 模板生成，只含模型和 provider，不含任何密钥。
 
 #### 2.6.1 推理档位
 
 首轮（`mode=full`）一律用 `xhigh`，不看改动文件，这是业主对首轮全面审查的裁定。
 
-复审（`mode=delta`）的档位按增量中的文件决定，增量文件取自 `git diff --name-only --no-renames <增量基准树> <head>`；`--no-renames` 使改名同时列出旧路径和新路径。复审沿用原先单遍审查的 `high`、纯文档 `medium` 两档，不用 `xhigh`：同一 PR 已经过两遍 `xhigh` 首轮，复审只读上次已审 head 之后的改动，范围小；本地合并列车的复审也用同样的两档。
+复审（`mode=delta`）的档位按增量中的文件决定，增量文件取自 `git diff --name-only --no-renames <增量基准树> <head>`；`--no-renames` 使改名同时列出旧路径和新路径。复审沿用 `high`、纯文档 `medium` 两档，不用 `xhigh`：同一 PR 已经过 `xhigh` 首轮，复审只读上次已审 head 之后的改动，范围小；本地合并列车的复审也用同样的两档。
 
 - 改动文件全部匹配 `medium` 表中的某个模式，并且没有一个匹配 `high` 表时，用 `medium`；
 - 其余情况一律用 `high`，包括没有任何改动文件的情况。
@@ -190,16 +191,15 @@ codex 的回合没有正常完成（退出码非 0 或有 `turn.failed`），并
 
 - 上一个已审 head：`state.sqlite` 的 `jobs` 表中，同一仓库、同一 PR、不同于当前 head、状态为 `clean` 或 `findings` 且有 review id 的任务，按完成时间取最新的一条（最多看 5 条）。服务再用 `GET /repos/<owner>/<repo>/pulls/<n>/reviews/<review id>` 读回该条 review：标记的 head 必须一致，verdict 必须仍是 `clean` 或 `findings`；被 `--invalidate` 作废或已删除（404）的跳过，看下一条。`failed`、`superseded`、`skipped` 的任务不算已审。同一 head 作废后重新入队时，它自己不会被当成上一个已审 head。
 - 每次审查开始时，把实际使用的 base 分支（从实时 PR 读取）写入该任务的 `jobs.base_ref`。
-- 首轮（`mode=full`）：找不到上一个已审 head、PR 的 base 分支与上一个已审 head 审查时的 base 不同（PR 改了目标分支）、上一个已审 head 已不在 bare 镜像中、它不是新 head 的祖先（例如 force-push 或 rebase），或计算增量基准失败时，做首轮。首轮跑两遍独立审查，档位 `xhigh`，每遍的超时为 `CODEX_REVIEW_FIRST_TIMEOUT_SECONDS`（默认 3600 秒）。第一遍侧重改动本身的正确性，第二遍侧重调用方与边界输入。两遍都通过 §2.4.1 的检查后合并：同一文件中行号范围重叠的发现折叠为一条，另一遍的报告附在其下；按优先级排序。任一遍判为 `failed`，或超时，整轮发 `failed`；第一遍 codex 退出码非 0 或超时时，不再跑第二遍。正文写明选择首轮的原因。
+- 首轮（`mode=full`）：找不到上一个已审 head、PR 的 base 分支与上一个已审 head 审查时的 base 不同（PR 改了目标分支）、上一个已审 head 已不在 bare 镜像中、它不是新 head 的祖先（例如 force-push 或 rebase），或计算增量基准失败时，做首轮。首轮只跑一遍（业主 2026-10-14「全面审计就不需要两遍了！」，取代 10-13 的两遍独立审查合并），档位 `xhigh`，超时为 `CODEX_REVIEW_FIRST_TIMEOUT_SECONDS`（默认 3600 秒）。提示要求同时审改动本身的正确性和调用方与边界输入，并读完全部改动文件的 diff。判为 `failed` 或超时，发 `failed`。正文写明选择首轮的原因。
 - 复审（`mode=delta`）：只跑一遍，超时为 `CODEX_REVIEW_TIMEOUT_SECONDS`。增量基准树按以下步骤计算：
   1. 在 `refs/remotes/origin/<base>` 的第一父链上，取新 head 已包含的最新提交 M（新 head 一个都不包含时做首轮）；
   2. 在 `work/<任务 id>/delta-base` 建一个停在上一个已审 head 的临时工作树，执行 `git merge --no-commit --no-ff M`。`git add --all` 之前先用 `git ls-files --unmerged` 列出未合并的条目：只有两边都存在、都是普通文件、并且工作树文件中有 `<<<<<<<` 和 `>>>>>>>` 冲突标记的文本冲突才保留在基准树中；modify/delete、符号链接、二进制、改名等冲突在工作树中可能只剩一边的版本，增量无法显示其解决结果，这时做首轮。然后用 `git write-tree` 得到基准树，再删除临时工作树。
   3. 交给 codex 的是 `git diff <基准树> HEAD`：从 base 合入的改动已在基准树中，不出现在增量里；解冲突的改动仍在增量里（删除冲突标记的 hunk 即解冲突结果）。这里不用 `git merge-tree --write-tree`，因为 Ubuntu 22.04 自带的 git 2.34 还没有这个选项（2.38 起才有）。
 - 增量为空（新 head 相对上一个已审 head 只有从 base 合入的改动）时，只看上一条有效 review 的 verdict：是 `clean` 且正文没有被截断，就不调用 codex，直接发 `verdict=clean effort=none tests=read-only mode=delta`；是 `findings`（包括只有 P3 的情况），或正文被截断、无法确认是 clean，就做首轮。不从上一条正文里解析发现、也不按关键词分类，因为解析和分类都会漏掉边界情况；这种情况少见，回到首轮的成本可以接受。发 clean 之前与普通审查一样重新读取实时 PR：PR 已关闭、head 已变、不再满足准入条件（例如变成被排除的草稿）时不发布；base 已变时重新排队。
 - 复审提示附上上一条 review 的正文（最多 20000 字符），要求报告：增量引入的问题；增量中对上次发现修得不完整或不对的地方。增量之外、本次未改动代码中的问题写进 `增量外问题（登记，不阻塞）` 一节。服务把这一节从最终消息中拆出（只认独立成行的节标题，可以带 `**` 或 `#`；发现正文中间出现同样的文字不算）：
-  - 置信度 ≥ 50，并且是 P0/P1、涉及资金、止损、凭据、安全边界，或没有 `[P0]` 到 `[P3]` 标记、无法确认优先级的，列入正文「增量外但阻塞的问题」一节，结论计为 `findings`；登记项一节中不以列表符号开头、但以优先级标记开头的行，也单独算一条；
-  - 置信度 ≥ 50 的其余条目列入正文「登记项」一节，不计入 verdict；这些条目需要登记为 issue 并在 PR 上回复，不阻塞合并；
-  - 置信度低于 50 或缺失的，按 §2.4.1 不发布。
+  - P0/P1、涉及资金、止损、凭据、安全边界，或没有 `[P0]` 到 `[P3]` 标记、无法确认优先级的，列入正文「增量外但阻塞的问题」一节，结论计为 `findings`；登记项一节中不以列表符号开头、但以优先级标记开头的行，也单独算一条；
+  - 其余条目列入正文「登记项」一节，不计入 verdict；这些条目需要登记为 issue 并在 PR 上回复，不阻塞合并。置信度不设门槛，只随条目显示。
 - 本地合并列车的 `local-review.sh` 用同一套策略。两边各自以自己最近一次结论为增量起点。
 
 ### 2.7 为什么用常驻服务
