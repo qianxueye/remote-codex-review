@@ -19,6 +19,7 @@ import codex_review as cr  # noqa: E402
 
 HEAD = 'a' * 40
 NEW_HEAD = 'b' * 40
+MERGE_BASE = 'e' * 40
 SECRET = b'webhook-secret'
 REPO = 'Example-Org/Example-Repo'
 WORKTREE = '/var/lib/codex-review/work/7/tree'
@@ -161,7 +162,12 @@ class FakeGit:
         self.fetched.append((full_name, number, base))
         return getattr(self, 'head', HEAD)
 
-    def changed_files(self, full_name, base, head):
+    def merge_base(self, full_name, base, head):
+        self.merge_base_of = (base, head)
+        return MERGE_BASE
+
+    def changed_files(self, full_name, merge_base, head):
+        self.changed_from = merge_base
         return getattr(self, 'files', ['src/app.py'])
 
     def delta_tree(self, full_name, base, prev, head, scratch):
@@ -438,7 +444,7 @@ class ReviewTests(Harness):
         self.assertIn(f'<!-- remote-codex-review head={HEAD} verdict=clean effort=xhigh tests=read-only mode=full -->',
                       post['body'])
         self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'])
-        self.assertIn('git diff origin/main...HEAD', self.codex.calls[0][2])
+        self.assertIn(f'git diff {MERGE_BASE}...HEAD', self.codex.calls[0][2])
         self.assertEqual(self.git.removed, [self.git.work / str(job.id) / 'tree'])
 
     def test_existing_marker_on_github_skips_codex(self):
@@ -518,7 +524,8 @@ class ReviewTests(Harness):
         _, status = self.run_next()
         self.assertEqual(status, 'clean')
         self.assertEqual(self.git.fetched[0][2], 'develop')
-        self.assertIn('git diff origin/develop...HEAD', self.codex.calls[0][2])
+        self.assertEqual(self.git.merge_base_of, ('develop', HEAD))
+        self.assertIn("against the base branch 'origin/develop', from their merge base", self.codex.calls[0][2])
 
     def test_base_changed_during_review_requeues_without_posting(self):
         self.deliver(pull_payload())
@@ -752,14 +759,14 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(cr.MARKER_RE.search(body).group(1), HEAD)
 
     def test_command_is_read_only_and_forbids_tests(self):
-        sections = cr.first_prompt('main')
+        sections = cr.first_prompt('main', MERGE_BASE)
         command = cr.CodexRunner('codex').command(sections, '/w/last.txt', 'high')
         self.assertEqual(command, ['codex', 'exec', '--json', '--sandbox', 'read-only',
                                    '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
                                    'review', cr.review_prompt(sections), '-o', '/w/last.txt'])
         self.assertNotIn('--base', command)
         prompt = command[-3]
-        self.assertIn('git diff origin/main...HEAD', prompt)
+        self.assertIn(f'git diff {MERGE_BASE}...HEAD', prompt)
         self.assertIn('do not run pytest, vitest or any other test suite', prompt)
         self.assertIn('本次为只读审查，未运行测试', prompt)
         self.assertIn('`VERDICT: CLEAN`', prompt)

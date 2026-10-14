@@ -38,8 +38,8 @@ PREVIOUS_LIMIT = 5
 DEFAULT_EFFORT_RULES = {'medium': ['docs/wiki/**', 'docs/*.md', '**/README.md'], 'high': ['docs/runbooks/**']}
 RULE_KEYS = frozenset({'medium', 'high'})
 BASE_PROMPT = (
-    "Review the code changes against the base branch 'origin/{base}'. Run `git diff origin/{base}...HEAD` to "
-    "inspect the changes relative to origin/{base}. Provide prioritized, actionable findings.")
+    "Review the code changes against the base branch 'origin/{base}', from their merge base {merge_base}. Run "
+    "`git diff {merge_base}...HEAD` to inspect the changes. Provide prioritized, actionable findings.")
 READ_ONLY_RULE = (
     'This is a read-only review: do not run pytest, vitest or any other test suite, and do not start a database '
     'or any other service. Read the code; use grep and git to view context. State in your conclusion: '
@@ -1472,9 +1472,12 @@ class Git:
                   f'+refs/heads/{base}:refs/remotes/origin/{base}'], env=auth_env(token))
         return self.run(['-C', str(mirror), 'rev-parse', f'refs/codex/pr/{number}'])
 
-    def changed_files(self, full_name, base, head):
+    def merge_base(self, full_name, base, head):
+        return self.run(['-C', str(self.mirror(full_name)), 'merge-base', f'refs/remotes/origin/{base}', head])
+
+    def changed_files(self, full_name, merge_base, head):
         out = self.run(['-C', str(self.mirror(full_name)), 'diff', '--name-only', '--no-renames', '-z',
-                        f'refs/remotes/origin/{base}...{head}'])
+                        f'{merge_base}...{head}'])
         return [name for name in out.split('\0') if name]
 
     def delta_tree(self, full_name, base, prev, head, scratch):
@@ -1626,9 +1629,9 @@ def read_retry_rule(attempt, path, count):
     return READ_RETRY_RULE.format(attempt=attempt, total=READ_ATTEMPTS, path=path, count=count)
 
 
-def first_prompt(base):
-    """Return the prompt sections of the first round over `origin/<base>...HEAD`."""
-    return [BASE_PROMPT.format(base=base), FIRST_ROUND_LENS, EXHAUSTIVE]
+def first_prompt(base, merge_base):
+    """Return the prompt sections of the first round over `<merge base>...HEAD`."""
+    return [BASE_PROMPT.format(base=base, merge_base=merge_base), FIRST_ROUND_LENS, EXHAUSTIVE]
 
 
 def delta_prompt(base, prev, tree, previous):
@@ -1925,9 +1928,10 @@ class Reviewer:
                 why = (f'the delta since {previous[0][:12]} is empty but the review of that head was '
                        f'{previous[3]}{" and truncated" if "[truncated" in previous[1] else ""}, so it is not '
                        'known to be clean')
-        files = self.git.changed_files(job.full_name, base, job.head)
-        return Plan('full', why, files, [f'refs/remotes/origin/{base}...{job.head}'], f'origin/{base}...HEAD',
-                    FIRST_ROUND_EFFORT, first_prompt(base), self.config.first_timeout_seconds)
+        merge_base = self.git.merge_base(job.full_name, base, job.head)
+        files = self.git.changed_files(job.full_name, merge_base, job.head)
+        return Plan('full', why, files, [f'{merge_base}...{job.head}'], f'{merge_base}...HEAD',
+                    FIRST_ROUND_EFFORT, first_prompt(base, merge_base), self.config.first_timeout_seconds)
 
     def recheck(self, job, base):
         """Return (token, None) when the live PR still matches the job and its base, else (None, outcome)."""

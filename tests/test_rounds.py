@@ -10,7 +10,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import codex_review as cr  # noqa: E402
-from test_codex_review import HEAD, NEW_HEAD, REPO, WORKTREE, Harness, events_jsonl, pull_payload  # noqa: E402
+from test_codex_review import HEAD, MERGE_BASE, NEW_HEAD, REPO, WORKTREE, Harness, events_jsonl, pull_payload  # noqa: E402
 from test_codex_review import file_diff as cr_file_diff, session_item  # noqa: E402
 import json  # noqa: E402
 
@@ -58,8 +58,9 @@ class FirstRoundTests(Rounds):
         self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'])
         prompt = self.codex.calls[0][2]
         self.assertIn(cr.FIRST_ROUND_LENS, prompt)
-        self.assertIn('git diff origin/main...HEAD', prompt)
-        self.assertIn('git diff --name-only --no-renames origin/main...HEAD', prompt)
+        self.assertIn(f"from their merge base {MERGE_BASE}. Run `git diff {MERGE_BASE}...HEAD`", prompt)
+        self.assertIn(f'git diff --name-only --no-renames {MERGE_BASE}...HEAD', prompt)
+        self.assertEqual(self.git.changed_from, MERGE_BASE)
         self.assertEqual(self.codex.manifests, ['src/app.py\nsrc/log.py\n'])
         self.assertIn('listed one per line in `', prompt)
         self.assertIn(cr.EXHAUSTIVE, prompt)
@@ -82,7 +83,7 @@ class ReadCoverageTests(Rounds):
         self.deliver(pull_payload())
         _, status = self.run_next()
         self.assertEqual(status, 'clean')
-        self.assertEqual(self.git.ranges, [[f'refs/remotes/origin/main...{HEAD}']])
+        self.assertEqual(self.git.ranges, [[f'{MERGE_BASE}...{HEAD}']])
         self.assertEqual(self.git.diff_worktrees, [self.root / 'work' / '1' / 'tree'])
         self.assertEqual(self.sessions.calls[0][0], 't-1')
         self.assertNotIn('阅读不完整', self.github.posted[-1]['body'])
@@ -413,7 +414,7 @@ class ManifestTests(unittest.TestCase):
             files = [f'src/package/module_{n:05d}/implementation_file_{n:05d}.py' for n in range(5000)]
             manifest = root / 'changed-files.txt'
             manifest.write_text(''.join(f'{f}\n' for f in files), encoding='utf-8')
-            sections = cr.first_prompt('main') + [cr.read_rule('origin/main...HEAD', manifest, len(files))]
+            sections = cr.first_prompt('main', MERGE_BASE) + [cr.read_rule(f'{MERGE_BASE}...HEAD', manifest, len(files))]
             scratch = root / 'review1'
             scratch.mkdir()
             rc, output, _, last, timed_out = cr.CodexRunner(str(stub))(1, root, sections, 'xhigh', 60, scratch,
@@ -488,7 +489,7 @@ class DeltaTests(Rounds):
         status, body = self.second_head(message(verdict='CLEAN'))
         self.assertEqual(status, 'clean')
         self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 2)
-        self.assertIn('git diff origin/main...HEAD', self.codex.calls[1][2])
+        self.assertIn(f'git diff {MERGE_BASE}...HEAD', self.codex.calls[1][2])
         self.assertIn('mode=full -->', body)
         self.assertIn('is not an ancestor', body)
 
@@ -541,7 +542,8 @@ class DeltaTests(Rounds):
         self.assertEqual(status, 'clean')
         self.assertEqual(getattr(self.git, 'delta_calls', []), [])
         self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'] * 2)
-        self.assertIn('git diff origin/release...HEAD', self.codex.calls[1][2])
+        self.assertEqual(self.git.merge_base_of, ('release', NEW_HEAD))
+        self.assertIn(f"'origin/release', from their merge base {MERGE_BASE}", self.codex.calls[1][2])
         self.assertIn('mode=full -->', body)
         self.assertIn('the base branch changed from main to release', body)
 
@@ -793,8 +795,10 @@ class RealDiffTests(unittest.TestCase):
         git(self.src, 'push', '-q', str(mirror), 'main:refs/remotes/origin/main', 'pr:refs/codex/pr/7')
         self.worktree = root / 'state' / 'work' / '1' / 'tree'
         self.store.add_worktree(REPO, self.worktree, self.head)
-        self.files = self.store.changed_files(REPO, 'main', self.head)
-        self.expected = self.store.file_diffs(self.worktree, [f'refs/remotes/origin/main...{self.head}'], self.files)
+        self.merge_base = self.store.merge_base(REPO, 'main', self.head)
+        self.files = self.store.changed_files(REPO, self.merge_base, self.head)
+        self.expected = self.store.file_diffs(self.worktree, [f'{self.merge_base}...{self.head}'], self.files)
+        self.mirror_path = mirror
 
     def tearDown(self):
         self.store.remove_worktree(REPO, self.worktree)
@@ -818,6 +822,16 @@ class RealDiffTests(unittest.TestCase):
         without_binary = [self.codex_output(path) for path in self.files if path != 'bin.dat']
         lines = cr.evidence_lines([session_item(t) for t in without_binary], cr.read_events(events_jsonl('', outputs=without_binary)))
         self.assertEqual(cr.unread_files(self.expected, lines), [('bin.dat', '未读')])
+
+    def test_the_reviewed_range_stays_put_when_the_base_branch_moves(self):
+        git(self.src, 'switch', '-q', 'main')
+        git(self.src, 'merge', '-q', '--ff-only', 'pr')
+        git(self.src, 'push', '-q', '-f', str(self.mirror_path), 'main:refs/remotes/origin/main')
+        self.assertEqual(self.store.merge_base(REPO, 'main', self.head), self.head)
+        shown = subprocess.run(['git', '-C', str(self.worktree), 'diff', '--no-renames', f'{self.merge_base}...HEAD',
+                                '--', 'data.dat'], check=True, capture_output=True).stdout.decode('utf-8', 'replace')
+        self.assertEqual(shown, self.expected['data.dat'])
+        self.assertEqual(self.codex_output('data.dat'), '')
 
     def test_crlf_lines_keep_their_bytes_on_both_sides(self):
         self.assertIn('-two\r\n+three\r\n', self.expected['win.txt'])
