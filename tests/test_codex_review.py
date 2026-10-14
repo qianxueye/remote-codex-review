@@ -58,7 +58,8 @@ def config(**overrides):
 
 
 def pull_payload(action='synchronize', head=HEAD, number=7, author='Example-Owner', association='OWNER',
-                 head_repo=REPO, draft=False, state='open', repo=REPO, installation_account=None, base='main'):
+                 head_repo=REPO, draft=False, state='open', repo=REPO, installation_account=None, base='main',
+                 user_type='User'):
     owner = repo.split('/')[0]
     installation = {'id': 99}
     if installation_account is not None:
@@ -66,7 +67,7 @@ def pull_payload(action='synchronize', head=HEAD, number=7, author='Example-Owne
     return {'action': action, 'installation': installation,
             'repository': {'full_name': repo, 'owner': {'login': owner}},
             'pull_request': {'number': number, 'state': state, 'draft': draft,
-                             'author_association': association, 'user': {'login': author},
+                             'author_association': association, 'user': {'login': author, 'type': user_type},
                              'head': {'sha': head, 'repo': {'full_name': head_repo}},
                              'base': {'ref': base, 'repo': {'full_name': repo, 'owner': {'login': owner}}}}}
 
@@ -295,9 +296,8 @@ class WebhookTests(Harness):
 
     def test_untrusted_pull_requests_are_not_queued(self):
         cases = {'fork': pull_payload(head_repo='stranger/Ops'),
-                 'none': pull_payload(association='NONE'),
-                 'contributor': pull_payload(association='CONTRIBUTOR'),
-                 'author': pull_payload(author='someone-else', association='COLLABORATOR')}
+                 'unlisted-member': pull_payload(author='someone-else', association='MEMBER'),
+                 'unlisted-collaborator': pull_payload(author='someone-else', association='COLLABORATOR')}
         for guid, payload in cases.items():
             with self.subTest(guid):
                 self.assertEqual(self.deliver(payload, guid=guid), 202)
@@ -305,8 +305,48 @@ class WebhookTests(Harness):
 
     def test_author_allowlist_accepts_added_bot(self):
         self.app.config = config(CODEX_REVIEW_AUTHORS='example-owner,owner-helper[bot]')
-        self.assertEqual(self.deliver(pull_payload(author='Owner-Helper[bot]', association='MEMBER')), 202)
+        self.assertEqual(self.deliver(pull_payload(author='Owner-Helper[bot]', association='NONE', user_type='Bot')), 202)
         self.assertEqual(len(self.store.queued()), 1)
+
+    def admit(self, payload, **overrides):
+        return cr.admission(config(**overrides), payload['repository'], payload['pull_request'], payload['installation'])
+
+    def test_listed_app_bot_is_admitted_regardless_of_association(self):
+        payload = pull_payload(author='inktrace-coordinator[bot]', association='NONE', user_type='Bot')
+        self.assertIsNone(self.admit(payload, CODEX_REVIEW_AUTHORS='example-owner,inktrace-coordinator[bot]'))
+
+    def test_unlisted_app_bot_is_skipped_with_author_reason(self):
+        payload = pull_payload(author='inktrace-coordinator[bot]', association='NONE', user_type='Bot')
+        self.assertEqual(self.admit(payload), 'author inktrace-coordinator[bot] (type Bot, association NONE) '
+                                              'not in CODEX_REVIEW_AUTHORS')
+
+    def test_listed_user_is_admitted_when_webhook_reports_contributor(self):
+        payload = pull_payload(author='qianxueye', association='CONTRIBUTOR', user_type='User')
+        self.assertIsNone(self.admit(payload, CODEX_REVIEW_AUTHORS='qianxueye'))
+
+    def test_unlisted_member_is_skipped(self):
+        payload = pull_payload(author='someone-else', association='MEMBER', user_type='User')
+        self.assertEqual(self.admit(payload), 'author someone-else (type User, association MEMBER) '
+                                              'not in CODEX_REVIEW_AUTHORS')
+
+    def test_listed_bot_login_from_a_user_account_is_skipped(self):
+        payload = pull_payload(author='inktrace-coordinator[bot]', association='OWNER', user_type='User')
+        self.assertEqual(self.admit(payload, CODEX_REVIEW_AUTHORS='inktrace-coordinator[bot]'),
+                         'author inktrace-coordinator[bot] (type User, association OWNER) is not a Bot account')
+
+    def test_listed_user_login_from_a_bot_account_is_skipped(self):
+        payload = pull_payload(author='example-owner', association='OWNER', user_type='Bot')
+        self.assertEqual(self.admit(payload),
+                         'author example-owner (type Bot, association OWNER) is not a User account')
+
+    def test_fork_and_draft_are_skipped_before_the_author_check(self):
+        fork = pull_payload(author='inktrace-coordinator[bot]', association='NONE', user_type='Bot',
+                            head_repo='stranger/Ops')
+        draft = pull_payload(author='inktrace-coordinator[bot]', association='NONE', user_type='Bot', draft=True)
+        authors = 'example-owner,inktrace-coordinator[bot]'
+        self.assertEqual(self.admit(fork, CODEX_REVIEW_AUTHORS=authors), 'head repository differs from base (fork)')
+        self.assertEqual(self.admit(draft, CODEX_REVIEW_AUTHORS=authors, CODEX_REVIEW_INCLUDE_DRAFTS='false'),
+                         'draft excluded')
 
     def test_ignored_events_and_drafts(self):
         self.assertEqual(self.deliver(pull_payload(action='closed')), 202)
