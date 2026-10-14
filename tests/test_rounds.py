@@ -277,10 +277,14 @@ class CoverageEvidenceTests(unittest.TestCase):
                          'Warning: truncated output (original token count: 12)')
         self.assertEqual(self.unread({'codex_review.py': text}, [session_item(text)], [text]), [])
 
-    def test_a_chunk_whose_output_the_tool_truncated_is_not_evidence(self):
+    def test_a_chunk_whose_output_the_tool_truncated_counts_only_outside_the_cut(self):
         text = self.diff('a.py', 'one', 'two')
-        self.assertEqual(self.unread({'a.py': text}, [session_item(self.WARNING + text)], [text]), [('a.py', '未读')])
+        cut = self.WARNING + text.replace('+one\n+two', '+o…3 tokens truncated…wo')
+        self.assertEqual(self.unread({'a.py': text}, [session_item(cut)], [text]), [('a.py', '部分')])
+        self.assertEqual(self.unread({'a.py': text}, [session_item(self.WARNING + text)], [text]), [])
         self.assertEqual(self.unread({'a.py': text}, [session_item(text, truncated=True)], [text]), [('a.py', '未读')])
+        bare = 'Warning: truncated output (original token count: 12)\n' + text
+        self.assertEqual(self.unread({'a.py': text}, [session_item(bare)], [text]), [('a.py', '未读')])
 
     def test_repeated_rows_need_every_occurrence(self):
         text = self.diff('rows.csv', *['same'] * 100)
@@ -310,6 +314,89 @@ class CoverageEvidenceTests(unittest.TestCase):
         self.assertEqual(self.unread({'s.py': text}, items, [text]), [])
         failed = [items[0], {**items[1], 'exit_code': 1}, items[2]]
         self.assertEqual(self.unread({'s.py': text}, failed, [text]), [('s.py', '未读')])
+
+
+class RolloutEvidenceTests(unittest.TestCase):
+    """codex 0.160 `exec review`: CommandExecution items, plus the review child's code-mode outputs when it has any."""
+
+    rollout = SessionLogTests.rollout
+
+    WARNING = 'Warning: truncated output (original token count: 11082)\nTotal output lines: 352\n\n'
+
+    def diff(self, path, *rows):
+        return f'diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{len(rows)} @@\n' + ''.join(
+            f'+{row}\n' for row in rows)
+
+    def command(self, aggregated, formatted=None, exit_code=0, number=1):
+        return {'type': 'item_completed', 'item': {
+            'type': 'CommandExecution', 'id': f'call_{number}', 'process_id': str(number), 'status': 'completed',
+            'command': ['/usr/bin/bash', '-lc', 'git diff origin/main...HEAD'], 'exit_code': exit_code,
+            'aggregated_output': aggregated, 'stdout': aggregated, 'stderr': '',
+            'formatted_output': aggregated if formatted is None else formatted}}
+
+    def review(self, expected, parent, child=None):
+        """Write a review thread's rollouts and return the unread files the checker reports for it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.rollout(home, 'parent', {'id': 'thread-1', 'cwd': '/w', 'cli_version': '0.160.1'}, [
+                {'type': 'item_completed', 'item': {'type': 'EnteredReviewMode', 'id': 'r1'}}, *parent,
+                {'type': 'item_completed', 'item': {'type': 'AgentMessage', 'id': 'm1'}}])
+            if child is not None:
+                self.rollout(home, 'child', {'id': 'thread-2', 'parent_thread_id': 'thread-1',
+                                             'source': {'subagent': 'review'}}, child)
+            records, error = cr.SessionLog(home).outputs('thread-1', 0)
+        self.assertIsNone(error)
+        printed = [item['item']['aggregated_output'] for item in [*parent, *(child or [])]
+                   if item.get('item', {}).get('type') == 'CommandExecution' and item['item']['exit_code'] == 0]
+        events = cr.read_events(events_jsonl('', outputs=printed))
+        return cr.unread_files(expected, cr.evidence_lines(records, events))
+
+    def three_files(self):
+        expected = {'a.py': self.diff('a.py', 'alpha one', 'alpha two'),
+                    'b.py': self.diff('b.py', *[f'beta {n}' for n in range(6)]),
+                    'c.py': self.diff('c.py', 'gamma one', 'gamma two')}
+        return expected, ''.join(expected.values())
+
+    def test_full_diff_in_formatted_output_reads_every_file(self):
+        expected, full = self.three_files()
+        failed = self.command('fatal: bad revision\n', exit_code=2, number=2)
+        self.assertEqual(self.review(expected, [self.command('pwd\n/w\n'), self.command(full, number=3), failed]), [])
+
+    def test_lines_in_the_elided_middle_are_unread_and_the_cut_line_is_not_seen(self):
+        expected, full = self.three_files()
+        cut = full[:full.index('+beta 1')] + '+beta …1082 tokens truncated…a 4\n' + full[full.index('+beta 5'):]
+        command = self.command(full, self.WARNING + cut)
+        self.assertEqual(self.review(expected, [command]), [('b.py', '部分')])
+        texts = cr.visible_texts([command['item'], cr.ROLLOUT_BOUNDARY])
+        self.assertNotIn('Total output lines: 352', texts[0])
+        self.assertNotIn('tokens truncated', texts[0])
+        dropped = full[:full.index('diff --git a/b.py')] + '+beta …900 tokens truncated…\n' + expected['c.py']
+        self.assertEqual(self.review(expected, [self.command(full, self.WARNING + dropped)]), [('b.py', '未读')])
+
+    def test_a_file_only_in_aggregated_output_is_unread(self):
+        expected, full = self.three_files()
+        shown = expected['a.py'] + expected['c.py']
+        self.assertEqual(self.review(expected, [self.command(full, shown)]), [('b.py', '未读')])
+
+    def test_plain_code_mode_text_counts_when_it_is_a_successful_commands_output(self):
+        expected, full = self.three_files()
+        a, b, c = expected.values()
+        header = {'type': 'input_text', 'text': 'Script completed\nWall time 0.2 seconds\nOutput:\n'}
+
+        def output(*texts, number=1):
+            return {'type': 'custom_tool_call_output', 'call_id': f'call_{number}',
+                    'output': [header, *({'type': 'input_text', 'text': text} for text in texts)]}
+        child = [self.command(a), self.command(b, number=2), output(a, b),
+                 self.command(c, exit_code=1, number=3), output(c, number=3),
+                 output('{"content":[{"type":"text","text":"Action completed."}]}', number=4)]
+        self.assertEqual(self.review(expected, [], child), [('c.py', '未读')])
+        partly = [self.command(full, a), output(a), self.command(c, exit_code=1, number=2), output(c, number=2)]
+        self.assertEqual(self.review(expected, [], partly), [('b.py', '未读'), ('c.py', '未读')])
+        wrapped = [self.command(full), output(self.WARNING + full[:40])]
+        self.assertEqual(self.review(expected, [self.command(full)], wrapped),
+                         [('a.py', '未读'), ('b.py', '未读'), ('c.py', '未读')])
+        cut = self.WARNING + a + '+beta …1082 tokens truncated…\n' + c
+        self.assertEqual(self.review(expected, [], [self.command(full, cut), output(cut)]), [('b.py', '未读')])
 
 
 class ManifestTests(unittest.TestCase):

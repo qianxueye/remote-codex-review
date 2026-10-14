@@ -89,6 +89,8 @@ READ_RULE = (
     'pass that misses any file. State in your conclusion how many of the changed files you read in full and the '
     'total, e.g. `已完整阅读 {total}/{total} 个改动文件`.')
 TRUNCATION_RE = re.compile(r'Warning: truncated output \(original token count: \d+\)\n')
+EXEC_TRUNCATION_RE = re.compile(r'Warning: truncated output \(original token count: \d+\)\nTotal output lines: \d+\n\n')
+ELISION_RE = re.compile(r'…\d+ (?:tokens|chars) truncated…')
 ROLLOUT_BOUNDARY = {'type': 'rollout_boundary'}
 TOOL_OUTPUT_TYPES = ('custom_tool_call_output', 'function_call_output')
 REGISTER_HEADING = '增量外问题（登记，不阻塞）'
@@ -613,19 +615,20 @@ def thread_id(events):
     return next((str(event.get('thread_id') or '') for event in events if event.get('type') == 'thread.started'), '')
 
 
-def output_chunks(output):
-    """Return the command chunks of one session tool-output item; [] when the wrapper truncated it or it is unreadable.
+def model_view(text):
+    """Return command output as the model saw it, or None when it carries a truncation warning of unknown shape.
 
-    Truncation is the wrapper's warning at the start of a text part or of a chunk's `output`, never inside the body.
+    The exec truncation header is dropped and the line holding the `…N tokens truncated…` cut becomes empty.
     """
-    if isinstance(output, str):
-        return [] if TRUNCATION_RE.match(output) else [{'exit_code': 0, 'output': output, 'truncated': False}]
-    if not isinstance(output, list):
-        return []
-    parts = [part.get('text', '') for part in output if isinstance(part, dict)]
-    if any(TRUNCATION_RE.match(part) for part in parts):
-        return []
-    text, decoder, chunks, position = ''.join(parts), json.JSONDecoder(), [], 0
+    header = EXEC_TRUNCATION_RE.match(text)
+    if header:
+        return '\n'.join('' if ELISION_RE.search(line) else line for line in text[header.end():].split('\n'))
+    return None if TRUNCATION_RE.match(text) else text
+
+
+def json_chunks(text):
+    """Return the `{"chunk_id", ...}` objects serialized in text, or None when one does not decode."""
+    decoder, chunks, position = json.JSONDecoder(), [], 0
     while True:
         start = text.find('{"chunk_id"', position)
         if start < 0:
@@ -633,24 +636,57 @@ def output_chunks(output):
         try:
             chunk, position = decoder.raw_decode(text, start)
         except ValueError:
-            return []
+            return None
         chunk['output'] = str(chunk.get('output') or '')
         chunk['truncated'] = bool(TRUNCATION_RE.match(chunk['output']))
         chunks.append(chunk)
 
 
+def output_chunks(output, formatted=None):
+    """Return the command chunks of one session tool-output item; [] when the wrapper truncated it or it is unreadable.
+
+    formatted maps each CommandExecution `formatted_output` of the rollout to its exit code; a plain text part equal
+    to one is that command's output. Any other part starting with the truncation warning means the wrapper cut it.
+    """
+    formatted = formatted or {}
+    if isinstance(output, str):
+        return [] if TRUNCATION_RE.match(output) else [{'exit_code': 0, 'output': output, 'truncated': False}]
+    if not isinstance(output, list):
+        return []
+    parts = [part.get('text', '') for part in output if isinstance(part, dict)]
+    if any(TRUNCATION_RE.match(part) and part not in formatted for part in parts):
+        return []
+    chunks, pending = [], ''
+    for part in [*parts, None]:
+        if part is not None and part not in formatted:
+            pending += part
+            continue
+        decoded = json_chunks(pending)
+        if decoded is None:
+            return []
+        chunks += decoded
+        pending = ''
+        if part is not None:
+            chunks.append({'exit_code': formatted[part], 'output': part, 'truncated': bool(TRUNCATION_RE.match(part))})
+    return chunks
+
+
 def streamed_texts(records):
-    """Return (chunk index, text) per command of one rollout file that exited 0 and was seen untruncated.
+    """Return (chunk index, text) per command of one rollout file that exited 0, as the model saw it.
 
     A yielded command's chunks carry `session_id` (its `process_id`); they count once its next completion exits 0.
     """
-    chunks, exits = [], []
+    chunks, exits, formatted = [], [], {}
+    for record in records:
+        if is_command(record) and isinstance(record.get('formatted_output'), str):
+            text = record['formatted_output']
+            formatted[text] = 0 if record.get('exit_code') == 0 or formatted.get(text) == 0 else 1
     for position, record in enumerate(records):
-        if isinstance(record, dict) and record.get('type') == 'CommandExecution':
+        if is_command(record):
             exits.append((position, str(record.get('process_id')), record.get('exit_code'),
                           str(record.get('aggregated_output') or '')))
         else:
-            chunks.extend((position, chunk) for chunk in output_chunks(record))
+            chunks.extend((position, chunk) for chunk in output_chunks(record, formatted))
     groups = {}
     for index, (position, chunk) in enumerate(chunks):
         if 'exit_code' in chunk or chunk.get('session_id') is None:
@@ -672,13 +708,23 @@ def streamed_texts(records):
             used.add(final)
             streamed = aggregated
         texts.append((members[0], streamed))
-    texts += [(index, chunk['output']) for index, (_, chunk) in enumerate(chunks)
-              if index not in used and chunk.get('exit_code') == 0 and not chunk['truncated']]
+    texts += [(index, model_view(chunk['output'])) for index, (_, chunk) in enumerate(chunks)
+              if index not in used and chunk.get('exit_code') == 0 and model_view(chunk['output']) is not None]
     return sorted(texts, key=lambda item: item[0])
 
 
+def is_command(record):
+    return isinstance(record, dict) and record.get('type') == 'CommandExecution'
+
+
 def visible_texts(records):
-    """Return, in record order, each command output the model saw untruncated from a command that exited 0."""
+    """Return, in record order, each command output the model saw from a command that exited 0.
+
+    Without any tool-output item the model saw each command's `formatted_output` (docs/runbook.zh.md 完整阅读核验).
+    """
+    if all(is_command(record) or record == ROLLOUT_BOUNDARY for record in records):
+        return [text for text in (model_view(str(record.get('formatted_output') or '')) for record in records
+                                  if is_command(record) and record.get('exit_code') == 0) if text]
     texts, current = [], []
     for record in [*records, ROLLOUT_BOUNDARY]:
         if record == ROLLOUT_BOUNDARY:
