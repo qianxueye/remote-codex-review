@@ -26,13 +26,18 @@ WORKTREE = '/var/lib/codex-review/work/7/tree'
 CLEAN = 'The change is consistent with its callers; no defects found.\nVERDICT: CLEAN'
 
 
-def events_jsonl(message, read=True):
-    """Return a minimal `codex exec --json` stream: one successful command, the message, a completed turn."""
+def file_diff(path):
+    """Return the diff text FakeGit expects codex to show for path."""
+    return f'diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new {path}\n'
+
+
+def events_jsonl(message, read=True, outputs=None):
+    """Return a minimal `codex exec --json` stream: successful commands, the message, a completed turn."""
     events = [{'type': 'thread.started', 'thread_id': 't-1'}, {'type': 'turn.started'}]
-    if read:
+    for index, output in enumerate(outputs if outputs is not None else [file_diff('x')] if read else []):
         events.append({'type': 'item.completed', 'item': {
-            'id': 'item_0', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff origin/main...HEAD'",
-            'aggregated_output': 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n', 'exit_code': 0, 'status': 'completed'}})
+            'id': f'item_{index}', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff'",
+            'aggregated_output': output, 'exit_code': 0, 'status': 'completed'}})
     events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
     events.append({'type': 'turn.completed', 'usage': {}})
     return '\n'.join(json.dumps(event) for event in events) + '\n'
@@ -155,6 +160,11 @@ class FakeGit:
     def diff_files(self, full_name, tree, head):
         return getattr(self, 'delta_files', ['src/fix.py'])
 
+    def file_diffs(self, full_name, range_args, files):
+        self.ranges = getattr(self, 'ranges', []) + [range_args]
+        self.expected = {path: file_diff(path) for path in files}
+        return self.expected
+
     def add_worktree(self, full_name, path, head):
         path.mkdir(parents=True)
         if self.agents is not None:
@@ -172,6 +182,8 @@ class FakeCodex:
         self.calls = []
         self.cancelled = []
         self.governance = None
+        self.git = None
+        self.read = None
 
     def __call__(self, job_id, worktree, sections, effort, timeout, scratch, proceed, governance=()):
         if getattr(self, 'before_proceed', None):
@@ -186,7 +198,12 @@ class FakeCodex:
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))
-        events = self.events if self.events is not None else events_jsonl(message)
+        events = self.events
+        if events is None:
+            expected = getattr(self.git, 'expected', None)
+            outputs = None if expected is None else [expected[p] for p in (self.read if self.read is not None
+                                                                           else expected)]
+            events = events_jsonl(message, outputs=outputs)
         return self.rc, events, 'progress\n', message, self.timed_out
 
     def cancel(self, job_ids):
@@ -205,6 +222,7 @@ class Harness(unittest.TestCase):
         self.github = FakeGitHub()
         self.git = FakeGit(self.root)
         self.codex = FakeCodex(CLEAN)
+        self.codex.git = self.git
         self.reviewer = cr.Reviewer(self.config, self.github, self.store, self.git, self.codex)
         self.app = cr.WebhookApp(self.config, self.store, SECRET, on_queued=self.reviewer.on_queued)
 
@@ -243,7 +261,7 @@ class ParseTests(unittest.TestCase):
 
     def test_priority_tag_without_location_still_counts_as_findings(self):
         message = 'One issue: [P2] the retry loop never ends.'
-        verdict, review, _ = cr.assess(0, cr.read_events(events_jsonl(message)), message)
+        verdict, review, _, _ = cr.assess(0, cr.read_events(events_jsonl(message)), message)
         self.assertEqual((verdict, review.findings), ('findings', []))
         body = cr.review_body(HEAD, verdict, review.text, review.findings)
         self.assertIn('[P2] the retry loop never ends.', body)
@@ -373,7 +391,7 @@ class ReviewTests(Harness):
         post = self.github.posted[0]
         self.assertIn(f'<!-- remote-codex-review head={HEAD} verdict=clean effort=xhigh tests=read-only mode=full -->',
                       post['body'])
-        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh', 'xhigh'])
+        self.assertEqual([call[3] for call in self.codex.calls], ['xhigh'])
         self.assertIn('git diff origin/main...HEAD', self.codex.calls[0][2])
         self.assertEqual(self.git.removed, [self.git.work / str(job.id) / 'tree'])
 
@@ -488,7 +506,7 @@ class ReviewTests(Harness):
             self.github.draft = True
         self.codex.during = to_draft
         _, status = self.run_next()
-        self.assertEqual((status, len(self.codex.calls), self.github.posted), ('skipped', 2, []))
+        self.assertEqual((status, len(self.codex.calls), self.github.posted), ('skipped', 1, []))
 
     def test_findings_posted_inline_and_in_body(self):
         self.codex.message = FINDINGS
@@ -649,7 +667,7 @@ class EffortTests(unittest.TestCase):
             harness.git.delta_files = ['docs/wiki/a.md']
             harness.deliver(pull_payload(head=NEW_HEAD), guid='d-2')
             harness.run_next()
-            self.assertEqual([call[3] for call in harness.codex.calls], ['xhigh', 'xhigh', 'medium'])
+            self.assertEqual([call[3] for call in harness.codex.calls], ['xhigh', 'medium'])
             self.assertIn('verdict=clean effort=medium tests=read-only mode=delta -->',
                           harness.github.posted[1]['body'])
         finally:
@@ -688,7 +706,7 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(cr.MARKER_RE.search(body).group(1), HEAD)
 
     def test_command_is_read_only_and_forbids_tests(self):
-        sections = cr.first_prompt('main', cr.LENSES[0][1])
+        sections = cr.first_prompt('main', ['src/app.py'])
         command = cr.CodexRunner('codex').command(sections, '/w/last.txt', 'high')
         self.assertEqual(command, ['codex', 'exec', '--json', '--sandbox', 'read-only',
                                    '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
