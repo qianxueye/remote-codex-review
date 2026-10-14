@@ -182,7 +182,7 @@ class ReadCoverageTests(Rounds):
         shown = 'diff --git a/big.min.js b/big.min.js\n@@ -1 +1 @@\n' + '\n'.join(folded) + '\n'
         lines = cr.evidence_lines([session_item(shown)], cr.read_events(events_jsonl('', outputs=[shown])))
         self.assertEqual(cr.unread_files(expected, lines), [])
-        self.assertEqual(cr.unread_files(expected, lines - {folded[1]}), [('big.min.js', '部分')])
+        self.assertEqual(cr.unread_files(expected, [lines[0][:3] + lines[0][4:]]), [('big.min.js', '部分')])
 
     def test_delta_review_requires_only_the_delta_files(self):
         self.first_round(message(verdict='CLEAN'))
@@ -203,7 +203,7 @@ class ReadCoverageTests(Rounds):
 
 
 class SessionLogTests(unittest.TestCase):
-    """SessionLog reads `$CODEX_HOME/sessions/**/rollout-*.jsonl`; visible_output decodes one tool-output item."""
+    """SessionLog reads `$CODEX_HOME/sessions/**/rollout-*.jsonl`; visible_texts decodes its records."""
 
     def rollout(self, home, name, meta, items):
         path = home / 'sessions' / '2026' / '10' / '14' / f'rollout-2026-10-14T00-00-00-{name}.jsonl'
@@ -224,32 +224,33 @@ class SessionLogTests(unittest.TestCase):
                          [{'type': 'custom_tool_call_output', 'call_id': 'c3', 'output': session_item('nine\n')}])
             outputs, error = cr.SessionLog(home).outputs('thread-1', 0)
             self.assertIsNone(error)
-            self.assertEqual(sorted(cr.visible_output(o) for o in outputs), ['one\n', 'two\n'])
+            self.assertEqual(sorted(cr.visible_texts(outputs)), ['one\n', 'two\n'])
+            self.assertEqual(outputs.count(cr.ROLLOUT_BOUNDARY), 2)
             self.assertEqual(cr.SessionLog(home).outputs('thread-7', 0), ([], f'no session record for thread thread-7 under {home / "sessions"}'))
             self.assertEqual(cr.SessionLog(home).outputs('', 0), ([], 'the codex events carry no thread id'))
             self.assertEqual(cr.SessionLog(home / 'missing').outputs('thread-1', 0),
                              ([], f'no sessions directory at {home / "missing" / "sessions"}'))
 
-    def test_visible_output_rejects_truncated_failed_and_unreadable_items(self):
-        self.assertEqual(cr.visible_output(session_item('a\nb\n')), 'a\nb\n')
-        self.assertIsNone(cr.visible_output(session_item('a\nb\n', truncated=True)))
-        self.assertIsNone(cr.visible_output(session_item('a\nb\n', exit_code=1)))
-        self.assertIsNone(cr.visible_output('Warning: truncated output (original token count: 5)\na\n'))
-        self.assertEqual(cr.visible_output('plain shell output\n'), 'plain shell output\n')
+    def test_visible_texts_reject_truncated_failed_and_unreadable_items(self):
+        self.assertEqual(cr.visible_texts([session_item('a\nb\n')]), ['a\nb\n'])
+        self.assertEqual(cr.visible_texts([session_item('a\nb\n', truncated=True)]), [])
+        self.assertEqual(cr.visible_texts([session_item('a\nb\n', exit_code=1)]), [])
+        self.assertEqual(cr.visible_texts(['Warning: truncated output (original token count: 5)\na\n']), [])
+        self.assertEqual(cr.visible_texts(['plain shell output\n']), ['plain shell output\n'])
         broken = session_item('a\n')
         broken[1]['text'] = broken[1]['text'][:-5]
-        self.assertIsNone(cr.visible_output(broken))
-        self.assertIsNone(cr.visible_output([{'type': 'input_text', 'text': 'tool listing without a chunk'}]))
-        self.assertIsNone(cr.visible_output({'unexpected': 'shape'}))
-        self.assertIsNone(cr.visible_output(None))
+        self.assertEqual(cr.visible_texts([broken]), [])
+        self.assertEqual(cr.visible_texts([[{'type': 'input_text', 'text': 'tool listing without a chunk'}]]), [])
+        self.assertEqual(cr.visible_texts([{'unexpected': 'shape'}]), [])
+        self.assertEqual(cr.visible_texts([None]), [])
         two = session_item('a\n')
         two[1]['text'] += '\n' + session_item('b\n')[1]['text']
-        self.assertEqual(cr.visible_output(two), 'a\n\nb\n')
+        self.assertEqual(cr.visible_texts([two]), ['a\n', 'b\n'])
 
     def test_evidence_needs_both_the_model_view_and_a_successful_command(self):
         events = cr.read_events(events_jsonl('', outputs=['x\ny\n']))
-        self.assertEqual(cr.evidence_lines([session_item('x\nz\n')], events), {'x', ''})
-        self.assertEqual(cr.evidence_lines([session_item('x\ny\n')], cr.read_events(events_jsonl('', outputs=['x\ny\n'], exit_code=1))), set())
+        self.assertEqual(cr.evidence_lines([session_item('x\nz\n')], events), [['x', None, '']])
+        self.assertEqual(cr.evidence_lines([session_item('x\ny\n')], cr.read_events(events_jsonl('', outputs=['x\ny\n'], exit_code=1))), [[None, None, None]])
 
 
 class CoverageEvidenceTests(unittest.TestCase):

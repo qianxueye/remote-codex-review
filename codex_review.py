@@ -70,6 +70,8 @@ CONFIDENCE_RULE = (
 READ_LIMIT = 20000
 READ_LINES = 150
 FOLD_WIDTH = 4000
+COVERAGE_GRAM = 8
+HASH_BASE, HASH_MOD = 1_000_003, (1 << 61) - 1
 READ_ATTEMPTS = 3
 READ_RETRY_RULE = (
     'This is review {attempt} of at most {total} of this head: the previous review did not show the complete diff '
@@ -86,7 +88,8 @@ READ_RULE = (
     'record of what you actually saw, that every line of every file\'s diff appeared untruncated, and rejects a '
     'pass that misses any file. State in your conclusion how many of the changed files you read in full and the '
     'total, e.g. `已完整阅读 {total}/{total} 个改动文件`.')
-TRUNCATION_RE = re.compile(r'Warning: truncated output|\[\.\.\. omitted \d+ of \d+ lines|\boutput truncated\b', re.I)
+TRUNCATION_RE = re.compile(r'Warning: truncated output \(original token count: \d+\)\n')
+ROLLOUT_BOUNDARY = {'type': 'rollout_boundary'}
 TOOL_OUTPUT_TYPES = ('custom_tool_call_output', 'function_call_output')
 REGISTER_HEADING = '增量外问题（登记，不阻塞）'
 DELTA_PROMPT = (
@@ -610,43 +613,88 @@ def thread_id(events):
     return next((str(event.get('thread_id') or '') for event in events if event.get('type') == 'thread.started'), '')
 
 
-def visible_output(output):
-    """Return the shell output the model saw in one session tool-output item; None when truncated or unreadable.
+def output_chunks(output):
+    """Return the command chunks of one session tool-output item; [] when the wrapper truncated it or it is unreadable.
 
-    Code-mode items are text parts holding `{"chunk_id": …, "exit_code": …, "output": …}` JSON per command.
+    Truncation is the wrapper's warning at the start of a text part or of a chunk's `output`, never inside the body.
     """
     if isinstance(output, str):
-        return None if TRUNCATION_RE.search(output) else output
+        return [] if TRUNCATION_RE.match(output) else [{'exit_code': 0, 'output': output, 'truncated': False}]
     if not isinstance(output, list):
-        return None
-    text = ''.join(part.get('text', '') for part in output if isinstance(part, dict))
-    if TRUNCATION_RE.search(text):
-        return None
-    decoder, chunks, position = json.JSONDecoder(), [], 0
+        return []
+    parts = [part.get('text', '') for part in output if isinstance(part, dict)]
+    if any(TRUNCATION_RE.match(part) for part in parts):
+        return []
+    text, decoder, chunks, position = ''.join(parts), json.JSONDecoder(), [], 0
     while True:
         start = text.find('{"chunk_id"', position)
         if start < 0:
-            break
+            return chunks
         try:
             chunk, position = decoder.raw_decode(text, start)
         except ValueError:
-            return None
-        if chunk.get('exit_code') == 0:
-            chunks.append(str(chunk.get('output') or ''))
-    return '\n'.join(chunks) if chunks else None
+            return []
+        chunk['output'] = str(chunk.get('output') or '')
+        chunk['truncated'] = bool(TRUNCATION_RE.match(chunk['output']))
+        chunks.append(chunk)
 
 
-def evidence_lines(outputs, events):
-    """Lines the model saw untruncated that a successful command also printed (`--json` aggregated_output)."""
-    seen = set()
-    for output in outputs:
-        text = visible_output(output)
-        if text is not None:
-            seen.update(text.split('\n'))
+def streamed_texts(records):
+    """Return (chunk index, text) per command of one rollout file that exited 0 and was seen untruncated.
+
+    A yielded command's chunks carry `session_id` (its `process_id`); they count once its next completion exits 0.
+    """
+    chunks, exits = [], []
+    for position, record in enumerate(records):
+        if isinstance(record, dict) and record.get('type') == 'CommandExecution':
+            exits.append((position, str(record.get('process_id')), record.get('exit_code'),
+                          str(record.get('aggregated_output') or '')))
+        else:
+            chunks.extend((position, chunk) for chunk in output_chunks(record))
+    groups = {}
+    for index, (position, chunk) in enumerate(chunks):
+        if 'exit_code' in chunk or chunk.get('session_id') is None:
+            continue
+        same = [done for done in exits if done[1] == str(chunk['session_id'])]
+        owner = next((done for done in same if done[0] > position), same[-1] if same else None)
+        if owner:
+            groups.setdefault(owner, []).append(index)
+    texts, used = [], set()
+    for (_, _, code, aggregated), members in groups.items():
+        streamed = ''.join(chunks[index][1]['output'] for index in members)
+        if code != 0 or any(chunks[index][1]['truncated'] for index in members) or not aggregated.startswith(streamed):
+            continue
+        rest = aggregated[len(streamed):]
+        final = next((index for index in range(members[-1] + 1, len(chunks)) if index not in used
+                      and chunks[index][1].get('exit_code') == 0 and not chunks[index][1]['truncated']
+                      and chunks[index][1]['output'] == rest), None)
+        if final is not None:
+            used.add(final)
+            streamed = aggregated
+        texts.append((members[0], streamed))
+    texts += [(index, chunk['output']) for index, (_, chunk) in enumerate(chunks)
+              if index not in used and chunk.get('exit_code') == 0 and not chunk['truncated']]
+    return sorted(texts, key=lambda item: item[0])
+
+
+def visible_texts(records):
+    """Return, in record order, each command output the model saw untruncated from a command that exited 0."""
+    texts, current = [], []
+    for record in [*records, ROLLOUT_BOUNDARY]:
+        if record == ROLLOUT_BOUNDARY:
+            texts += [text for _, text in streamed_texts(current)]
+            current = []
+        else:
+            current.append(record)
+    return texts
+
+
+def evidence_lines(records, events):
+    """Return each visible text as its lines; a line no successful `--json` command printed becomes None."""
     printed = set()
     for item in ran_commands(events):
         printed.update(str(item.get('aggregated_output') or '').split('\n'))
-    return seen & printed
+    return [[line if line in printed else None for line in text.split('\n')] for text in visible_texts(records)]
 
 
 class SessionLog:
@@ -656,7 +704,10 @@ class SessionLog:
         self.sessions = Path(home) / 'sessions'
 
     def outputs(self, thread, since):
-        """Return (tool outputs of thread and its child threads started after since, error or None)."""
+        """Return (records of thread and its child threads started after since, error or None).
+
+        Records are tool outputs and CommandExecution items in file order, each file followed by ROLLOUT_BOUNDARY.
+        """
         if not thread:
             return [], 'the codex events carry no thread id'
         if not self.sessions.is_dir():
@@ -678,8 +729,12 @@ class SessionLog:
                             continue
                         if payload.get('type') in TOOL_OUTPUT_TYPES:
                             outputs.append(payload.get('output'))
+                        elif (payload.get('type') == 'item_completed' and isinstance(payload.get('item'), dict)
+                              and payload['item'].get('type') == 'CommandExecution'):
+                            outputs.append(payload['item'])
+                    outputs.append(ROLLOUT_BOUNDARY)
             except (OSError, ValueError, AttributeError):
-                continue
+                outputs.append(ROLLOUT_BOUNDARY)
         if not found:
             return [], f'no session record for thread {thread} under {self.sessions}'
         return outputs, None
@@ -691,20 +746,140 @@ def fold(line, width=FOLD_WIDTH):
     return [data[start:start + width].decode('utf-8', 'replace') for start in range(0, len(data), width)]
 
 
-def unread_files(expected, lines):
-    """Return (path, 未读|部分) for each expected diff whose lines (or their fold segments) are not all in lines.
+class Coverage:
+    """Marks diff lines as read from contiguous runs of seen lines; each seen line covers at most one diff line.
 
-    未读: its `diff --git` header line never appeared; 部分: the header did but some later line did not.
+    Matching and tie-breaking are described in docs/runbook.zh.md (完整阅读核验).
     """
-    def seen(line):
-        return line in lines or (len(line.encode('utf-8', 'surrogatepass')) > FOLD_WIDTH
-                                 and all(segment in lines for segment in fold(line)))
-    unread = []
-    for path, text in expected.items():
-        wanted = [line for line in text.split('\n') if line]
-        if not all(seen(line) for line in wanted):
-            unread.append((path, '部分' if wanted and seen(wanted[0]) else '未读'))
-    return unread
+
+    def __init__(self, expected):
+        self.rows = {path: [line for line in text.split('\n') if line] for path, text in expected.items()}
+        self.whole = {path: [False] * len(lines) for path, lines in self.rows.items()}
+        self.parts, self.sequences = {}, []
+        for path, lines in self.rows.items():
+            self.parts[path] = {row: [False] * len(fold(line)) for row, line in enumerate(lines)
+                                if len(line.encode('utf-8', 'surrogatepass')) > FOLD_WIDTH}
+            self.sequences.append((path, [(line, row, None) for row, line in enumerate(lines)]))
+            if self.parts[path]:
+                self.sequences.append((path, [
+                    token for row, line in enumerate(lines)
+                    for token in ([(segment, row, part) for part, segment in enumerate(fold(line))]
+                                  if row in self.parts[path] else [(line, row, None)])]))
+        self.single, self.pairs, self.grams, self.where, self.ids, self.hashes = {}, {}, {}, {}, {}, []
+        self.frontier, self.continuing = set(), {}
+        for number, (_, tokens) in enumerate(self.sequences):
+            values = [token for token, _, _ in tokens]
+            self.hashes.append(self.prefix([self.ids.setdefault(token, len(self.ids) + 1) for token in values]))
+            for position, token in enumerate(values):
+                self.single.setdefault(token, []).append((number, position))
+                self.where.setdefault(self.place(number, position), []).append((number, position))
+                if position + 1 < len(values):
+                    self.pairs.setdefault(tuple(values[position:position + 2]), []).append((number, position))
+                if position + COVERAGE_GRAM <= len(values):
+                    self.grams.setdefault(tuple(values[position:position + COVERAGE_GRAM]), []).append(
+                        (number, position))
+
+    def place(self, number, position):
+        path, tokens = self.sequences[number]
+        if position == len(tokens):
+            return path, len(self.rows[path]), 0
+        _, row, part = tokens[position]
+        return path, row, part or 0
+
+    def covered(self, number, position):
+        path, tokens = self.sequences[number]
+        _, row, part = tokens[position]
+        return self.whole[path][row] or (part is not None and self.parts[path][row][part])
+
+    def prefix(self, ids):
+        hashes = [0]
+        for value in ids:
+            hashes.append((hashes[-1] * HASH_BASE + value) % HASH_MOD)
+        return hashes
+
+    @staticmethod
+    def span(hashes, start, length):
+        return (hashes[start + length] - hashes[start] * pow(HASH_BASE, length, HASH_MOD)) % HASH_MOD
+
+    def run(self, seen, index, start, limit):
+        """Return the matching length of seen from index against a sequence start, by binary search on hashes."""
+        number, position = start
+        low, high = 0, min(limit, len(seen) - index, len(self.sequences[number][1]) - position)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self.span(self.seen_hashes, index, middle) == self.span(self.hashes[number], position, middle):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    def longest(self, seen, index):
+        """Return (length, starts) of the longest runs of seen from index that match a diff sequence.
+
+        A run continuing where an earlier one ended wins once it spans COVERAGE_GRAM lines or the rest of seen.
+        """
+        window = seen[index:index + COVERAGE_GRAM]
+        following = [(self.run(seen, index, start, len(seen)), start)
+                     for start in self.continuing.get(seen[index], ())]
+        following = [(length, start) for length, start in following if length >= len(window)]
+        if following:
+            length = max(length for length, _ in following)
+            return length, [start for value, start in following if value == length]
+        starts, limit = self.grams.get(tuple(window), ()) if None not in window else (), len(seen)
+        if not starts and index + 1 < len(seen) and None not in seen[index:index + 2]:
+            starts, limit = self.pairs.get(tuple(seen[index:index + 2]), ()), COVERAGE_GRAM - 1
+        if not starts:
+            return (1, self.single[seen[index]]) if seen[index] in self.single else (0, [])
+        lengths = [(self.run(seen, index, start, limit), start) for start in starts]
+        length = max(length for length, _ in lengths)
+        return length, [start for value, start in lengths if value == length]
+
+    def read(self, seen):
+        self.seen_hashes, index = self.prefix([self.ids.get(token, 0) for token in seen]), 0
+        while index < len(seen):
+            length, starts = self.longest(seen, index)
+            if not length:
+                index += 1
+                continue
+            starts = [start for start in starts if self.place(*start) in self.frontier] or starts
+            number, position = min(starts, key=lambda start: (
+                -sum(not self.covered(start[0], at) for at in range(start[1], start[1] + length)), start))
+            path, tokens = self.sequences[number]
+            length = next((at for at in range(length) if seen[index + at] != tokens[position + at][0]), length)
+            if not length:
+                index += 1
+                continue
+            for at in range(position, position + length):
+                _, row, part = tokens[at]
+                if part is None:
+                    self.whole[path][row] = True
+                else:
+                    self.parts[path][row][part] = True
+            place = self.place(number, position + length)
+            self.frontier.add(place)
+            for start in self.where.get(place, ()):
+                self.continuing.setdefault(self.sequences[start[0]][1][start[1]][0], set()).add(start)
+            index += length
+
+    def unread(self):
+        def done(path, row):
+            return self.whole[path][row] or all(self.parts[path].get(row, [False]))
+        unread = []
+        for path, lines in self.rows.items():
+            if not all(done(path, row) for row in range(len(lines))):
+                unread.append((path, '部分' if done(path, 0) else '未读'))
+        return unread
+
+
+def unread_files(expected, seen):
+    """Return (path, 未读|部分) for each expected diff that the seen line lists do not cover line by line.
+
+    未读: its `diff --git` header line was not covered; 部分: the header was but some later line was not.
+    """
+    coverage = Coverage(expected)
+    for lines in seen:
+        coverage.read(lines)
+    return coverage.unread()
 
 
 def unread_note(unread, total, error=None):
@@ -1793,7 +1968,7 @@ class Reviewer:
                     break
                 events = read_events(result[1])
                 outputs, error = self.sessions.outputs(thread_id(events), started)
-                unread = unread_files(plan.expected, evidence_lines(outputs, events) if not error else set())
+                unread = unread_files(plan.expected, evidence_lines(outputs, events) if not error else [])
                 unread_counts.append(len(unread))
                 coverage = unread_note(unread, len(plan.expected), error) if unread else ''
                 if not unread:
