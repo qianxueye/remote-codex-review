@@ -44,7 +44,7 @@ class GovernancePrefetchTests(Harness):
                                                                           '1859.md'))
         self.assertFalse(path.is_relative_to(worktree))
         self.assertEqual(second[2], '# Rules\n\n\n')
-        prompt = cr.review_prompt(cr.first_prompt('main', ['src/app.py']), [cr.GovernanceDoc(ref, path)])
+        prompt = cr.review_prompt(cr.first_prompt('main'), [cr.GovernanceDoc(ref, path)])
         self.assertIn(f'- {REF}: {path}', prompt)
         self.assertIn('do not fetch them from the network', prompt)
         self.assertNotIn('could not be prefetched', self.github.posted[0]['body'])
@@ -67,7 +67,7 @@ class GovernancePrefetchTests(Harness):
                 self.assertIn(f'Governance issue `{REF}` linked from AGENTS.md could not be prefetched '
                               f'(GitHub HTTP {status}: {detail}); codex reviewed without it.', body)
                 self.assertEqual(self.codex.governance[0][1:], (None, None, f'GitHub HTTP {status}: {detail}'))
-                prompt = cr.review_prompt(cr.first_prompt('main', ['src/app.py']), [cr.GovernanceDoc(REF, error='x')])
+                prompt = cr.review_prompt(cr.first_prompt('main'), [cr.GovernanceDoc(REF, error='x')])
                 self.assertIn(f'not available; do not try to fetch them:\n- {REF}', prompt)
 
     def test_network_error_is_reported_not_raised(self):
@@ -81,8 +81,8 @@ class GovernancePrefetchTests(Harness):
         self.deliver(pull_payload())
         self.assertEqual(self.run_next()[1], 'clean')
         self.assertEqual((self.github.issue_calls, self.codex.governance), ([], []))
-        self.assertEqual(cr.review_prompt(cr.first_prompt('main', ['src/app.py']), []), cr.review_prompt(cr.first_prompt('main', ['src/app.py'])))
-        self.assertNotIn('AGENTS.md', cr.review_prompt(cr.first_prompt('main', ['src/app.py'])))
+        self.assertEqual(cr.review_prompt(cr.first_prompt('main'), []), cr.review_prompt(cr.first_prompt('main')))
+        self.assertNotIn('AGENTS.md', cr.review_prompt(cr.first_prompt('main')))
 
     def test_no_agents_file_means_no_fetch(self):
         self.git.agents = None

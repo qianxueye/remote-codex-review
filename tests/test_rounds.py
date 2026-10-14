@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import codex_review as cr  # noqa: E402
 from test_codex_review import HEAD, NEW_HEAD, REPO, WORKTREE, Harness, events_jsonl, pull_payload  # noqa: E402
-from test_codex_review import file_diff as cr_file_diff  # noqa: E402
+from test_codex_review import file_diff as cr_file_diff, session_item  # noqa: E402
+import json  # noqa: E402
 
 THIRD_HEAD = 'd' * 40
 TREE = 'c' * 40
@@ -59,7 +60,8 @@ class FirstRoundTests(Rounds):
         self.assertIn(cr.FIRST_ROUND_LENS, prompt)
         self.assertIn('git diff origin/main...HEAD', prompt)
         self.assertIn('git diff --name-only --no-renames origin/main...HEAD', prompt)
-        self.assertIn('- src/app.py\n- src/log.py', prompt)
+        self.assertEqual(self.codex.manifests, ['src/app.py\nsrc/log.py\n'])
+        self.assertIn('listed one per line in `', prompt)
         self.assertIn(cr.EXHAUSTIVE, prompt)
         self.assertIn('Confidence: <0-100>', prompt)
         self.assertIn(f'head={HEAD} verdict=findings effort=xhigh tests=read-only mode=full -->', body)
@@ -70,28 +72,19 @@ class FirstRoundTests(Rounds):
 
 
 class ReadCoverageTests(Rounds):
-    """Every changed file's diff must appear in the output of a successful command of at most READ_LIMIT bytes."""
+    """Every changed file's diff must appear, untruncated, in what the model saw from successful commands."""
 
     def setUp(self):
         super().setUp()
         self.git.files = ['src/app.py', 'src/b.py']
-
-    def events(self, outputs, exit_codes=None):
-        text = events_jsonl(message(verdict='CLEAN'), outputs=outputs)
-        for index, code in enumerate(exit_codes or []):
-            text = text.replace(f'"id": "item_{index}"', f'"id": "item_{index}", "rc": {code}')
-            text = text.replace(f'"id": "item_{index}", "rc": {code}', f'"id": "item_{index}"').replace(
-                f'"item_{index}", "type": "command_execution", "command": "/usr/bin/bash -lc \'git diff\'", '
-                f'"aggregated_output": {cr.json.dumps(outputs[index])}, "exit_code": 0',
-                f'"item_{index}", "type": "command_execution", "command": "/usr/bin/bash -lc \'git diff\'", '
-                f'"aggregated_output": {cr.json.dumps(outputs[index])}, "exit_code": {code}')
-        return text
 
     def test_all_files_read_is_clean(self):
         self.deliver(pull_payload())
         _, status = self.run_next()
         self.assertEqual(status, 'clean')
         self.assertEqual(self.git.ranges, [[f'refs/remotes/origin/main...{HEAD}']])
+        self.assertEqual(self.git.diff_worktrees, [self.root / 'work' / '1' / 'tree'])
+        self.assertEqual(self.sessions.calls[0][0], 't-1')
         self.assertNotIn('阅读不完整', self.github.posted[-1]['body'])
 
     def test_one_unread_file_after_three_reviews_is_failed_and_listed(self):
@@ -102,7 +95,7 @@ class ReadCoverageTests(Rounds):
         body = self.github.posted[-1]['body']
         self.assertEqual((status, len(self.codex.calls)), ('failed', 3))
         self.assertIn('verdict=failed', body)
-        self.assertIn('1 个改动文件（共 2 个）没有在合格的命令输出中读全：`src/b.py`（未读）', body)
+        self.assertIn('1 个改动文件（共 2 个）没有在模型看到的合格命令输出中读全：`src/b.py`（未读）', body)
         self.assertIn('本 head 审查 3 次（上限 3）；各次未读全的文件数：1、1、1。', body)
         self.assertNotIn('`src/app.py`', body)
         kept = (self.root / 'output' / '1.log').read_text(encoding='utf-8')
@@ -114,11 +107,10 @@ class ReadCoverageTests(Rounds):
         _, status = self.run_next()
         body = self.github.posted[-1]['body']
         self.assertEqual((status, len(self.codex.calls)), ('clean', 2))
-        self.assertNotIn('review 2 of at most 3', self.codex.calls[0][2])
+        self.assertNotIn('This is review', self.codex.calls[0][2])
         self.assertIn('This is review 2 of at most 3 of this head', self.codex.calls[1][2])
-        self.assertIn('when needed:\n- src/b.py', self.codex.calls[1][2])
-        self.assertNotIn('- src/app.py\n- src/b.py\n\nThis is review', self.codex.calls[1][2].replace(
-            cr.read_rule('origin/main...HEAD', ['src/app.py', 'src/b.py']), ''))
+        self.assertIn('of 1 changed file(s), listed one per line in `', self.codex.calls[1][2])
+        self.assertEqual(self.codex.unread_lists, [None, 'src/b.py\n'])
         self.assertIn('本 head 审查 2 次（上限 3）；各次未读全的文件数：1、0。', body)
         self.assertNotIn('阅读不完整', body)
         self.assertIn('verdict=clean', body)
@@ -131,8 +123,7 @@ class ReadCoverageTests(Rounds):
         self.assertIn('各次未读全的文件数：2、1、2。', self.github.posted[-1]['body'])
 
     def test_partly_read_file_is_failed_as_partial(self):
-        partial = cr_file_diff('src/app.py').rsplit('\n', 2)[0] + '\n'
-        self.codex.events = self.events([partial, cr_file_diff('src/b.py')])
+        self.codex.outputs = [cr_file_diff('src/app.py').rsplit('\n', 2)[0] + '\n', cr_file_diff('src/b.py')]
         self.deliver(pull_payload())
         _, status = self.run_next()
         self.assertEqual(status, 'failed')
@@ -146,23 +137,30 @@ class ReadCoverageTests(Rounds):
         body = self.github.posted[-1]['body']
         self.assertEqual((status, len(self.codex.calls)), ('findings', 3))
         self.assertIn('verdict=findings', body)
-        self.assertIn('**阅读不完整**：1 个改动文件（共 2 个）没有在合格的命令输出中读全：`src/b.py`（未读）。', body)
+        self.assertIn('**阅读不完整**：1 个改动文件（共 2 个）没有在模型看到的合格命令输出中读全：`src/b.py`（未读）。', body)
         self.assertIn('本 head 审查 3 次（上限 3）；各次未读全的文件数：1、1、1。', body)
         self.assertIn('Retry never stops', body)
         self.assertTrue((self.root / 'output' / '1.log').exists())
 
-    def test_output_over_20000_bytes_is_not_evidence(self):
-        self.assertEqual(cr.READ_LIMIT, 20000)
-        padded = cr_file_diff('src/app.py') + '+' + 'x' * 20000 + '\n'
-        self.codex.events = self.events([padded, cr_file_diff('src/b.py')])
+    def test_output_truncated_for_the_model_is_not_evidence(self):
+        self.codex.truncate = True
         self.deliver(pull_payload())
         _, status = self.run_next()
-        self.assertEqual(status, 'failed')
-        self.assertIn('`src/app.py`（未读）', self.github.posted[-1]['body'])
+        self.assertEqual((status, len(self.codex.calls)), ('failed', 3))
+        self.assertIn('`src/app.py`（未读）、`src/b.py`（未读）', self.github.posted[-1]['body'])
+
+    def test_unreadable_session_record_is_not_evidence_and_is_explained(self):
+        self.sessions.error = 'no session record for thread t-1 under /nonexistent/sessions'
+        self.deliver(pull_payload())
+        _, status = self.run_next()
+        body = self.github.posted[-1]['body']
+        self.assertEqual((status, len(self.codex.calls)), ('failed', 3))
+        self.assertIn('2 个改动文件（共 2 个）没有在模型看到的合格命令输出中读全：`src/app.py`（未读）、`src/b.py`（未读）'
+                      '（codex 会话记录不可用，一律不算证据：no session record for thread t-1 under /nonexistent/sessions）',
+                      body)
 
     def test_output_of_a_failed_command_is_not_evidence(self):
-        self.codex.events = self.events([cr_file_diff('src/app.py'), cr_file_diff('src/b.py')], exit_codes=[1])
-        self.assertIn('"exit_code": 1', self.codex.events)
+        self.codex.exit_code = 1
         self.deliver(pull_payload())
         _, status = self.run_next()
         self.assertEqual(status, 'failed')
@@ -170,9 +168,21 @@ class ReadCoverageTests(Rounds):
 
     def test_a_diff_read_in_parts_counts(self):
         lines = cr_file_diff('src/app.py').splitlines(keepends=True)
-        self.codex.events = self.events([''.join(lines[:3]), ''.join(lines[3:]), cr_file_diff('src/b.py')])
+        self.codex.outputs = [''.join(lines[:3]), ''.join(lines[3:]), cr_file_diff('src/b.py')]
         self.deliver(pull_payload())
         self.assertEqual(self.run_next()[1], 'clean')
+
+    def test_a_line_longer_than_the_fold_width_counts_when_every_segment_was_seen(self):
+        self.assertEqual(cr.FOLD_WIDTH, 4000)
+        long_line = '+' + 'é' * 6000
+        expected = {'big.min.js': f'diff --git a/big.min.js b/big.min.js\n@@ -1 +1 @@\n{long_line}\n'}
+        folded = cr.fold(long_line)
+        self.assertEqual(len(folded), 4)
+        self.assertIn('\ufffd', folded[0])
+        shown = 'diff --git a/big.min.js b/big.min.js\n@@ -1 +1 @@\n' + '\n'.join(folded) + '\n'
+        lines = cr.evidence_lines([session_item(shown)], cr.read_events(events_jsonl('', outputs=[shown])))
+        self.assertEqual(cr.unread_files(expected, lines), [])
+        self.assertEqual(cr.unread_files(expected, lines - {folded[1]}), [('big.min.js', '部分')])
 
     def test_delta_review_requires_only_the_delta_files(self):
         self.first_round(message(verdict='CLEAN'))
@@ -181,56 +191,91 @@ class ReadCoverageTests(Rounds):
         self.assertEqual(status, 'clean')
         self.assertEqual(self.git.ranges[-1], [TREE, NEW_HEAD])
         self.assertIn(f'git diff --name-only --no-renames {TREE} HEAD', self.codex.calls[-1][2])
+        self.assertEqual(self.codex.manifests[-1], 'src/fix.py\n')
         self.assertEqual(list(self.git.expected), ['src/fix.py'])
         self.codex.read = []
         calls = len(self.codex.calls)
         status, body = self.second_head(message(verdict='CLEAN'), guid='d-3', head=THIRD_HEAD)
         self.assertEqual((status, len(self.codex.calls) - calls), ('failed', 3))
-        self.assertIn('1 个改动文件（共 1 个）没有在合格的命令输出中读全：`src/fix.py`（未读）', body)
+        self.assertIn('1 个改动文件（共 1 个）没有在模型看到的合格命令输出中读全：`src/fix.py`（未读）', body)
         self.assertIn(f'git diff --name-only --no-renames {TREE} HEAD', self.codex.calls[-1][2])
-        self.assertIn('when needed:\n- src/fix.py', self.codex.calls[-1][2])
+        self.assertEqual(self.codex.unread_lists[-1], 'src/fix.py\n')
 
 
-class RealDiffTests(unittest.TestCase):
-    """Real git: binary, mode-only, deleted and renamed files have diffs without hunks and must still be shown."""
+class SessionLogTests(unittest.TestCase):
+    """SessionLog reads `$CODEX_HOME/sessions/**/rollout-*.jsonl`; visible_output decodes one tool-output item."""
 
-    def test_file_diffs_cover_every_kind_of_change(self):
+    def rollout(self, home, name, meta, items):
+        path = home / 'sessions' / '2026' / '10' / '14' / f'rollout-2026-10-14T00-00-00-{name}.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps({'timestamp': 't', 'type': 'session_meta', 'payload': meta})]
+        lines += [json.dumps({'timestamp': 't', 'type': 'response_item', 'payload': item}) for item in items]
+        path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+    def test_outputs_of_the_thread_and_its_child_are_returned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.rollout(home, 'parent', {'id': 'thread-1', 'cwd': '/w'},
+                         [{'type': 'custom_tool_call_output', 'call_id': 'c1', 'output': session_item('one\n')}])
+            self.rollout(home, 'child', {'id': 'thread-2', 'parent_thread_id': 'thread-1'},
+                         [{'type': 'function_call_output', 'call_id': 'c2', 'output': 'two\n'},
+                          {'type': 'message', 'role': 'assistant', 'content': []}])
+            self.rollout(home, 'other', {'id': 'thread-9'},
+                         [{'type': 'custom_tool_call_output', 'call_id': 'c3', 'output': session_item('nine\n')}])
+            outputs, error = cr.SessionLog(home).outputs('thread-1', 0)
+            self.assertIsNone(error)
+            self.assertEqual(sorted(cr.visible_output(o) for o in outputs), ['one\n', 'two\n'])
+            self.assertEqual(cr.SessionLog(home).outputs('thread-7', 0), ([], f'no session record for thread thread-7 under {home / "sessions"}'))
+            self.assertEqual(cr.SessionLog(home).outputs('', 0), ([], 'the codex events carry no thread id'))
+            self.assertEqual(cr.SessionLog(home / 'missing').outputs('thread-1', 0),
+                             ([], f'no sessions directory at {home / "missing" / "sessions"}'))
+
+    def test_visible_output_rejects_truncated_failed_and_unreadable_items(self):
+        self.assertEqual(cr.visible_output(session_item('a\nb\n')), 'a\nb\n')
+        self.assertIsNone(cr.visible_output(session_item('a\nb\n', truncated=True)))
+        self.assertIsNone(cr.visible_output(session_item('a\nb\n', exit_code=1)))
+        self.assertIsNone(cr.visible_output('Warning: truncated output (original token count: 5)\na\n'))
+        self.assertEqual(cr.visible_output('plain shell output\n'), 'plain shell output\n')
+        broken = session_item('a\n')
+        broken[1]['text'] = broken[1]['text'][:-5]
+        self.assertIsNone(cr.visible_output(broken))
+        self.assertIsNone(cr.visible_output([{'type': 'input_text', 'text': 'tool listing without a chunk'}]))
+        self.assertIsNone(cr.visible_output({'unexpected': 'shape'}))
+        self.assertIsNone(cr.visible_output(None))
+        two = session_item('a\n')
+        two[1]['text'] += '\n' + session_item('b\n')[1]['text']
+        self.assertEqual(cr.visible_output(two), 'a\n\nb\n')
+
+    def test_evidence_needs_both_the_model_view_and_a_successful_command(self):
+        events = cr.read_events(events_jsonl('', outputs=['x\ny\n']))
+        self.assertEqual(cr.evidence_lines([session_item('x\nz\n')], events), {'x', ''})
+        self.assertEqual(cr.evidence_lines([session_item('x\ny\n')], cr.read_events(events_jsonl('', outputs=['x\ny\n'], exit_code=1))), set())
+
+
+class ManifestTests(unittest.TestCase):
+    """The changed-file list reaches codex through a file, so a huge PR cannot overflow one argv entry."""
+
+    def test_five_thousand_files_start_codex_with_bounded_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            src, store = root / 'src', cr.Git(root / 'state')
-            src.mkdir()
-            git(src, 'init', '-q', '-b', 'main')
-            (src / 'bin.dat').write_bytes(b'\x00\x01\x02')
-            (src / 'old.py').write_text('print(1)\n' * 10)
-            (src / 'gone.py').write_text('x = 1\n')
-            (src / 'run.sh').write_text('echo\n')
-            git(src, 'add', '-A')
-            git(src, 'commit', '-qm', 'base')
-            git(src, 'switch', '-qc', 'pr')
-            (src / 'bin.dat').write_bytes(b'\x00\x01\x03')
-            git(src, 'mv', 'old.py', 'new.py')
-            (src / 'gone.py').unlink()
-            (src / 'run.sh').chmod(0o755)
-            git(src, 'add', '-A')
-            git(src, 'commit', '-qm', 'pr')
-            head = git(src, 'rev-parse', 'HEAD')
-            mirror = store.mirror(REPO)
-            mirror.parent.mkdir(parents=True)
-            git(root, 'init', '-q', '--bare', str(mirror))
-            git(src, 'push', '-q', str(mirror), 'main:refs/remotes/origin/main', 'pr:refs/codex/pr/7')
-            files = store.changed_files(REPO, 'main', head)
-            expected = store.file_diffs(REPO, [f'refs/remotes/origin/main...{head}'], files)
-        self.assertEqual(sorted(expected), ['bin.dat', 'gone.py', 'new.py', 'old.py', 'run.sh'])
-        self.assertIn('Binary files a/bin.dat and b/bin.dat differ', expected['bin.dat'])
-        self.assertIn('old mode 100644\nnew mode 100755', expected['run.sh'])
-        self.assertIn('deleted file mode', expected['gone.py'])
-        self.assertIn('new file mode', expected['new.py'])
-        self.assertNotIn('rename', expected['new.py'])
-        self.assertFalse(any('@@' in expected[name] for name in ('bin.dat', 'run.sh')))
-        shown = cr.read_events(events_jsonl('', outputs=list(expected.values())))
-        self.assertEqual(cr.unread_files(expected, shown), [])
-        without_binary = cr.read_events(events_jsonl('', outputs=[t for n, t in expected.items() if n != 'bin.dat']))
-        self.assertEqual(cr.unread_files(expected, without_binary), [('bin.dat', '未读')])
+            stub = root / 'codex-stub'
+            stub.write_text('#!/usr/bin/env python3\nimport sys\n'
+                            "print(max(len(a.encode()) for a in sys.argv))\n"
+                            "open(sys.argv[sys.argv.index('-o') + 1], 'w').write('ok')\n", encoding='utf-8')
+            stub.chmod(0o700)
+            files = [f'src/package/module_{n:05d}/implementation_file_{n:05d}.py' for n in range(5000)]
+            manifest = root / 'changed-files.txt'
+            manifest.write_text(''.join(f'{f}\n' for f in files), encoding='utf-8')
+            sections = cr.first_prompt('main') + [cr.read_rule('origin/main...HEAD', manifest, len(files))]
+            scratch = root / 'review1'
+            scratch.mkdir()
+            rc, output, _, last, timed_out = cr.CodexRunner(str(stub))(1, root, sections, 'xhigh', 60, scratch,
+                                                                        lambda: True)
+            self.assertEqual((rc, last, timed_out), (0, 'ok', False))
+            self.assertLess(int(output.strip()), 131072)
+            self.assertIn(f'listed one per line in `{manifest}`', cr.review_prompt(sections))
+            self.assertNotIn('implementation_file_04999.py', cr.review_prompt(sections))
+            self.assertEqual(manifest.read_text(encoding='utf-8').count('\n'), 5000)
 
 
 class DeltaTests(Rounds):
@@ -243,7 +288,7 @@ class DeltaTests(Rounds):
         prompt, effort = self.codex.calls[1][2], self.codex.calls[1][3]
         self.assertEqual(self.git.delta_calls, [(HEAD, NEW_HEAD)])
         self.assertIn(f'run `git diff {TREE} HEAD`', prompt)
-        self.assertIn('- src/fix.py', prompt)
+        self.assertEqual(self.codex.manifests[-1], 'src/fix.py\n')
         self.assertNotIn('origin/main...HEAD', prompt)
         self.assertIn('Retry never stops', prompt)
         self.assertEqual(effort, 'high')
@@ -565,6 +610,76 @@ class DeltaTreeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RealDiffTests(unittest.TestCase):
+    """Real git: reference diffs come from codex's worktree, keep CRLF bytes, and honour `.gitattributes`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.src, self.store = root / 'src', cr.Git(root / 'state')
+        self.src.mkdir()
+        git(self.src, 'init', '-q', '-b', 'main')
+        (self.src / '.gitattributes').write_text('*.dat -diff\n')
+        (self.src / 'bin.dat').write_bytes(b'\x00\x01\x02')
+        (self.src / 'data.dat').write_text('alpha\nbeta\n')
+        (self.src / 'win.txt').write_bytes(b'one\r\ntwo\r\n')
+        (self.src / 'old.py').write_text('print(1)\n' * 10)
+        (self.src / 'gone.py').write_text('x = 1\n')
+        (self.src / 'run.sh').write_text('echo\n')
+        git(self.src, 'add', '-A')
+        git(self.src, 'commit', '-qm', 'base')
+        git(self.src, 'switch', '-qc', 'pr')
+        (self.src / 'bin.dat').write_bytes(b'\x00\x01\x03')
+        (self.src / 'data.dat').write_text('alpha\ngamma\n')
+        (self.src / 'win.txt').write_bytes(b'one\r\nthree\r\n')
+        git(self.src, 'mv', 'old.py', 'new.py')
+        (self.src / 'gone.py').unlink()
+        (self.src / 'run.sh').chmod(0o755)
+        git(self.src, 'add', '-A')
+        git(self.src, 'commit', '-qm', 'pr')
+        self.head = git(self.src, 'rev-parse', 'HEAD')
+        mirror = self.store.mirror(REPO)
+        mirror.parent.mkdir(parents=True)
+        git(root, 'init', '-q', '--bare', str(mirror))
+        git(self.src, 'push', '-q', str(mirror), 'main:refs/remotes/origin/main', 'pr:refs/codex/pr/7')
+        self.worktree = root / 'state' / 'work' / '1' / 'tree'
+        self.store.add_worktree(REPO, self.worktree, self.head)
+        self.files = self.store.changed_files(REPO, 'main', self.head)
+        self.expected = self.store.file_diffs(self.worktree, [f'refs/remotes/origin/main...{self.head}'], self.files)
+
+    def tearDown(self):
+        self.store.remove_worktree(REPO, self.worktree)
+        self.tmp.cleanup()
+
+    def codex_output(self, path):
+        """The bytes codex's own `git diff` prints for path in the worktree, decoded as codex does."""
+        return subprocess.run(['git', '-C', str(self.worktree), 'diff', '--no-renames', 'origin/main...HEAD', '--', path],
+                              check=True, capture_output=True).stdout.decode('utf-8', 'replace')
+
+    def test_file_diffs_cover_every_kind_of_change(self):
+        self.assertEqual(sorted(self.expected), ['bin.dat', 'data.dat', 'gone.py', 'new.py', 'old.py', 'run.sh', 'win.txt'])
+        self.assertIn('Binary files a/bin.dat and b/bin.dat differ', self.expected['bin.dat'])
+        self.assertIn('old mode 100644\nnew mode 100755', self.expected['run.sh'])
+        self.assertIn('deleted file mode', self.expected['gone.py'])
+        self.assertIn('new file mode', self.expected['new.py'])
+        self.assertNotIn('rename', self.expected['new.py'])
+        shown = [self.codex_output(path) for path in self.files]
+        lines = cr.evidence_lines([session_item(text) for text in shown], cr.read_events(events_jsonl('', outputs=shown)))
+        self.assertEqual(cr.unread_files(self.expected, lines), [])
+        without_binary = [self.codex_output(path) for path in self.files if path != 'bin.dat']
+        lines = cr.evidence_lines([session_item(t) for t in without_binary], cr.read_events(events_jsonl('', outputs=without_binary)))
+        self.assertEqual(cr.unread_files(self.expected, lines), [('bin.dat', '未读')])
+
+    def test_crlf_lines_keep_their_bytes_on_both_sides(self):
+        self.assertIn('-two\r\n+three\r\n', self.expected['win.txt'])
+        self.assertEqual(self.expected['win.txt'], self.codex_output('win.txt'))
+
+    def test_minus_diff_attribute_is_applied_to_the_reference(self):
+        self.assertIn('Binary files a/data.dat and b/data.dat differ', self.expected['data.dat'])
+        self.assertNotIn('+gamma', self.expected['data.dat'])
+        self.assertEqual(self.expected['data.dat'], self.codex_output('data.dat'))
 
 
 class ShutdownTests(Rounds):

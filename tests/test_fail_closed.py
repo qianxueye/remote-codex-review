@@ -31,7 +31,7 @@ def fixture(name):
 def judge(stdout, last, rc=0):
     """Return assess()'s (verdict, summary, findings, reasons)."""
     events = cr.read_events(stdout)
-    verdict, review, reasons, _ = cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
+    verdict, review, reasons = cr.assess(rc, events, cr.final_message(events, last), (WORKTREE,))
     return verdict, review.text, review.findings if verdict == 'findings' else [], reasons
     return verdict, summary, posted, reasons
 

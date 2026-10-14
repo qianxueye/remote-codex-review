@@ -31,16 +31,25 @@ def file_diff(path):
     return f'diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new {path}\n'
 
 
-def events_jsonl(message, read=True, outputs=None):
-    """Return a minimal `codex exec --json` stream: successful commands, the message, a completed turn."""
+def events_jsonl(message, read=True, outputs=None, exit_code=0):
+    """Return a minimal `codex exec --json` stream: commands, the message, a completed turn."""
     events = [{'type': 'thread.started', 'thread_id': 't-1'}, {'type': 'turn.started'}]
     for index, output in enumerate(outputs if outputs is not None else [file_diff('x')] if read else []):
         events.append({'type': 'item.completed', 'item': {
             'id': f'item_{index}', 'type': 'command_execution', 'command': "/usr/bin/bash -lc 'git diff'",
-            'aggregated_output': output, 'exit_code': 0, 'status': 'completed'}})
+            'aggregated_output': output, 'exit_code': exit_code, 'status': 'completed'}})
     events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
     events.append({'type': 'turn.completed', 'usage': {}})
     return '\n'.join(json.dumps(event) for event in events) + '\n'
+def session_item(output, exit_code=0, truncated=False):
+    """Return one code-mode tool-output item as codex records it in the session rollout."""
+    chunk = json.dumps({'chunk_id': 'c1', 'exit_code': exit_code, 'original_token_count': 1, 'output': output,
+                        'wall_time_seconds': 0.1})
+    warning = 'Warning: truncated output (original token count: 9999)\nTotal output lines: 1\n\n' if truncated else ''
+    return [{'type': 'input_text', 'text': 'Script completed\nWall time 0.1 seconds\nOutput:\n'},
+            {'type': 'input_text', 'text': warning + chunk}]
+
+
 FINDINGS = f"""Two defects remain.
 
 Full review comments:
@@ -160,8 +169,9 @@ class FakeGit:
     def diff_files(self, full_name, tree, head):
         return getattr(self, 'delta_files', ['src/fix.py'])
 
-    def file_diffs(self, full_name, range_args, files):
+    def file_diffs(self, worktree, range_args, files):
         self.ranges = getattr(self, 'ranges', []) + [range_args]
+        self.diff_worktrees = getattr(self, 'diff_worktrees', []) + [worktree]
         self.expected = {path: file_diff(path) for path in files}
         return self.expected
 
@@ -185,6 +195,12 @@ class FakeCodex:
         self.git = None
         self.read = None
         self.reads = []
+        self.outputs = None
+        self.truncate = False
+        self.exit_code = 0
+        self.shown = []
+        self.manifests = []
+        self.unread_lists = []
 
     def __call__(self, job_id, worktree, sections, effort, timeout, scratch, proceed, governance=()):
         if getattr(self, 'before_proceed', None):
@@ -201,12 +217,20 @@ class FakeCodex:
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))
+        manifest, listed = Path(scratch).parent / 'changed-files.txt', Path(scratch) / 'unread-files.txt'
+        self.manifests.append(manifest.read_text(encoding='utf-8') if manifest.exists() else None)
+        self.unread_lists.append(listed.read_text(encoding='utf-8') if listed.exists() else None)
+        expected = getattr(self.git, 'expected', None)
+        if self.outputs is not None:
+            outputs = list(self.outputs)
+        elif expected is None:
+            outputs = [file_diff('x')]
+        else:
+            outputs = [expected[p] for p in (self.read if self.read is not None else expected)]
+        self.shown.append([session_item(text, self.exit_code, self.truncate) for text in outputs])
         events = self.events
         if events is None:
-            expected = getattr(self.git, 'expected', None)
-            outputs = None if expected is None else [expected[p] for p in (self.read if self.read is not None
-                                                                           else expected)]
-            events = events_jsonl(message, outputs=outputs)
+            events = events_jsonl(message, outputs=outputs, exit_code=self.exit_code)
         return self.rc, events, 'progress\n', message, self.timed_out
 
     def cancel(self, job_ids):
@@ -214,6 +238,19 @@ class FakeCodex:
 
     def cancel_all(self):
         pass
+
+
+class FakeSessions:
+    """Hands back what FakeCodex showed the model in its latest call, or a configured read error."""
+
+    def __init__(self, codex):
+        self.codex, self.error, self.calls = codex, None, []
+
+    def outputs(self, thread, since):
+        self.calls.append((thread, since))
+        if self.error:
+            return [], self.error
+        return (self.codex.shown[-1] if self.codex.shown else []), None
 
 
 class Harness(unittest.TestCase):
@@ -226,7 +263,9 @@ class Harness(unittest.TestCase):
         self.git = FakeGit(self.root)
         self.codex = FakeCodex(CLEAN)
         self.codex.git = self.git
-        self.reviewer = cr.Reviewer(self.config, self.github, self.store, self.git, self.codex)
+        self.sessions = FakeSessions(self.codex)
+        self.reviewer = cr.Reviewer(self.config, self.github, self.store, self.git, self.codex,
+                                    sessions=self.sessions)
         self.app = cr.WebhookApp(self.config, self.store, SECRET, on_queued=self.reviewer.on_queued)
 
     def tearDown(self):
@@ -264,7 +303,7 @@ class ParseTests(unittest.TestCase):
 
     def test_priority_tag_without_location_still_counts_as_findings(self):
         message = 'One issue: [P2] the retry loop never ends.'
-        verdict, review, _, _ = cr.assess(0, cr.read_events(events_jsonl(message)), message)
+        verdict, review, _ = cr.assess(0, cr.read_events(events_jsonl(message)), message)
         self.assertEqual((verdict, review.findings), ('findings', []))
         body = cr.review_body(HEAD, verdict, review.text, review.findings)
         self.assertIn('[P2] the retry loop never ends.', body)
@@ -709,7 +748,7 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertEqual(cr.MARKER_RE.search(body).group(1), HEAD)
 
     def test_command_is_read_only_and_forbids_tests(self):
-        sections = cr.first_prompt('main', ['src/app.py'])
+        sections = cr.first_prompt('main')
         command = cr.CodexRunner('codex').command(sections, '/w/last.txt', 'high')
         self.assertEqual(command, ['codex', 'exec', '--json', '--sandbox', 'read-only',
                                    '-c', 'approval_policy="never"', '-c', 'model_reasoning_effort=high',
