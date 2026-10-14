@@ -223,7 +223,7 @@ class SessionLogTests(unittest.TestCase):
                                                                'exit_code': 0, 'aggregated_output': 'one\n'}},
                           {'type': 'item_completed', 'item': {'type': 'AgentMessage', 'id': 'm1'}}])
             self.rollout(home, 'child', {'id': 'thread-2', 'parent_thread_id': 'thread-1'},
-                         [{'type': 'function_call_output', 'call_id': 'c2', 'output': 'two\n'},
+                         [{'type': 'function_call_output', 'call_id': 'c2', 'output': session_item('two\n')},
                           {'type': 'message', 'role': 'assistant', 'content': []}])
             self.rollout(home, 'other', {'id': 'thread-9'},
                          [{'type': 'custom_tool_call_output', 'call_id': 'c3', 'output': session_item('nine\n')}])
@@ -243,7 +243,7 @@ class SessionLogTests(unittest.TestCase):
         self.assertEqual(cr.visible_texts([session_item('a\nb\n', truncated=True)]), [])
         self.assertEqual(cr.visible_texts([session_item('a\nb\n', exit_code=1)]), [])
         self.assertEqual(cr.visible_texts(['Warning: truncated output (original token count: 5)\na\n']), [])
-        self.assertEqual(cr.visible_texts(['plain shell output\n']), ['plain shell output\n'])
+        self.assertEqual(cr.visible_texts(['plain shell output\n']), [])
         broken = session_item('a\n')
         broken[1]['text'] = broken[1]['text'][:-5]
         self.assertEqual(cr.visible_texts([broken]), [])

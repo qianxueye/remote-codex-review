@@ -649,8 +649,6 @@ def output_chunks(output, formatted=None):
     to one is that command's output. Any other part starting with the truncation warning means the wrapper cut it.
     """
     formatted = formatted or {}
-    if isinstance(output, str):
-        return [] if TRUNCATION_RE.match(output) else [{'exit_code': 0, 'output': output, 'truncated': False}]
     if not isinstance(output, list):
         return []
     parts = [part.get('text', '') for part in output if isinstance(part, dict)]
