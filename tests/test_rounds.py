@@ -94,16 +94,41 @@ class ReadCoverageTests(Rounds):
         self.assertEqual(self.git.ranges, [[f'refs/remotes/origin/main...{HEAD}']])
         self.assertNotIn('阅读不完整', self.github.posted[-1]['body'])
 
-    def test_one_unread_file_is_failed_and_listed(self):
+    def test_one_unread_file_after_three_reviews_is_failed_and_listed(self):
+        self.assertEqual(cr.READ_ATTEMPTS, 3)
         self.codex.read = ['src/app.py']
         self.deliver(pull_payload())
         _, status = self.run_next()
         body = self.github.posted[-1]['body']
-        self.assertEqual(status, 'failed')
+        self.assertEqual((status, len(self.codex.calls)), ('failed', 3))
         self.assertIn('verdict=failed', body)
         self.assertIn('1 个改动文件（共 2 个）没有在合格的命令输出中读全：`src/b.py`（未读）', body)
+        self.assertIn('本 head 审查 3 次（上限 3）；各次未读全的文件数：1、1、1。', body)
         self.assertNotIn('`src/app.py`', body)
-        self.assertTrue((self.root / 'output' / '1.log').exists())
+        kept = (self.root / 'output' / '1.log').read_text(encoding='utf-8')
+        self.assertEqual(kept.count('===== review '), 3)
+
+    def test_a_file_read_in_the_second_review_is_clean(self):
+        self.codex.reads = [['src/app.py'], ['src/app.py', 'src/b.py']]
+        self.deliver(pull_payload())
+        _, status = self.run_next()
+        body = self.github.posted[-1]['body']
+        self.assertEqual((status, len(self.codex.calls)), ('clean', 2))
+        self.assertNotIn('review 2 of at most 3', self.codex.calls[0][2])
+        self.assertIn('This is review 2 of at most 3 of this head', self.codex.calls[1][2])
+        self.assertIn('when needed:\n- src/b.py', self.codex.calls[1][2])
+        self.assertNotIn('- src/app.py\n- src/b.py\n\nThis is review', self.codex.calls[1][2].replace(
+            cr.read_rule('origin/main...HEAD', ['src/app.py', 'src/b.py']), ''))
+        self.assertIn('本 head 审查 2 次（上限 3）；各次未读全的文件数：1、0。', body)
+        self.assertNotIn('阅读不完整', body)
+        self.assertIn('verdict=clean', body)
+
+    def test_the_third_review_is_the_last(self):
+        self.codex.reads = [[], ['src/app.py'], [], ['src/app.py', 'src/b.py']]
+        self.deliver(pull_payload())
+        _, status = self.run_next()
+        self.assertEqual((status, len(self.codex.calls)), ('failed', 3))
+        self.assertIn('各次未读全的文件数：2、1、2。', self.github.posted[-1]['body'])
 
     def test_partly_read_file_is_failed_as_partial(self):
         partial = cr_file_diff('src/app.py').rsplit('\n', 2)[0] + '\n'
@@ -115,13 +140,14 @@ class ReadCoverageTests(Rounds):
 
     def test_findings_with_an_unread_file_are_published_with_a_note(self):
         self.codex.read = ['src/app.py']
-        self.codex.messages = [message(finding('P2', 'Retry never stops', 'src/app.py', 10, 80))]
+        self.codex.messages = [message(finding('P2', 'Retry never stops', 'src/app.py', 10, 80))] * 3
         self.deliver(pull_payload())
         _, status = self.run_next()
         body = self.github.posted[-1]['body']
-        self.assertEqual(status, 'findings')
+        self.assertEqual((status, len(self.codex.calls)), ('findings', 3))
         self.assertIn('verdict=findings', body)
         self.assertIn('**阅读不完整**：1 个改动文件（共 2 个）没有在合格的命令输出中读全：`src/b.py`（未读）。', body)
+        self.assertIn('本 head 审查 3 次（上限 3）；各次未读全的文件数：1、1、1。', body)
         self.assertIn('Retry never stops', body)
         self.assertTrue((self.root / 'output' / '1.log').exists())
 
@@ -157,9 +183,12 @@ class ReadCoverageTests(Rounds):
         self.assertIn(f'git diff --name-only --no-renames {TREE} HEAD', self.codex.calls[-1][2])
         self.assertEqual(list(self.git.expected), ['src/fix.py'])
         self.codex.read = []
+        calls = len(self.codex.calls)
         status, body = self.second_head(message(verdict='CLEAN'), guid='d-3', head=THIRD_HEAD)
-        self.assertEqual(status, 'failed')
+        self.assertEqual((status, len(self.codex.calls) - calls), ('failed', 3))
         self.assertIn('1 个改动文件（共 1 个）没有在合格的命令输出中读全：`src/fix.py`（未读）', body)
+        self.assertIn(f'git diff --name-only --no-renames {TREE} HEAD', self.codex.calls[-1][2])
+        self.assertIn('when needed:\n- src/fix.py', self.codex.calls[-1][2])
 
 
 class RealDiffTests(unittest.TestCase):

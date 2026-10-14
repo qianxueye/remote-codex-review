@@ -69,6 +69,11 @@ CONFIDENCE_RULE = (
     'is real; end every register line the same way.')
 READ_LIMIT = 20000
 READ_LINES = 150
+READ_ATTEMPTS = 3
+READ_RETRY_RULE = (
+    'This is review {attempt} of at most {total} of this head: the previous review did not show the complete diff '
+    'of these files in qualifying output. Before anything else, read each of them in full, in parts of at most '
+    '{lines} lines when needed:\n{files}')
 READ_RULE = (
     'Read the complete diff of every changed file. List them with `git diff --name-only --no-renames {range}`, '
     'then read each one with `git diff --no-renames {range} -- <path>` (several small files per command are fine). '
@@ -1311,6 +1316,11 @@ def read_rule(range_text, files):
                             files='\n'.join(f'- {f}' for f in files))
 
 
+def read_retry_rule(attempt, unread):
+    return READ_RETRY_RULE.format(attempt=attempt, total=READ_ATTEMPTS, lines=READ_LINES,
+                                  files='\n'.join(f'- {path}' for path, _ in unread))
+
+
 def first_prompt(base, files):
     """Return the prompt sections of the first round over `origin/<base>...HEAD`."""
     return [BASE_PROMPT.format(base=base), FIRST_ROUND_LENS, EXHAUSTIVE, read_rule(f'origin/{base}...HEAD', files)]
@@ -1495,15 +1505,17 @@ class Reviewer:
             return 'skipped'
         return None
 
-    def keep_output(self, job, output, stderr, last):
-        """Write the codex output to state_dir/output/<job id>.log with mode 0600."""
+    def keep_output(self, job, runs):
+        """Write every review attempt's codex output to state_dir/output/<job id>.log with mode 0600."""
         path = self.config.state_dir / 'output' / f'{job.id}.log'
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             os.fchmod(handle.fileno(), 0o600)
-            handle.write(output + ('\n--- stderr ---\n' + stderr if stderr else '')
-                         + ('\n--- last message ---\n' + last + '\n' if last else '\n'))
+            for attempt, _, output, stderr, last, _ in runs:
+                handle.write(f'===== review {attempt} =====\n' + output
+                             + ('\n--- stderr ---\n' + stderr if stderr else '')
+                             + ('\n--- last message ---\n' + last + '\n' if last else '\n'))
 
     def work_forever(self):
         while not self.stop.is_set():
@@ -1665,18 +1677,35 @@ class Reviewer:
                 job.head, 'clean', '', [], effort='none', mode='delta', scope=(
                     f'复审：增量 `{plan.prev[:12]}..{job.head[:12]}` 为空（相对上次已审 head 只有从 origin/{base} '
                     '合入的改动），未调用 codex。')), [], token)
+        runs, unread_counts = [], []
         try:
             governance = prefetch_governance(self.github, token, worktree, scratch / 'governance')
             for doc in governance:
                 if doc.error:
                     log(f'{job}: governance issue {doc.ref} not prefetched: {doc.error}')
             running = lambda: not self.stop.is_set() and self.store.status(job.id) == 'running'  # noqa: E731
-            log(f'{job}: codex {plan.mode} review started against origin/{base} effort={plan.effort}')
-            started = time.time()
-            (scratch / 'codex').mkdir(parents=True, exist_ok=True)
-            rc, output, stderr, last, timed_out = self.codex(job.id, worktree, plan.sections, plan.effort,
-                                                             plan.timeout, scratch / 'codex', running, governance)
-            log(f'{job}: codex finished rc={rc} timed_out={timed_out} after {int(time.time() - started)} s')
+            unread = []
+            for attempt in range(1, READ_ATTEMPTS + 1):
+                if not running():
+                    break
+                sections = plan.sections + ([read_retry_rule(attempt, unread)] if unread else [])
+                directory = scratch / f'review{attempt}'
+                directory.mkdir(parents=True, exist_ok=True)
+                log(f'{job}: codex {plan.mode} review {attempt}/{READ_ATTEMPTS} started against origin/{base} '
+                    f'effort={plan.effort}')
+                started = time.time()
+                result = self.codex(job.id, worktree, sections, plan.effort, plan.timeout, directory, running,
+                                    governance)
+                log(f'{job}: codex review {attempt} finished rc={result[0]} timed_out={result[4]} '
+                    f'after {int(time.time() - started)} s')
+                runs.append((attempt, *result))
+                if result[0] != 0 or result[4]:
+                    break
+                unread = unread_files(plan.expected, read_events(result[1]))
+                unread_counts.append(len(unread))
+                if not unread:
+                    break
+                log(f'{job}: review {attempt}/{READ_ATTEMPTS}: {unread_note(unread, len(plan.expected))}')
         finally:
             with self.repo_lock(job.full_name):
                 self.git.remove_worktree(job.full_name, worktree)
@@ -1687,34 +1716,37 @@ class Reviewer:
         if self.stop.is_set():
             self.store.retry(job.id, 0, count_attempt=False)
             return None
-        if rc is None:
+        if not runs or runs[-1][1] is None:
             log(f'{job}: codex not started; job is {self.store.status(job.id)}')
             return self.store.status(job.id)
         token, outcome = self.recheck(job, base)
         if token is None:
             return outcome
         kept = f'$CODEX_REVIEW_STATE_DIR/output/{job.id}.log'
+        attempt, rc, output, stderr, last, timed_out = runs[-1]
+        reads = (f'本 head 审查 {attempt} 次（上限 {READ_ATTEMPTS}）；各次未读全的文件数：'
+                 f'{"、".join(str(n) for n in unread_counts) or "未核验"}。')
         common = dict(effort=plan.effort, kept=kept, governance=governance, mode=plan.mode,
-                      scope=self.scope(plan, job, base))
+                      scope=self.scope(plan, job, base) + reads)
         events = read_events(output)
         upstream = None if timed_out else transient_error(rc, events)
         if upstream is not None:
             body = self.defer_or_give_up(job, upstream, plan.effort, kept, governance, plan.mode)
             if body is None:
                 return None
-            self.keep_output(job, output, stderr, last)
+            self.keep_output(job, runs)
             return self.publish(job, 'failed', body, [], token)
         self.store.clear_transient(job.id)
         if timed_out:
-            self.keep_output(job, output, stderr, last)
+            self.keep_output(job, runs)
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
-                f'codex timed out after {plan.timeout} s'), **common), [], token)
+                f'codex review {attempt} timed out after {plan.timeout} s'), **common), [], token)
         verdict, body, findings, unread = self.conclude(job, plan, rc, events, last, worktree, common)
         comments = []
         if findings:
             comments = inline_comments(findings, diff_lines(self.github.pull_files(job.full_name, job.number, token)))
         if verdict == 'failed' or unread or len(body) > BODY_LIMIT:
-            self.keep_output(job, output, stderr, last)
+            self.keep_output(job, runs)
         return self.publish(job, verdict, body, comments, token)
 
     def conclude(self, job, plan, rc, events, last, worktree, common):

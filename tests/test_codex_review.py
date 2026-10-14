@@ -184,6 +184,7 @@ class FakeCodex:
         self.governance = None
         self.git = None
         self.read = None
+        self.reads = []
 
     def __call__(self, job_id, worktree, sections, effort, timeout, scratch, proceed, governance=()):
         if getattr(self, 'before_proceed', None):
@@ -193,6 +194,8 @@ class FakeCodex:
         self.calls.append((job_id, worktree, cr.review_prompt(sections, governance), effort))
         if self.messages:
             self.message = self.messages.pop(0)
+        if self.reads:
+            self.read = self.reads.pop(0)
         self.governance = [(doc.ref, doc.path, doc.path.read_text() if doc.path else None, doc.error)
                            for doc in governance]
         if self.during:
