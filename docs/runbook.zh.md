@@ -40,10 +40,12 @@ GitHub App webhook
 | 仓库属于 `CODEX_REVIEW_ACCOUNTS` 中的账户，且不在 `CODEX_REVIEW_EXCLUDE_REPOS` 中 | `repository.owner` |
 | PR 处于 open；草稿只在 `CODEX_REVIEW_INCLUDE_DRAFTS=true` 时入队（默认 true） | `pull_request` |
 | `head.repo.full_name` 等于 `base.repo.full_name`，即不审 fork 发来的 PR | `pull_request` |
-| `author_association` 为 `OWNER`、`MEMBER` 或 `COLLABORATOR` | `pull_request` |
-| 作者在 `CODEX_REVIEW_AUTHORS` 中（必填，可列多个，例如再加上自己的 bot 账号） | `pull_request.user.login` |
+| 作者登录名在 `CODEX_REVIEW_AUTHORS` 中（必填，可列多个，例如 `qianxueye,inktrace-coordinator[bot]`） | `pull_request.user.login` |
+| 列表中以 `[bot]` 结尾的登录名，作者必须是 GitHub App 账户（`user.type` 为 `Bot`）；其他登录名，作者必须是用户账户（`User`） | `pull_request.user.type` |
 
-原因：公开仓库里任何人都能提 PR。如果不加限制，陌生人的代码会在审查主机上被 codex 读取甚至执行，同时消耗 App 所有者的额度。重新投递的事件走同一个接收入口，因此同样经过这组过滤。账户、仓库和作者名比较时不区分大小写，统一经由 `same_name`。
+原因：公开仓库里任何人都能提 PR。如果不加限制，陌生人的代码会在审查主机上被 codex 读取甚至执行，同时消耗 App 所有者的额度。重新投递的事件走同一个接收入口，因此同样经过这组过滤。账户、仓库和作者名比较时不区分大小写，统一经由 `same_name`；`user.type` 按原值比较。
+
+`author_association` 不作为准入条件，只写进跳过日志。webhook 载荷里这个字段不可靠：GitHub App 的 bot 账户报 `NONE`，私有组织的成员提自己仓库的 PR 时也可能报 `CONTRIBUTOR`。以 `[bot]` 结尾的登录名只能属于 GitHub App，普通用户无法注册；所以作者白名单加上账户类型核对已经足够，陌生人既不能冒用列表中的登录名，也不能用同名的用户账户冒充 bot。
 
 #### 2.2.1 陌生安装
 
@@ -281,7 +283,7 @@ rm conversion.json
    rm -P ~/codex-review-app/app-private-key.pem ~/codex-review-app/webhook-secret
    ```
 
-3. 在审查主机编辑 `/etc/codex-review/codex-review.env`，填写 `CODEX_REVIEW_APP_ID=<id>`，并把 `CODEX_REVIEW_ACCOUNTS` 和 `CODEX_REVIEW_AUTHORS` 改成实际的账户和作者。其余键已有默认值，含义见同目录的 `codex-review.env.example`。
+3. 在审查主机编辑 `/etc/codex-review/codex-review.env`，填写 `CODEX_REVIEW_APP_ID=<id>`，并把 `CODEX_REVIEW_ACCOUNTS` 和 `CODEX_REVIEW_AUTHORS` 改成实际的账户和作者。要让某个 GitHub App 开的 PR 也被审查，把它的 bot 登录名加进 `CODEX_REVIEW_AUTHORS`，例如 `CODEX_REVIEW_AUTHORS=qianxueye,inktrace-coordinator[bot]`；改完后重启服务生效。其余键已有默认值，含义见同目录的 `codex-review.env.example`。
 
 服务读取私钥和 webhook secret 时会检查：必须是普通文件，属主是服务账号，权限 0600。不满足时服务拒绝启动。
 

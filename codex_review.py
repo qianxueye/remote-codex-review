@@ -27,7 +27,6 @@ API = 'https://api.github.com'
 DEFAULT_CONFIG = '/etc/codex-review/codex-review.env'
 WEBHOOK_PATH = '/webhook'
 ACTIONS = frozenset({'opened', 'synchronize', 'reopened', 'ready_for_review'})
-TRUSTED_ASSOCIATIONS = frozenset({'OWNER', 'MEMBER', 'COLLABORATOR'})
 MARKER = '<!-- remote-codex-review head={head} verdict={verdict}{effort}{tests} -->'
 MARKER_RE = re.compile(r'<!-- remote-codex-review head=([0-9a-f]{40}) verdict=(clean|findings|failed|invalid)'
                        r'(?: effort=[a-z]+)?(?: tests=[a-z-]+)? -->')
@@ -275,7 +274,9 @@ def admission(config, repository, pull, installation=None):
     full_name = repository.get('full_name', '')
     head_repo = (pull.get('head') or {}).get('repo') or {}
     base_repo = (pull.get('base') or {}).get('repo') or {}
-    author = (pull.get('user') or {}).get('login', '')
+    user = pull.get('user') or {}
+    author, user_type = user.get('login', ''), user.get('type')
+    identity = f'{author} (type {user_type}, association {pull.get("author_association")})'
     installation_account = ((installation or {}).get('account') or {}).get('login')
     if installation_account is not None and not config.allowed_account(installation_account):
         return f'installation account {installation_account} not in CODEX_REVIEW_ACCOUNTS'
@@ -289,10 +290,12 @@ def admission(config, repository, pull, installation=None):
         return 'draft excluded'
     if not head_repo.get('full_name') or not same_name(head_repo['full_name'], base_repo.get('full_name', '')):
         return 'head repository differs from base (fork)'
-    if pull.get('author_association') not in TRUSTED_ASSOCIATIONS:
-        return f'author_association {pull.get("author_association")} not trusted'
     if not config.allowed_author(author):
-        return f'author {author} not in CODEX_REVIEW_AUTHORS'
+        return f'author {identity} not in CODEX_REVIEW_AUTHORS'
+    # A `[bot]` login belongs only to a GitHub App account; any other login only to a user account.
+    expected_type = 'Bot' if author.casefold().endswith('[bot]') else 'User'
+    if user_type != expected_type:
+        return f'author {identity} is not a {expected_type} account'
     return None
 
 
