@@ -209,14 +209,18 @@ class SessionLogTests(unittest.TestCase):
         path = home / 'sessions' / '2026' / '10' / '14' / f'rollout-2026-10-14T00-00-00-{name}.jsonl'
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [json.dumps({'timestamp': 't', 'type': 'session_meta', 'payload': meta})]
-        lines += [json.dumps({'timestamp': 't', 'type': 'response_item', 'payload': item}) for item in items]
+        lines += [json.dumps({'timestamp': 't', 'type': 'event_msg' if item['type'] == 'item_completed' else 'response_item',
+                              'payload': item}) for item in items]
         path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
     def test_outputs_of_the_thread_and_its_child_are_returned(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             self.rollout(home, 'parent', {'id': 'thread-1', 'cwd': '/w'},
-                         [{'type': 'custom_tool_call_output', 'call_id': 'c1', 'output': session_item('one\n')}])
+                         [{'type': 'custom_tool_call_output', 'call_id': 'c1', 'output': session_item('one\n')},
+                          {'type': 'item_completed', 'item': {'type': 'CommandExecution', 'process_id': '7',
+                                                               'exit_code': 0, 'aggregated_output': 'one\n'}},
+                          {'type': 'item_completed', 'item': {'type': 'AgentMessage', 'id': 'm1'}}])
             self.rollout(home, 'child', {'id': 'thread-2', 'parent_thread_id': 'thread-1'},
                          [{'type': 'function_call_output', 'call_id': 'c2', 'output': 'two\n'},
                           {'type': 'message', 'role': 'assistant', 'content': []}])
@@ -226,6 +230,8 @@ class SessionLogTests(unittest.TestCase):
             self.assertIsNone(error)
             self.assertEqual(sorted(cr.visible_texts(outputs)), ['one\n', 'two\n'])
             self.assertEqual(outputs.count(cr.ROLLOUT_BOUNDARY), 2)
+            self.assertEqual([o for o in outputs if isinstance(o, dict) and o.get('type') != 'rollout_boundary'],
+                             [{'type': 'CommandExecution', 'process_id': '7', 'exit_code': 0, 'aggregated_output': 'one\n'}])
             self.assertEqual(cr.SessionLog(home).outputs('thread-7', 0), ([], f'no session record for thread thread-7 under {home / "sessions"}'))
             self.assertEqual(cr.SessionLog(home).outputs('', 0), ([], 'the codex events carry no thread id'))
             self.assertEqual(cr.SessionLog(home / 'missing').outputs('thread-1', 0),
