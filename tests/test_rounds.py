@@ -123,6 +123,7 @@ class ReadCoverageTests(Rounds):
         self.assertIn('verdict=findings', body)
         self.assertIn('**阅读不完整**：1 个改动文件（共 2 个）没有在合格的命令输出中读全：`src/b.py`（未读）。', body)
         self.assertIn('Retry never stops', body)
+        self.assertTrue((self.root / 'output' / '1.log').exists())
 
     def test_output_over_20000_bytes_is_not_evidence(self):
         self.assertEqual(cr.READ_LIMIT, 20000)

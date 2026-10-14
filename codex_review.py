@@ -1709,16 +1709,16 @@ class Reviewer:
             self.keep_output(job, output, stderr, last)
             return self.publish(job, 'failed', review_body(job.head, 'failed', '', [], reason=(
                 f'codex timed out after {plan.timeout} s'), **common), [], token)
-        verdict, body, findings = self.conclude(job, plan, rc, events, last, worktree, common)
+        verdict, body, findings, unread = self.conclude(job, plan, rc, events, last, worktree, common)
         comments = []
         if findings:
             comments = inline_comments(findings, diff_lines(self.github.pull_files(job.full_name, job.number, token)))
-        if verdict == 'failed' or len(body) > BODY_LIMIT:
+        if verdict == 'failed' or unread or len(body) > BODY_LIMIT:
             self.keep_output(job, output, stderr, last)
         return self.publish(job, verdict, body, comments, token)
 
     def conclude(self, job, plan, rc, events, last, worktree, common):
-        """Assess the codex output against the plan; returns (verdict, body, findings)."""
+        """Assess the codex output against the plan; returns (verdict, body, findings, unread files)."""
         roots = (str(worktree), os.path.realpath(worktree))
         verdict, review, reasons, unread = assess(rc, events, final_message(events, last), roots,
                                                   plan.mode == 'delta', plan.expected)
@@ -1727,11 +1727,11 @@ class Reviewer:
         if verdict == 'failed':
             log(f'{job}: codex output rejected: {"; ".join(reasons)}')
             return 'failed', review_body(job.head, 'failed', '', [], reasons=reasons,
-                                         reason='codex output did not pass the review checks', **common), []
+                                         reason='codex output did not pass the review checks', **common), [], unread
         body = review_body(job.head, verdict, review.text, review.findings, unparsed=review.unparsed,
                            promoted=review.promoted, register=review.registered, unread=unread,
                            total=len(plan.expected), **common)
-        return verdict, body, review.findings
+        return verdict, body, review.findings, unread
 
 
 # ---- entry point -----------------------------------------------------------
