@@ -1581,6 +1581,7 @@ def main(argv=None):
             print(f'would review {job} base=origin/{job.base} status={job.status}', flush=True)
         redeliver_failed(github, store, config.redeliver_hours * 3600, dry_run=True)
         return 0
+    sd_notify('WATCHDOG=1\nSTATUS=starting: requeue, mirror sweep, codex self-check')
     git = Git(config.state_dir)
     log(f'startup: {store.reset_running()} interrupted job(s) requeued')
     git.sweep()

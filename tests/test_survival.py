@@ -230,6 +230,29 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn('WatchdogSec=', unit)
 
 
+class StartupTests(unittest.TestCase):
+    def test_watchdog_is_petted_before_the_slow_startup_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            secret = root / 'secret'
+            secret.write_text('s')
+            secret.chmod(0o600)
+            env = root / 'env'
+            env.write_text(f'CODEX_REVIEW_APP_ID=42\nCODEX_REVIEW_PRIVATE_KEY={root}/key\n'
+                           f'CODEX_REVIEW_WEBHOOK_SECRET_FILE={secret}\nCODEX_REVIEW_ACCOUNTS=o\n'
+                           f'CODEX_REVIEW_AUTHORS=o\nCODEX_REVIEW_STATE_DIR={root}\n')
+            order = []
+            with mock.patch.object(cr, 'sd_notify', lambda state: order.append(('notify', state))), \
+                    mock.patch.object(cr, 'Git') as git, \
+                    mock.patch.object(cr, 'self_check', lambda *a, **k: order.append(('self_check',)) or 'stub'), \
+                    mock.patch.object(cr, 'serve') as serve:
+                git.return_value.sweep.side_effect = lambda: order.append(('sweep',))
+                self.assertEqual(cr.main(['--config', str(env)]), cr.SELF_CHECK_FAILED)
+            serve.assert_not_called()
+        self.assertEqual([step[0] for step in order], ['notify', 'sweep', 'self_check'])
+        self.assertTrue(order[0][1].startswith('WATCHDOG=1\n'))
+
+
 class NotifyTests(unittest.TestCase):
     def test_without_notify_socket_is_a_no_op(self):
         with mock.patch.dict(os.environ, {}, clear=True):
