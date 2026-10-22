@@ -358,6 +358,9 @@ sudo -u codex-review sqlite3 /var/lib/codex-review/state.sqlite \
 ```
 
 - `--dry-run` 列出排队中和运行中的任务，以及补投扫描将要请求重新投递的投递，不改动任何状态。它需要私钥和 webhook secret 都已就位。
+- `systemctl status codex-review` 的 Status 行显示存活线程数（如 `2/2 workers alive; ok`）；磁盘空间不足时显示 `disk space low`，此时任务保持排队，日志中有一行 `error: … below CODEX_REVIEW_MIN_FREE_MB=…`，腾出空间后自动恢复并记录 `disk space restored`。
+- 日志中出现 `worker error #N` 表示某次取任务或审查出错并在退避后重试；出现 `all N review workers have exited` 时服务以退出码 4 退出，systemd 在 10 秒后重启它。主线程超过 600 秒未向 systemd 报告（`WatchdogSec=600s`）时也会被重启。
+- 需要不经 webhook 排队某个 head 时：`sudo -u codex-review /usr/bin/python3 /opt/codex-review/codex_review.py --config /etc/codex-review/codex-review.env --enqueue OWNER/REPO#PR@SHA`。PR 必须是开放且通过准入的；SHA 不再是当前 head 时改排当前 head。
 - 任务状态：`queued`、`running`、`clean`、`findings`、`failed`、`superseded`、`rejected`（安装所属账户不在白名单，见 §2.2.1）、`skipped`（入队后不再满足准入条件，见 §2.3）。
 - 重新审查某个 head（例如 `failed` 之后）：
 
