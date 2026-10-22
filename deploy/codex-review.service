@@ -15,6 +15,10 @@ ExecStart=/usr/bin/python3 /opt/codex-review/codex_review.py --config /etc/codex
 Restart=on-failure
 RestartSec=10s
 RestartPreventExitStatus=3
+# WATCHDOG=1 is sent once before the startup steps and then every 30 s while a worker lives;
+# the budget covers the mirror sweep plus the 300 s self-check between those two pets.
+NotifyAccess=main
+WatchdogSec=600s
 KillMode=mixed
 TimeoutStopSec=60s
 Nice=10

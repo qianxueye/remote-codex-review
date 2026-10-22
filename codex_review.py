@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -83,7 +84,9 @@ FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
 SELF_CHECK_FAILED = 3
+WORKERS_DEAD = 4
 REDELIVER_INTERVAL = 3600
+SUPERVISE_INTERVAL = 30
 ACTIVE = ('queued', 'running')
 
 
@@ -197,6 +200,7 @@ class Config:
         self.retry_max_delay = number('CODEX_REVIEW_RETRY_MAX_DELAY_SECONDS', '1800', 1)
         self.retry_window = number('CODEX_REVIEW_RETRY_WINDOW_SECONDS', '7200', 0)
         self.state_dir = Path(values.get('CODEX_REVIEW_STATE_DIR', '/var/lib/codex-review'))
+        self.min_free_bytes = number('CODEX_REVIEW_MIN_FREE_MB', '1024', 0) * 1024 * 1024
         self.codex = values.get('CODEX_REVIEW_CODEX_BIN', 'codex')
         self.effort_rules = load_effort_rules(values.get('CODEX_REVIEW_EFFORT_RULES', ''))
 
@@ -701,12 +705,17 @@ class Store:
             'since REAL NOT NULL, last_error TEXT NOT NULL);')
 
     def _transaction(self, work):
+        """Run work inside BEGIN IMMEDIATE; SQLite may already have rolled back after SQLITE_FULL."""
         with self.lock:
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 result = work()
             except BaseException:
-                self.db.execute('ROLLBACK')
+                if self.db.in_transaction:
+                    try:
+                        self.db.execute('ROLLBACK')
+                    except sqlite3.Error as exc:
+                        log(f'rollback failed: {exc}')
                 raise
             self.db.execute('COMMIT')
             return result
@@ -870,7 +879,11 @@ class WebhookApp:
         except ValueError:
             return 400
         job = self.job_for(headers.get('X-GitHub-Event', ''), payload, guid)
-        outcome, running = self.store.accept(guid, job)
+        try:
+            outcome, running = self.store.accept(guid, job)
+        except sqlite3.Error as exc:
+            log(f'delivery {guid}: not recorded, answering 503 so GitHub retries it: {exc}')
+            return 503
         if outcome == 'queued':
             log(f'delivery {guid}: queued {job[0]}#{job[1]}@{job[2][:12]}')
         self.on_queued(running)
@@ -1180,12 +1193,38 @@ def self_check(codex, work_dir, timeout=300):
 # ---- review worker ---------------------------------------------------------
 
 class Reviewer:
-    def __init__(self, config, github, store, git, codex, stop=None):
+    def __init__(self, config, github, store, git, codex, stop=None, disk_free=None):
         self.config, self.github, self.store, self.git, self.codex = config, github, store, git, codex
         self.stop = stop or threading.Event()
         self.wake = threading.Event()
         self.repo_locks = {}
         self.locks_guard = threading.Lock()
+        self.disk_free = disk_free or (lambda: shutil.disk_usage(self.config.state_dir).free)
+        self.disk_low, self.free_bytes = False, None
+        self.backoff_first, self.backoff_max = 5, 300
+
+    def disk_ok(self):
+        """Report whether the state directory has enough free space; log only when that changes."""
+        try:
+            free = self.disk_free()
+        except OSError as exc:
+            log(f'free-space check of {self.config.state_dir} failed, claiming anyway: {exc}')
+            return True
+        low = free < self.config.min_free_bytes
+        with self.locks_guard:
+            previous, self.disk_low, self.free_bytes = self.disk_low, low, free
+        if low and not previous:
+            log(f'error: {free // (1024 * 1024)} MB free under {self.config.state_dir}, below '
+                f'CODEX_REVIEW_MIN_FREE_MB={self.config.min_free_bytes // (1024 * 1024)}; '
+                'queued reviews wait until space is freed')
+        elif previous and not low:
+            log(f'disk space restored: {free // (1024 * 1024)} MB free under {self.config.state_dir}')
+        return not low
+
+    def health(self):
+        if self.disk_low:
+            return f'disk space low: {self.free_bytes // (1024 * 1024)} MB free; not claiming reviews'
+        return 'ok'
 
     def repo_lock(self, full_name):
         with self.locks_guard:
@@ -1230,13 +1269,26 @@ class Reviewer:
                          + ('\n--- last message ---\n' + last if last else ''))
 
     def work_forever(self):
+        """Loop over work_once until stop; an error anywhere in an iteration backs off instead of ending the thread."""
+        failures = 0
         while not self.stop.is_set():
-            if not self.work_once():
+            try:
+                busy = self.work_once()
+            except Exception as exc:  # noqa: BLE001 - the worker must outlive every error
+                failures += 1
+                delay = min(self.backoff_first * 2 ** (failures - 1), self.backoff_max)
+                log(f'worker error #{failures}, next attempt in {delay} s: {exc!r}')
+                self.stop.wait(delay)
+                continue
+            failures = 0
+            if not busy:
                 self.wake.wait(30)
                 self.wake.clear()
 
     def work_once(self):
-        """Run the next due job; any escaping error requeues it so the worker thread survives."""
+        """Run the next due job when disk space allows; a failed job is requeued so the worker survives."""
+        if not self.disk_ok():
+            return False
         job = self.store.claim_next()
         if job is None:
             return False
@@ -1244,7 +1296,10 @@ class Reviewer:
             self.run(job)
         except Exception as exc:  # noqa: BLE001 - keep the worker alive
             log(f'{job}: unexpected error, requeued: {exc}')
-            self.store.retry(job.id, 300)
+            try:
+                self.store.retry(job.id, 300)
+            except sqlite3.Error as store_exc:
+                log(f'{job}: could not requeue, stays running until restart: {store_exc}')
         return True
 
     def run(self, job):
@@ -1389,6 +1444,44 @@ class Reviewer:
 
 # ---- entry point -----------------------------------------------------------
 
+def sd_notify(state):
+    """Send a systemd notification when NOTIFY_SOCKET is set; never raises."""
+    address = os.environ.get('NOTIFY_SOCKET')
+    if not address:
+        return
+    if address.startswith('@'):
+        address = '\0' + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(state.encode(), address)
+    except OSError as exc:
+        log(f'sd_notify failed: {exc}')
+
+
+def heartbeat(done, status, interval=SUPERVISE_INTERVAL, notify=None):
+    """Send WATCHDOG=1 every interval until done is set; covers startup steps of unbounded total length."""
+    notify = notify or sd_notify
+    while not done.is_set():
+        notify(f'WATCHDOG=1\nSTATUS={status}')
+        done.wait(interval)
+
+
+def supervise(reviewer, workers, interval=SUPERVISE_INTERVAL, notify=None):
+    """Pet the watchdog while a worker lives; once all have exited, stop and return WORKERS_DEAD."""
+    notify = notify or sd_notify
+    while not reviewer.stop.is_set():
+        alive = sum(worker.is_alive() for worker in workers)
+        if alive == 0:
+            log(f'error: all {len(workers)} review workers have exited; stopping so systemd restarts the service')
+            notify(f'STATUS=all {len(workers)} review workers exited; restarting')
+            reviewer.stop.set()
+            reviewer.wake.set()
+            return WORKERS_DEAD
+        notify(f'WATCHDOG=1\nSTATUS={alive}/{len(workers)} workers alive; {reviewer.health()}')
+        reviewer.stop.wait(interval)
+    return 0
+
+
 def serve(config, reviewer, secret):
     app = WebhookApp(config, reviewer.store, secret, on_queued=reviewer.on_queued)
     server = make_server(app, config.listen_port)
@@ -1406,18 +1499,20 @@ def serve(config, reviewer, secret):
     def shutdown(*_):
         reviewer.stop.set()
         reviewer.wake.set()
-        reviewer.codex.cancel_all()
-        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     for worker in workers:
         worker.start()
     threading.Thread(target=recover, name='redelivery', daemon=True).start()
+    threading.Thread(target=server.serve_forever, name='http', daemon=True).start()
     log(f'listening on 127.0.0.1:{config.listen_port}{WEBHOOK_PATH} with {config.concurrency} worker(s)')
-    server.serve_forever()
+    status = supervise(reviewer, workers)
+    reviewer.codex.cancel_all()
+    server.shutdown()
     for worker in workers:
         worker.join(timeout=60)
+    return status
 
 
 def enqueue_command(config, github, store, target):
@@ -1495,6 +1590,9 @@ def main(argv=None):
             print(f'would review {job} base=origin/{job.base} status={job.status}', flush=True)
         redeliver_failed(github, store, config.redeliver_hours * 3600, dry_run=True)
         return 0
+    started = threading.Event()
+    threading.Thread(target=heartbeat, name='startup-heartbeat', daemon=True,
+                     args=(started, 'starting: requeue, mirror sweep, codex self-check', SUPERVISE_INTERVAL)).start()
     git = Git(config.state_dir)
     log(f'startup: {store.reset_running()} interrupted job(s) requeued')
     git.sweep()
@@ -1504,8 +1602,8 @@ def main(argv=None):
         return SELF_CHECK_FAILED
     log('startup self-check passed: codex read a repository file')
     reviewer = Reviewer(config, github, store, git, CodexRunner(config.codex))
-    serve(config, reviewer, secret)
-    return 0
+    started.set()
+    return serve(config, reviewer, secret)
 
 
 if __name__ == '__main__':
