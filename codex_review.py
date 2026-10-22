@@ -1458,8 +1458,17 @@ def sd_notify(state):
         log(f'sd_notify failed: {exc}')
 
 
-def supervise(reviewer, workers, interval=SUPERVISE_INTERVAL, notify=sd_notify):
+def heartbeat(done, status, interval=SUPERVISE_INTERVAL, notify=None):
+    """Send WATCHDOG=1 every interval until done is set; covers startup steps of unbounded total length."""
+    notify = notify or sd_notify
+    while not done.is_set():
+        notify(f'WATCHDOG=1\nSTATUS={status}')
+        done.wait(interval)
+
+
+def supervise(reviewer, workers, interval=SUPERVISE_INTERVAL, notify=None):
     """Pet the watchdog while a worker lives; once all have exited, stop and return WORKERS_DEAD."""
+    notify = notify or sd_notify
     while not reviewer.stop.is_set():
         alive = sum(worker.is_alive() for worker in workers)
         if alive == 0:
@@ -1581,7 +1590,9 @@ def main(argv=None):
             print(f'would review {job} base=origin/{job.base} status={job.status}', flush=True)
         redeliver_failed(github, store, config.redeliver_hours * 3600, dry_run=True)
         return 0
-    sd_notify('WATCHDOG=1\nSTATUS=starting: requeue, mirror sweep, codex self-check')
+    started = threading.Event()
+    threading.Thread(target=heartbeat, name='startup-heartbeat', daemon=True,
+                     args=(started, 'starting: requeue, mirror sweep, codex self-check', SUPERVISE_INTERVAL)).start()
     git = Git(config.state_dir)
     log(f'startup: {store.reset_running()} interrupted job(s) requeued')
     git.sweep()
@@ -1591,6 +1602,7 @@ def main(argv=None):
         return SELF_CHECK_FAILED
     log('startup self-check passed: codex read a repository file')
     reviewer = Reviewer(config, github, store, git, CodexRunner(config.codex))
+    started.set()
     return serve(config, reviewer, secret)
 
 

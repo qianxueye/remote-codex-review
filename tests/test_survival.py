@@ -231,7 +231,7 @@ class SupervisorTests(unittest.TestCase):
 
 
 class StartupTests(unittest.TestCase):
-    def test_watchdog_is_petted_before_the_slow_startup_steps(self):
+    def test_watchdog_is_petted_throughout_a_slow_startup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             secret = root / 'secret'
@@ -242,15 +242,42 @@ class StartupTests(unittest.TestCase):
                            f'CODEX_REVIEW_WEBHOOK_SECRET_FILE={secret}\nCODEX_REVIEW_ACCOUNTS=o\n'
                            f'CODEX_REVIEW_AUTHORS=o\nCODEX_REVIEW_STATE_DIR={root}\n')
             order = []
+
+            def slow_sweep():
+                order.append(('sweep',))
+                time.sleep(0.2)
+
+            def check(*_a, **_k):
+                order.append(('self_check',))
+                time.sleep(0.2)
+                return 'stub'
             with mock.patch.object(cr, 'sd_notify', lambda state: order.append(('notify', state))), \
+                    mock.patch.object(cr, 'SUPERVISE_INTERVAL', 0.02), \
                     mock.patch.object(cr, 'Git') as git, \
-                    mock.patch.object(cr, 'self_check', lambda *a, **k: order.append(('self_check',)) or 'stub'), \
+                    mock.patch.object(cr, 'self_check', check), \
                     mock.patch.object(cr, 'serve') as serve:
-                git.return_value.sweep.side_effect = lambda: order.append(('sweep',))
+                git.return_value.sweep.side_effect = slow_sweep
                 self.assertEqual(cr.main(['--config', str(env)]), cr.SELF_CHECK_FAILED)
             serve.assert_not_called()
-        self.assertEqual([step[0] for step in order], ['notify', 'sweep', 'self_check'])
-        self.assertTrue(order[0][1].startswith('WATCHDOG=1\n'))
+        steps = [step[0] for step in order]
+        self.assertEqual(steps[0], 'notify')
+        self.assertLess(steps.index('sweep'), steps.index('self_check'))
+        during_sweep = steps[steps.index('sweep'):steps.index('self_check')].count('notify')
+        after_check = steps[steps.index('self_check'):].count('notify')
+        self.assertGreaterEqual(during_sweep, 3, steps)
+        self.assertGreaterEqual(after_check, 3, steps)
+        self.assertTrue(all(step[1].startswith('WATCHDOG=1\n') for step in order if step[0] == 'notify'))
+
+    def test_heartbeat_stops_when_done(self):
+        done = threading.Event()
+        notes = []
+        thread = threading.Thread(target=cr.heartbeat, args=(done, 'starting', 0.01, notes.append))
+        thread.start()
+        self.assertTrue(wait_for(lambda: len(notes) >= 3))
+        done.set()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(notes[0], 'WATCHDOG=1\nSTATUS=starting')
 
 
 class NotifyTests(unittest.TestCase):
