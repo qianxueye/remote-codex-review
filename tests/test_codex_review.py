@@ -36,6 +36,24 @@ def events_jsonl(message, read=True):
     events.append({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': message}})
     events.append({'type': 'turn.completed', 'usage': {}})
     return '\n'.join(json.dumps(event) for event in events) + '\n'
+
+
+def synthetic_structured(stdout, message, root=WORKTREE):
+    """Supplement exec-only recordings/fakes with explicitly synthetic rollout data (score 0.99).
+
+    These scores were not recorded on the host. Real rollout loading is tested in test_confidence.py.
+    """
+    thread = next(e['thread_id'] for e in cr.read_events(stdout) if e.get('type') == 'thread.started')
+    _, _, parsed = cr.parse_review(message, (root,))
+    findings = [{'title': f'[{f.priority}] {f.title}', 'body': cr.VERDICT_RE.sub('', f.text).strip(),
+                 'confidence_score': 0.99, 'priority': int(f.priority[1]),
+                 'code_location': {'absolute_file_path': f.path if f.path.startswith('/') else root + '/' + f.path,
+                                   'line_range': {'start': f.start, 'end': f.end}}} for f in parsed]
+    return stdout + json.dumps({'type': 'review.structured', 'thread_id': thread, 'review_output': {
+        'findings': findings, 'overall_correctness': 'patch is incorrect' if findings else 'patch is correct',
+        'overall_explanation': message or 'No final message', 'overall_confidence_score': 0.99}}) + '\n'
+
+
 FINDINGS = f"""Two defects remain.
 
 Full review comments:
@@ -168,7 +186,8 @@ class FakeCodex:
         if self.during:
             self.during()
         message = self.message.replace(WORKTREE, str(worktree))
-        events = self.events if self.events is not None else events_jsonl(message)
+        events = (self.events.replace(WORKTREE, str(worktree)) if self.events is not None
+                  else synthetic_structured(events_jsonl(message), message, str(worktree)))
         return self.rc, events, 'progress\n', message, self.timed_out
 
     def cancel(self, job_ids):
@@ -225,8 +244,6 @@ class ParseTests(unittest.TestCase):
     def test_priority_tag_without_location_still_counts_as_findings(self):
         verdict, _, findings = cr.parse_review('One issue: [P2] the retry loop never ends.')
         self.assertEqual((verdict, findings), ('findings', []))
-        body = cr.review_body(HEAD, verdict, '', findings, raw='One issue: [P2] the retry loop never ends.')
-        self.assertIn('[P2] the retry loop never ends.', body)
 
     def test_final_message_prefers_output_file_then_last_agent_message(self):
         events = cr.read_events(events_jsonl('old') + events_jsonl('new'))

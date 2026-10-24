@@ -14,7 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import codex_review as cr  # noqa: E402
-from test_codex_review import HEAD, NEW_HEAD, REPO, WORKTREE, FakeCodex, Harness, config, pull_payload  # noqa: E402
+from test_codex_review import HEAD, NEW_HEAD, REPO, WORKTREE, FakeCodex, Harness, config, pull_payload, synthetic_structured  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / 'fixtures'
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,8 +24,9 @@ INCIDENT_MESSAGE = ('Review blocked: the execution tool failed because /usr/loca
 
 def fixture(name):
     """Return (JSONL stdout, last message) of a real codex 0.160.1 run recorded on the review host."""
-    return (FIXTURES / f'{name}.jsonl').read_text(encoding='utf-8'), (FIXTURES / f'{name}.last').read_text(
-        encoding='utf-8')
+    stdout = (FIXTURES / f'{name}.jsonl').read_text(encoding='utf-8')
+    last = (FIXTURES / f'{name}.last').read_text(encoding='utf-8')
+    return synthetic_structured(stdout, last), last
 
 
 def judge(stdout, last, rc=0):
@@ -60,7 +61,9 @@ class RealOutputTests(unittest.TestCase):
 
     def test_real_single_finding_read_only_run_drops_the_block_header(self):
         last = (FIXTURES / 'findings-ro-single.last').read_text(encoding='utf-8')
-        verdict, summary, findings, _ = judge(fixture('findings-ro')[0], last)
+        # This alternate rendering represents another run and needs its own matching structured result.
+        stdout = (FIXTURES / 'findings-ro.jsonl').read_text(encoding='utf-8')
+        verdict, summary, findings, _ = judge(synthetic_structured(stdout, last), last)
         self.assertEqual(verdict, 'findings')
         self.assertEqual([(f.priority, f.title, f.path, f.start, f.end) for f in findings],
                          [('P2', 'Correct both pagination slice bounds', 'paging.py', 8, 9)])
