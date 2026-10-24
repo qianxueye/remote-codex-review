@@ -43,6 +43,118 @@ def assess(findings, **kwargs):
 
 
 class ConfidenceTests(unittest.TestCase):
+    def test_all_withheld_broken_recording_stays_failed(self):
+        fixtures = Path(__file__).parent / 'fixtures'
+        items = [finding(0.3)]
+        final = (fixtures / 'broken-tests.last').read_text() + '\n\n' + message(items).split('\n\n', 1)[1]
+        events = cr.read_events((fixtures / 'broken-tests.jsonl').read_text())
+        events.append(envelope(review_output(items), events[0]['thread_id']))
+        verdict, _, posted, reasons = cr.assess(0, events, final, (WORKTREE,))
+        self.assertEqual((verdict, posted), ('failed', []))
+        for reason in ('error item', 'no command with exit code 0', 'reports a failure', 'found BLOCKED'):
+            self.assertIn(reason, '\n'.join(reasons))
+
+    def test_all_withheld_requires_each_clean_evidence_check(self):
+        items = [finding(0.3)]
+        healthy = stream(items)
+        cases = [(1, healthy, message(items)),
+                 (0, [e for e in healthy if e.get('type') != 'turn.completed'], message(items)),
+                 (0, healthy + [{'type': 'turn.failed'}], message(items)),
+                 (0, healthy + [{'type': 'error', 'message': 'fatal error'}], message(items)),
+                 (0, healthy + [{'type': 'item.completed', 'item': {'type': 'error', 'message': 'tool failed'}}], message(items)),
+                 (0, [e for e in healthy if (e.get('item') or {}).get('type') != 'command_execution'], message(items)),
+                 (0, healthy, message(items).replace('FINDINGS', 'BLOCKED')),
+                 (0, healthy, message(items).replace('VERDICT: FINDINGS', 'Review incomplete.')),
+                 (0, healthy, message(items).replace('VERDICT: FINDINGS', '')),
+                 (0, healthy, 'VERDICT: CLEAN\n' + message(items))]
+        for rc, events, final in cases:
+            with self.subTest(rc=rc, events=events[-1], final=final):
+                self.assertEqual(cr.assess(rc, events, final, (WORKTREE,))[0], 'failed')
+
+    def test_empty_posted_accepts_only_single_clean_or_findings_verdict(self):
+        for items in ([], [finding(0.3)]):
+            for verdict in ('CLEAN', 'FINDINGS'):
+                final = message(items).replace('VERDICT: CLEAN', 'VERDICT: ' + verdict).replace('VERDICT: FINDINGS', 'VERDICT: ' + verdict)
+                self.assertEqual(cr.assess(0, stream(items), final, (WORKTREE,))[0], 'clean')
+
+    def test_published_finding_keeps_existing_nonpassing_failure_path(self):
+        items = [finding(0.9)]
+        final = message(items).replace('VERDICT: FINDINGS', 'Review incomplete.\nVERDICT: BLOCKED')
+        events = [e for e in stream(items) if (e.get('item') or {}).get('type') != 'command_execution']
+        self.assertEqual(cr.assess(0, events, final, (WORKTREE,))[0], 'findings')
+
+    def test_p1_bypasses_threshold_and_keeps_score(self):
+        for score in (0.0, 0.3, 0.8, None, '0.9', True, float('nan'), float('inf'), -1, 2, {}, [], 10 ** 500):
+            item = dict(finding(score), priority=1, title='[P1] Urgent defect')
+            verdict, summary, posted, reasons = assess([item], min_confidence=1)
+            self.assertEqual((verdict, len(posted), reasons), ('findings', 1, []))
+            body = cr.review_body(HEAD, verdict, summary, posted)
+            inline = cr.inline_comments(posted, {'src/app.py': {1: 0}})[0]['body']
+            for text in (body, inline):
+                self.assertIn('置信度 ' + (str(score) if cr.valid_confidence(score) else '缺失或无效'), text)
+        for priority in (0, 2, 3):
+            self.assertEqual(assess([dict(finding(0.8), priority=priority, title=f'[P{priority}] Other')])[2], [])
+            self.assertEqual(assess([dict(finding(0.81), priority=priority, title=f'[P{priority}] Other')])[0], 'findings')
+        missing = dict(finding(), priority=1, title='[P1] Missing score')
+        del missing['confidence_score']
+        self.assertEqual(assess([missing])[0], 'findings')
+
+    def test_optional_priority_uses_title_and_rejects_ambiguity(self):
+        for priority in (None, 'absent'):
+            item = finding()
+            if priority == 'absent':
+                del item['priority']
+            else:
+                item['priority'] = priority
+            self.assertEqual(assess([item])[0], 'findings')
+            item['title'] = 'No priority available'
+            self.assertEqual(assess([item])[0], 'failed')
+        self.assertEqual(assess([dict(finding(), priority=1)])[0], 'failed')
+
+    def test_relative_location_and_capitalized_correctness_fail_closed(self):
+        for field in ('relative', 'correctness'):
+            events = stream([finding()])
+            output = events[-1]['review_output']
+            if field == 'relative':
+                output['findings'][0]['code_location']['absolute_file_path'] = 'src/app.py'
+            else:
+                output['overall_correctness'] = 'Patch is incorrect'
+            self.assertEqual(cr.assess(0, events, message([finding()]), (WORKTREE,))[0], 'failed')
+
+    def test_explanation_priority_tag_is_not_an_extra_finding(self):
+        items = [finding()]
+        events = stream(items)
+        explanation = 'One [P1] regression in the queue.\nVERDICT: FINDINGS'
+        events[-1]['review_output']['overall_explanation'] = explanation
+        final = explanation + '\n\n' + message(items).split('\n\n', 1)[1]
+        self.assertEqual(cr.assess(0, events, final, (WORKTREE,))[0], 'findings')
+
+    def test_whitespace_path_reconciles(self):
+        item = finding()
+        item['code_location']['absolute_file_path'] = WORKTREE + '/source dir/app file.py'
+        self.assertEqual(assess([item])[0], 'findings')
+
+    def test_body_heading_is_not_an_extra_finding(self):
+        item = finding()
+        item['body'] += '\n- [P3] Example heading — /example.py:3\nExample continuation.'
+        verdict, _, posted, _ = assess([item])
+        self.assertEqual(verdict, 'findings')
+        self.assertEqual(posted[0].text, item['body'])
+        final = message([item]).replace('Keep the gate closed', 'Keep   the gate closed')
+        self.assertEqual(cr.assess(0, stream([item]), final, (WORKTREE,))[0], 'findings')
+
+    def test_display_preserves_scores_and_threshold_precision(self):
+        for score, threshold in ((0.8000001, 0.8), (0.801, 0.8), (0.80500001, 0.805)):
+            items = [finding(score), finding(threshold, 'Withheld', 2)]
+            verdict, summary, posted, _ = assess(items, min_confidence=threshold)
+            body = cr.review_body(HEAD, verdict, summary, posted)
+            inline = cr.inline_comments(posted, {'src/app.py': {1: 0}})[0]['body']
+            for text in (body, inline):
+                displayed = float(text.split('置信度 ')[-1].split()[0])
+                self.assertGreater(displayed, threshold)
+                self.assertEqual(displayed, score)
+            self.assertIn('不高于 ' + ('0.80' if threshold == 0.8 else str(threshold)), summary)
+
     def test_exactly_080_is_withheld(self):
         self.assertEqual(assess([finding(0.80)])[2], [])
 
@@ -66,7 +178,7 @@ class ConfidenceTests(unittest.TestCase):
     def test_all_withheld_is_clean_with_count_and_no_details(self):
         verdict, summary, posted, reasons = assess([finding(0.8)])
         self.assertEqual((verdict, posted, reasons), ('clean', [], []))
-        self.assertIn('另有 1 条置信度不高于 0.80 的发现未发布', summary)
+        self.assertIn('另有 1 条置信度不高于 0.80 的非 P1 发现未发布', summary)
         self.assertNotIn('Private', summary)
         self.assertNotIn('Secret', summary)
 
@@ -170,6 +282,44 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(cr.assess(0, events, message([finding()]), (WORKTREE,))[0], 'findings')
         self.assertEqual(events[-1]['review_output']['findings'][0]['confidence_score'], 0.87)
 
+    def test_sanitized_real_rollout_reconciles(self):
+        """Original rollout ordinals 0/63/65, codex 0.160.1; neutral prose, unchanged schema."""
+        rows = [json.loads(line) for line in (Path(__file__).parent / 'fixtures/real-review-rollout.jsonl').read_text().splitlines()]
+        thread, cwd = rows[0]['payload']['id'], rows[0]['payload']['cwd']
+        final = rows[-1]['payload']['item']['content'][0]['text']
+        self.path.unlink()
+        path = self.path.with_name('rollout-2026-10-24-' + thread + '.jsonl')
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        output = events_jsonl(final).replace('t-1', thread)
+        events = cr.read_events(cr.attach_review_output(output, Path(cwd), self.home))
+        verdict, _, posted, reasons = cr.assess(0, events, final, (cwd,))
+        self.assertEqual((verdict, reasons), ('findings', []))
+        self.assertEqual([f.confidence_score for f in posted], [0.97, 0.99])
+        self.assertEqual([f.start for f in posted], [7409, 3616])
+        self.assertTrue(all(f.path == 'src/main/java/us/q3q/fido2/FIDO2Applet.java' for f in posted))
+
+    def test_forwarded_other_thread_event_is_ignored(self):
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        forwarded = json.loads(json.dumps(rows[-1]))
+        forwarded['payload']['thread_id'] = 'child-thread'
+        forwarded['payload']['item']['review_output'] = review_output([])
+        self.path.write_text(''.join(json.dumps(row) + '\n' for row in rows + [forwarded]))
+        self.assertEqual(cr.assess(0, cr.read_events(self.load()), message([finding()]), (WORKTREE,))[0], 'findings')
+
+    def test_repeated_matching_session_metadata_is_accepted(self):
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.path.write_text(''.join(json.dumps(row) + '\n' for row in rows + [rows[0]]))
+        self.assertEqual(cr.assess(0, cr.read_events(self.load()), message([finding()]), (WORKTREE,))[0], 'findings')
+
+    def test_conflicting_session_metadata_fails_closed(self):
+        for field, value in (('id', 'other'), ('cwd', '/other/worktree')):
+            self.write_rollout()
+            row = {'type': 'session_meta', 'payload': {'id': 't-1', 'cwd': WORKTREE}}
+            row['payload'][field] = value
+            with self.path.open('a') as handle:
+                handle.write(json.dumps(row) + '\n')
+            self.assertEqual(cr.assess(0, cr.read_events(self.load()), message([finding()]), (WORKTREE,))[0], 'failed')
+
     def test_missing_wrong_or_ambiguous_rollout_fails(self):
         for thread, cwd in (('other', WORKTREE), ('t-1', '/wrong/worktree')):
             self.write_rollout(thread, cwd)
@@ -217,6 +367,23 @@ class RolloutTests(unittest.TestCase):
 
 
 class AuditTests(Harness):
+    def test_broken_withheld_run_publishes_failed_marker(self):
+        fixtures = Path(__file__).parent / 'fixtures'
+        items = [finding(0.3)]
+        self.codex.message = (fixtures / 'broken-tests.last').read_text() + '\n\n' + message(items).split('\n\n', 1)[1]
+        stdout = (fixtures / 'broken-tests.jsonl').read_text()
+        thread = cr.read_events(stdout)[0]['thread_id']
+        self.codex.events = stdout + '\n' + json.dumps(envelope(review_output(items), thread))
+        self.deliver(pull_payload())
+        job, status = self.run_next()
+        self.assertEqual(status, 'failed')
+        body = self.github.posted[0]['body']
+        self.assertIn(f'head={HEAD} verdict=failed', body)
+        self.assertIn('found BLOCKED', body)
+        self.assertNotIn('Secret', body)
+        self.assertEqual(self.github.posted[0]['comments'], [])
+        self.assertTrue((self.root / 'output' / f'{job.id}.log').is_file())
+
     def test_withheld_details_saved_privately_before_publication(self):
         items = [finding(0.8, 'Withheld'), finding(0.87, 'Published', 2)]
         self.codex.message = message(items)

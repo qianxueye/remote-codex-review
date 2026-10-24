@@ -81,7 +81,7 @@ ISSUE_LINK_RE = re.compile(r'github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issue
 GOVERNANCE_LIMIT = 20
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
-FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(\S+?):(\d+)(?:-(\d+))?\s*$')
+FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(.+?):(\d+)(?:-(\d+))?\s*$')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
 SELF_CHECK_FAILED = 3
@@ -573,6 +573,14 @@ def valid_confidence(value):
     return type(value) in (int, float) and 0 <= value <= 1
 
 
+def confidence_text(value):
+    """Keep ordinary scores readable and preserve every significant boundary digit."""
+    if not valid_confidence(value):
+        return '缺失或无效'
+    short = f'{value:.2f}'
+    return short if float(short) == value else str(value)
+
+
 def attach_review_output(output, worktree, codex_home=None):
     """Read only this exec thread's rollout; carry the full result into the local audit stream."""
     event = {'type': 'review.structured'}
@@ -590,9 +598,10 @@ def attach_review_output(output, worktree, codex_home=None):
         if any(not isinstance(row, dict) for row in rows):
             raise ValueError('malformed rollout row')
         meta = [row.get('payload') for row in rows if row.get('type') == 'session_meta']
-        if (len(meta) != 1 or not isinstance(meta[0], dict) or meta[0].get('id') != thread
-                or not isinstance(meta[0].get('cwd'), str)
-                or os.path.realpath(meta[0]['cwd']) != os.path.realpath(worktree)):
+        # Repeated metadata is harmless only if every row identifies this same session/worktree.
+        if not meta or any(not isinstance(m, dict) or m.get('id') != thread
+                           or not isinstance(m.get('cwd'), str)
+                           or os.path.realpath(m['cwd']) != os.path.realpath(worktree) for m in meta):
             raise ValueError('rollout session identity does not match exec thread/worktree')
         outputs = []
         for row in rows:
@@ -602,7 +611,7 @@ def attach_review_output(output, worktree, codex_home=None):
             item = payload.get('item')
             if isinstance(item, dict) and item.get('type') == 'ExitedReviewMode':
                 if payload.get('thread_id', thread) != thread:
-                    raise ValueError('review event thread does not match exec thread')
+                    continue  # Forwarded sub-agent results cannot replace the parent review.
                 outputs.append(item.get('review_output'))
         if len(outputs) != 1:
             raise ValueError('expected exactly one ExitedReviewMode output')
@@ -632,9 +641,15 @@ def structured_findings(events, message, worktree_roots):
         if not isinstance(raw, dict):
             raise ValueError('malformed structured finding')
         title, body, priority = raw.get('title'), raw.get('body'), raw.get('priority')
+        prefix = re.match(r'^\[P([0-3])\]\s*', title) if isinstance(title, str) else None
+        # Codex permits omitted/null priority. The explicit title tag can supply it;
+        # without either source there is no safe way to apply the P1 exemption.
+        if priority is None and prefix:
+            priority = int(prefix[1])
         location = raw.get('code_location')
         if (not isinstance(title, str) or not title.strip() or not isinstance(body, str) or not body.strip()
-                or type(priority) is not int or priority not in range(4) or not isinstance(location, dict)):
+                or type(priority) is not int or priority not in range(4) or not isinstance(location, dict)
+                or (prefix and int(prefix[1]) != priority)):
             raise ValueError('malformed structured finding')
         path, lines = location.get('absolute_file_path'), location.get('line_range')
         if (not isinstance(path, str) or not path.startswith('/') or not isinstance(lines, dict)
@@ -646,7 +661,8 @@ def structured_findings(events, message, worktree_roots):
         finding.lines = body.splitlines()
         finding.confidence_score = raw.get('confidence_score')
         findings.append(finding)
-    parsed_verdict, parsed_summary, rendered = parse_review(message, worktree_roots, deduplicate=False)
+    _, parsed_summary, rendered = parse_review(message, worktree_roots, deduplicate=False,
+                                             expected_findings=findings)
 
     def key(finding):
         return (finding.priority, ' '.join(finding.title.split()), finding.location(),
@@ -654,8 +670,8 @@ def structured_findings(events, message, worktree_roots):
 
     structured_keys, rendered_keys = [key(f) for f in findings], [key(f) for f in rendered]
     if (len(set(structured_keys)) != len(structured_keys) or sorted(structured_keys) != sorted(rendered_keys)
-            or PRIORITY_RE.search(parsed_summary)
-            or (parsed_verdict == 'findings' and not findings)):
+            or (PRIORITY_RE.search(parsed_summary)
+                and ' '.join(parsed_summary.split()) != ' '.join(result['overall_explanation'].split()))):
         raise ValueError('structured findings disagree with the final message')
     return findings
 
@@ -669,15 +685,17 @@ def assess(rc, events, message, worktree_roots=(), min_confidence=0.80, audit=No
     except ValueError as exc:
         return 'failed', '', [], failure_reasons(rc, events, message) + [str(exc)]
     declared = VERDICT_RE.findall(message)
-    # Preserve the existing failed-run and clean-verdict checks, including the positive findings path.
-    if not (rc == 0 and message and findings):
+    posted = [f for f in findings if f.priority == 'P1'
+              or (valid_confidence(f.confidence_score) and f.confidence_score > min_confidence)]
+    # A passing marker always needs the full clean-run evidence, including all-withheld runs.
+    # Preserve main's non-passing positive-findings path when something is actually published.
+    if not (rc == 0 and message and posted):
         reasons = failure_reasons(rc, events, message)
-        if declared != ['CLEAN']:
-            reasons.append('the final message carries no single `VERDICT: CLEAN` line'
+        if declared not in (['CLEAN'], ['FINDINGS']):
+            reasons.append('the final message carries no single `VERDICT: CLEAN` or `VERDICT: FINDINGS` line'
                            + (f' (found {", ".join(declared)})' if declared else ''))
         if reasons:
             return 'failed', '', [], reasons
-    posted = [f for f in findings if valid_confidence(f.confidence_score) and f.confidence_score > min_confidence]
     withheld = len(findings) - len(posted)
     if audit is not None:
         raw_findings = next(e['review_output']['findings'] for e in events if e.get('type') == 'review.structured')
@@ -685,9 +703,9 @@ def assess(rc, events, message, worktree_roots=(), min_confidence=0.80, audit=No
                      withheld=[raw for raw, finding in zip(raw_findings, findings) if finding not in posted])
     if findings:
         # The model's explanation may describe withheld findings; publish only an aggregate sentence.
-        summary = f'已发布 {len(posted)} 条通过置信度阈值的发现。'
+        summary = f'已发布 {len(posted)} 条发现（P1 不受置信度门槛限制，其他发现须严格大于阈值）。'
     if withheld:
-        summary += f'\n\n另有 {withheld} 条置信度不高于 {min_confidence:.2f} 的发现未发布（含缺失或无效分数）。'
+        summary += f'\n\n另有 {withheld} 条置信度不高于 {confidence_text(min_confidence)} 的非 P1 发现未发布（含缺失或无效分数）。'
     return ('findings' if posted else 'clean'), summary, posted, []
 
 
@@ -699,10 +717,18 @@ def strip_prefix(path, worktree_roots):
     return path[2:] if path.startswith('./') else path
 
 
-def parse_review(message, worktree_roots=(), deduplicate=True):
+def parse_review(message, worktree_roots=(), deduplicate=True, expected_findings=()):
     """Split a final codex message into (verdict, summary, findings)."""
     findings, summary, current, seen = [], [], None, set()
+    expected = {(f.priority, ' '.join(f.title.split()), f.location()): ' '.join(f.text.split())
+                for f in expected_findings}
     for line in message.splitlines():
+        # Consume a known structured body before interpreting heading-like example lines inside it.
+        body = expected.get((current.priority, ' '.join(current.title.split()), current.location())) if current else None
+        consumed = ' '.join(current.text.split()) if current else ''
+        if body and consumed != body and body.startswith(consumed):
+            current.lines.append(line)
+            continue
         match = FINDING_RE.match(line)
         if match:
             priority, title, path, start, end = match.groups()
@@ -748,7 +774,7 @@ def inline_comments(findings, diff):
             continue
         comment = {'path': finding.path, 'line': finding.end, 'side': 'RIGHT',
                    'body': f'**[{finding.priority}] {finding.title}**'
-                   + (f' · 置信度 {finding.confidence_score:.2f}' if valid_confidence(finding.confidence_score) else '')
+                   + f' · 置信度 {confidence_text(finding.confidence_score)}'
                    + f'\n\n{finding.text}'}
         if finding.start != finding.end and lines.get(finding.start) == lines[finding.end]:
             comment.update(start_line=finding.start, start_side='RIGHT')
@@ -756,7 +782,7 @@ def inline_comments(findings, diff):
     return comments
 
 
-def review_body(head, verdict, summary, findings, raw='', reason='', effort=None, kept=None, reasons=(),
+def review_body(head, verdict, summary, findings, reason='', effort=None, kept=None, reasons=(),
                 governance=()):
     """Render the review body; it always carries the marker and every finding in full.
 
@@ -771,7 +797,7 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
     elif verdict == 'clean':
         parts.append(f'**Remote codex review: no findings** for `{head}`.')
     else:
-        parts.append(f'**Remote codex review: {len(findings) or "unparsed"} finding(s)** for `{head}`.')
+        parts.append(f'**Remote codex review: {len(findings)} finding(s)** for `{head}`.')
     if effort:
         parts.append('Read-only review: codex was told not to run tests or start services.')
     parts += [f'Governance issue `{doc.ref}` linked from AGENTS.md could not be prefetched ({doc.error}); '
@@ -780,11 +806,9 @@ def review_body(head, verdict, summary, findings, raw='', reason='', effort=None
         parts.append(summary)
     for finding in findings:
         parts.append(f'- **[{finding.priority}] {finding.title}** — `{finding.location()}`'
-                     + (f' · 置信度 {finding.confidence_score:.2f}' if valid_confidence(finding.confidence_score) else '')
+                     + f' · 置信度 {confidence_text(finding.confidence_score)}'
                      + '\n\n'
                      + '\n'.join('  ' + line for line in finding.text.splitlines()))
-    if verdict == 'findings' and not findings and raw:
-        parts.append(raw)
     body = '\n\n'.join(parts)
     if len(body) > BODY_LIMIT:
         body = body[:BODY_LIMIT] + (f'\n\n[truncated; full text kept on the review host at `{kept}`]'
@@ -1554,7 +1578,7 @@ class Reviewer:
                 body = review_body(job.head, 'failed', '', [], effort=effort, kept=kept, governance=governance,
                                    reason='codex output did not pass the review checks', reasons=reasons)
             else:
-                body = review_body(job.head, verdict, summary, findings, raw=message, effort=effort,
+                body = review_body(job.head, verdict, summary, findings, effort=effort,
                                    kept=kept, governance=governance)
             if findings:
                 comments = inline_comments(findings, diff_lines(

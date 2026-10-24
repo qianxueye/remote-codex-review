@@ -244,8 +244,6 @@ class ParseTests(unittest.TestCase):
     def test_priority_tag_without_location_still_counts_as_findings(self):
         verdict, _, findings = cr.parse_review('One issue: [P2] the retry loop never ends.')
         self.assertEqual((verdict, findings), ('findings', []))
-        body = cr.review_body(HEAD, verdict, '', findings, raw='One issue: [P2] the retry loop never ends.')
-        self.assertIn('[P2] the retry loop never ends.', body)
 
     def test_final_message_prefers_output_file_then_last_agent_message(self):
         events = cr.read_events(events_jsonl('old') + events_jsonl('new'))

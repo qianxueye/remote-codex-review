@@ -73,23 +73,24 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 - 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。`verdict=invalid` 的标记不算，所以作废后重新入队的 head 会再审一次。
 - 结论判定（§2.4.1）默认为 `failed`。最终消息优先取 `-o` 输出文件，取不到时取 `--json` 事件流中最后一条 `agent_message`。
 - codex 因上游临时故障失败时先按 §2.4.2 重试，不发 review。超时（默认 40 分钟）或判定为 `failed` 时，发 `verdict=failed`，正文写明「This is not a pass」，并逐条列出未通过的检查。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--enqueue`。
-- 结论为 `failed`、有扣留发现，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
+- 结论为 `failed`、有扣留发现，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。failed 或正文截断时会在正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径；仅因扣留而留档的 clean/findings 正文不附日志指针，可按任务 id 查找。服务不会自动清理这些文件。
 - GitHub 或 git 出错（不是 codex 本身失败）时，任务重新排队，等待 5 分钟乘以已失败次数后再试。累计 `CODEX_REVIEW_MAX_ATTEMPTS`（默认 3）次仍失败时，发 `failed` 标记。
 
 #### 2.4.1 结论判定
 
 codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独保存。事件格式见 §9。
 
-- 先核验本次结构化结果：从 `--json` 的唯一 `thread.started.thread_id` 定位 `$CODEX_HOME/sessions/**/rollout-*-<thread_id>.jsonl`（未设置 `CODEX_HOME` 时用 `~/.codex`）。必须只有一个匹配文件，且 `session_meta` 的 id、cwd 与本次 thread、工作树一致；文件中必须只有一个 `item_completed` / `ExitedReviewMode`，其 `review_output` 格式有效。不能改取最新的 rollout。缺失、损坏、不唯一或发现与最终消息无法对应，均发 `failed`，不公开原始发现。允许最终发现顺序或空白不同，优先级、标题、正文和位置必须对应。
-- 发现分数只取结构化 `confidence_score`，不从 Markdown 猜测，也不使用 `overall_confidence_score` 替代。`CODEX_REVIEW_MIN_CONFIDENCE` 默认 `0.80`，必须为 `[0, 1]` 内有限数；只发布原始分数**严格大于**阈值的发现，先比较再显示。因此 `0.80` 扣留，`0.8000001` 和 `0.81` 发布。缺失、字符串、布尔值、NaN、无穷和越界分数均扣留，不使任务崩溃。
-- 原始结构化发现非空且 codex 退出码为 0、有最终消息时，沿用原有发现路径；筛选后至少发布一条为 `findings`，全部扣留为 `clean`。两者仍使用 `<!-- remote-codex-review head=<sha> verdict=… -->` 标记（含已有 effort/tests 扩展字段），不改变 merge gate 和 `invalid` 行为。
-- 每条公开发现（正文与行内评论）显示 `置信度 0.87` 一类分数。存在原始发现时，总评改为数量说明，不转发可能描述扣留内容的模型总评；扣留项只写「另有 N 条置信度不高于 0.80 的发现未发布（含缺失或无效分数）」。完整扣留列表、阈值、结构化输出和最终消息在发布前写入 §2.4 的本地 0600 日志；写入失败不能先发 review。日志不自动清理，需按主机容量管理。
-- 原始发现为空时，仍须同时满足以下全部条件才判为 `clean`：
+- 先核验本次结构化结果：从 `--json` 的唯一 `thread.started.thread_id` 定位 `$CODEX_HOME/sessions/**/rollout-*-<thread_id>.jsonl`（未设置 `CODEX_HOME` 时用 `~/.codex`）。必须只有一个匹配文件；允许多条 `session_meta`，但每条的 id、cwd 都必须与本次 thread、工作树一致，冲突或缺失均失败。只取本 thread 的 `item_completed` / `ExitedReviewMode`，必须恰好一个；明确属于其他 thread 的转发子 agent 事件忽略，不能替代父审查。缺失 thread_id 的事件沿用 rollout 的 session 归属。不能改取最新 rollout。文件损坏、归属不唯一、结果无效或发现与最终消息冲突均发 `failed`，不公开原始发现。
+- 已用 2026-10-24 的真实 review rollout 制作脱敏 fixture（`tests/fixtures/real-review-rollout.jsonl`），保留 session 元数据、ExitedReviewMode 及最终 AgentMessage 的键、类型和嵌套；没有在本轮运行真实 review。允许最终发现顺序或空白不同、路径含空白、正文有类似发现标题的示例行、结构化总评提及 `[P1]`；发现的优先级、标题、正文和位置必须对应。未知的额外优先级条目仍失败。`priority` 为 0–3 整数；省略/null 时仅可从标题 `[Pn]` 恢复，没有可确定的优先级或两处冲突则失败。相对路径和大小写不符的 correctness 仍失败：前者违反 `absolute_file_path` 契约，后者不是已验证 schema 的枚举值，不猜测修正。
+- 发现分数只取结构化 `confidence_score`，不从 Markdown 猜测，也不使用 `overall_confidence_score` 替代。**P1 不受门槛限制，一律发布，仍显示分数**；缺失或无效分数标注为「置信度 缺失或无效」。其他优先级（含 P2/P3，P0 沿用原规则）仅在原始分数**严格大于** `CODEX_REVIEW_MIN_CONFIDENCE` 时发布。配置默认 `0.80`，必须为 `[0, 1]` 内有限数，先比较再显示。这些优先级中，`0.80` 扣留，`0.8000001` 和 `0.81` 发布；缺失、字符串、布尔值、NaN、无穷和越界分数均扣留，不使任务崩溃。
+- 筛选后至少发布一条，且退出码为 0、有最终消息时为 `findings`。沿用 main 的非通过路径：有发布项时，即使证据不足或声明 BLOCKED，也不会变成 clean。没有发布项（包括全部扣留）必须通过下列全部 clean 检查。head/verdict 标记（含已有 effort/tests 扩展字段）和 `invalid` 行为沿用原约定。
+- 正文与行内评论均显示分数：普通值如 `0.87`，边界值如 `0.8000001` 保留必要位数，阈值如 `0.805` 也不截成两位。存在原始发现时，总评改为数量及 P1 豁免说明，不转发可能描述扣留内容的模型总评；扣留项只写「另有 N 条置信度不高于 0.80 的非 P1 发现未发布（含缺失或无效分数）」。完整扣留列表、阈值、结构化输出和最终消息在发布前写入 §2.4 的本地 0600 日志；写入失败不能先发 review。日志不自动清理，需按主机容量管理。
+- 没有发布项时，须同时满足以下全部条件才判为 `clean`：
   1. codex 退出码为 0；
   2. 事件流中有 `turn.completed`，没有 `turn.failed`、`error` 条目和顶层 `error` 事件。例外：回合正常完成时，内容属于临时故障的顶层 `error` 事件（例如 `Reconnecting... 2/5 (unexpected status 503 …)`）只是 codex 自动重连的通知，不计；
   3. 至少有一条 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，并且它的 `aggregated_output` 含有统一 diff 的结构：一行以 `diff --git a/` 或 `diff --git "a/` 开头（后者是 git 默认 `core.quotePath=true` 时非 ASCII 路径的写法），另有至少一行以 `@@ ` 开头的 hunk 头。合并提交的组合 diff（`diff --cc`、`diff --combined`，hunk 头为 `@@@ `）不算，因为它只含合并时的冲突处理，不是 PR 相对 base 的改动。这一条只看命令的输出，不分析命令怎么写；输出被截断时，只要剩下的部分仍有这两种行就算。只跑过 `git status`、`ls`、`git -v`、`echo`、`git diff --stat` 的不算。与 base 没有任何差别的 PR，`git diff` 输出为空，也按这一条判 `failed`，原因中写明这种情况；服务目前没有单独的「无改动」处理。只改二进制文件或只改名的 PR 没有 hunk 头，同样判 `failed`；
   4. 最终消息中没有 codex 说自己没能完成审查的语句。这一条只拦截意思明确的说法：`Reviewer failed to output a response.`、`Review blocked`、`the verdict is a placeholder`、`I could not read`、`The reviewer was unable to read`、`unable to read the diff`、`the review is incomplete`、`codex-code-mode-host is missing`、「我无法读取」、「本次审查无法读取文件」、「审查未完成」、「未能读取 diff」，完整列表见 `codex_review.py` 的 `FAILURE_SIGNAL_RE`。结论描述被审代码时也会用到的词不在列表中，例如单独的 blocked、placeholder、cannot view、no such file or directory、工具缺失；工具坏到读不了 diff 的情况由第 3 条判定；
-  5. 最终消息中恰好有一行 `VERDICT: CLEAN`。
+  5. 最终消息中恰好有一行结论，值为 `VERDICT: CLEAN` 或 `VERDICT: FINDINGS`；BLOCKED、缺失或多个结论行均不通过。
 - 其余情况一律判为 `failed`。
 
 第 5 条的结论行来自提示词：提示要求 codex 在 `overall_explanation` 末尾写 `VERDICT: CLEAN`、`VERDICT: FINDINGS` 或 `VERDICT: BLOCKED`。`--json` 的 exec 事件流不包含 review 模式的结构化字段；结构化结果从同次 rollout 读取。工具失败时 codex 仍可能把 `overall_correctness` 填成占位值，所以不单靠它判定 clean。结论行写在 `overall_explanation` 内，因为 codex 只取模型输出中的 JSON 对象，对象之外的文字会被丢弃。
