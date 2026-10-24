@@ -1,5 +1,6 @@
 """Offline confidence policy and exact-rollout regression tests."""
 import json
+from itertools import product
 from pathlib import Path
 import stat
 import tempfile
@@ -42,6 +43,28 @@ def assess(findings, **kwargs):
     return cr.assess(0, stream(findings), message(findings), (WORKTREE,), **kwargs)
 
 
+# Each tuple is ordered: (no tag/correct, no tag/incorrect, tag/correct, tag/incorrect).
+# These are policy expectations, deliberately independent of assess's implementation.
+VERDICT_TABLE = {
+    'none': {'CLEAN': ('clean', 'failed', 'failed', 'failed'),
+             'FINDINGS': ('failed',) * 4, 'BLOCKED': ('failed',) * 4,
+             'none': ('failed',) * 4, 'multiple': ('failed',) * 4},
+    'all-withheld': {'CLEAN': ('clean',) * 4, 'FINDINGS': ('clean',) * 4,
+                     'BLOCKED': ('failed',) * 4, 'none': ('failed',) * 4,
+                     'multiple': ('failed',) * 4},
+    'some-posted': {declared: ('findings',) * 4
+                    for declared in ('CLEAN', 'FINDINGS', 'BLOCKED', 'none', 'multiple')},
+}
+
+
+def verdict_cases():
+    for raw, declared, tagged, correctness in product(
+            VERDICT_TABLE, ('CLEAN', 'FINDINGS', 'BLOCKED', 'none', 'multiple'),
+            (False, True), ('patch is correct', 'patch is incorrect')):
+        expected = VERDICT_TABLE[raw][declared][2 * tagged + (correctness == 'patch is incorrect')]
+        yield raw, declared, tagged, correctness, expected
+
+
 class ConfidenceTests(unittest.TestCase):
     def test_all_withheld_broken_recording_stays_failed(self):
         fixtures = Path(__file__).parent / 'fixtures'
@@ -55,27 +78,55 @@ class ConfidenceTests(unittest.TestCase):
             self.assertIn(reason, '\n'.join(reasons))
 
     def test_all_withheld_requires_each_clean_evidence_check(self):
-        items = [finding(0.3)]
-        healthy = stream(items)
-        cases = [(1, healthy, message(items)),
-                 (0, [e for e in healthy if e.get('type') != 'turn.completed'], message(items)),
-                 (0, healthy + [{'type': 'turn.failed'}], message(items)),
-                 (0, healthy + [{'type': 'error', 'message': 'fatal error'}], message(items)),
-                 (0, healthy + [{'type': 'item.completed', 'item': {'type': 'error', 'message': 'tool failed'}}], message(items)),
-                 (0, [e for e in healthy if (e.get('item') or {}).get('type') != 'command_execution'], message(items)),
-                 (0, healthy, message(items).replace('FINDINGS', 'BLOCKED')),
-                 (0, healthy, message(items).replace('VERDICT: FINDINGS', 'Review incomplete.')),
-                 (0, healthy, message(items).replace('VERDICT: FINDINGS', '')),
-                 (0, healthy, 'VERDICT: CLEAN\n' + message(items))]
-        for rc, events, final in cases:
-            with self.subTest(rc=rc, events=events[-1], final=final):
-                self.assertEqual(cr.assess(rc, events, final, (WORKTREE,))[0], 'failed')
-
-    def test_empty_posted_accepts_only_single_clean_or_findings_verdict(self):
         for items in ([], [finding(0.3)]):
-            for verdict in ('CLEAN', 'FINDINGS'):
-                final = message(items).replace('VERDICT: CLEAN', 'VERDICT: ' + verdict).replace('VERDICT: FINDINGS', 'VERDICT: ' + verdict)
-                self.assertEqual(cr.assess(0, stream(items), final, (WORKTREE,))[0], 'clean')
+            healthy, final = stream(items), message(items)
+            cases = [('exit', 1, healthy, final),
+                     ('completion', 0, [e for e in healthy if e.get('type') != 'turn.completed'], final),
+                     ('turn-failed', 0, healthy + [{'type': 'turn.failed'}], final),
+                     ('error-event', 0, healthy + [{'type': 'error', 'message': 'fatal error'}], final),
+                     ('error-item', 0, healthy + [{'type': 'item.completed', 'item': {'type': 'error', 'message': 'tool failed'}}], final),
+                     ('diff', 0, [e for e in healthy if (e.get('item') or {}).get('type') != 'command_execution'], final),
+                     ('failure-signal', 0, healthy, 'Review incomplete.\n' + final),
+                     ('blocked', 0, healthy, final.replace('VERDICT: FINDINGS', 'VERDICT: BLOCKED').replace('VERDICT: CLEAN', 'VERDICT: BLOCKED')),
+                     ('missing-verdict', 0, healthy, cr.VERDICT_RE.sub('', final)),
+                     ('multiple-verdicts', 0, healthy, 'VERDICT: CLEAN\n' + final),
+                     ('missing-message', 0, healthy, '')]
+            for condition, rc, events, text in cases:
+                with self.subTest(raw=len(items), condition=condition):
+                    self.assertEqual(cr.assess(rc, events, text, (WORKTREE,))[0], 'failed')
+
+    def test_clean_verdict_truth_table(self):
+        cases = list(verdict_cases())
+        self.assertEqual(len(cases), 60)
+        for raw, declared, tagged, correctness, expected in cases:
+            with self.subTest(raw=raw, declared=declared, tagged=tagged, correctness=correctness):
+                items = {'none': [], 'all-withheld': [finding(0.3)],
+                         'some-posted': [finding(0.3), finding(0.9, 'Published', 2)]}[raw]
+                explanation = ('- [P1] Migration drops rows on rollback (no location).'
+                               if tagged else 'Review complete.')
+                lines = {'none': '', 'multiple': '\nVERDICT: CLEAN\nVERDICT: FINDINGS'}
+                explanation += lines.get(declared, '\nVERDICT: ' + declared)
+                output = dict(review_output(items), overall_explanation=explanation,
+                              overall_correctness=correctness)
+                final = explanation + (message(items)[message(items).index('\n\n'):] if items else '')
+                events = cr.read_events(events_jsonl(final)) + [envelope(output)]
+                verdict, summary, posted, reasons = cr.assess(0, events, final, (WORKTREE,))
+                self.assertEqual(verdict, expected)
+                self.assertEqual(len(posted), int(raw == 'some-posted'))
+                self.assertEqual(bool(reasons), expected == 'failed')
+                if expected == 'failed':
+                    self.assertEqual(summary, '')
+
+    def test_empty_raw_requires_matching_clean_declarations(self):
+        for side, declared in product(('structured', 'final'), ('FINDINGS', 'BLOCKED', '', 'CLEAN\nVERDICT: CLEAN')):
+            with self.subTest(side=side, declared=declared):
+                events = stream([])
+                final = message([])
+                if side == 'structured':
+                    events[-1]['review_output']['overall_explanation'] = 'Review complete.\nVERDICT: ' + declared
+                else:
+                    final = 'Review complete.\nVERDICT: ' + declared
+                self.assertEqual(cr.assess(0, events, final, (WORKTREE,))[0], 'failed')
 
     def test_published_finding_keeps_existing_nonpassing_failure_path(self):
         items = [finding(0.9)]
@@ -83,21 +134,26 @@ class ConfidenceTests(unittest.TestCase):
         events = [e for e in stream(items) if (e.get('item') or {}).get('type') != 'command_execution']
         self.assertEqual(cr.assess(0, events, final, (WORKTREE,))[0], 'findings')
 
-    def test_p1_bypasses_threshold_and_keeps_score(self):
-        for score in (0.0, 0.3, 0.8, None, '0.9', True, float('nan'), float('inf'), -1, 2, {}, [], 10 ** 500):
-            item = dict(finding(score), priority=1, title='[P1] Urgent defect')
+    def test_p0_p1_bypass_threshold_and_keep_score(self):
+        for priority, score in product((0, 1), (0.0, 0.3, 0.8, None, '0.9', True, float('nan'), float('inf'), -1, 2, {}, [], 10 ** 500)):
+            item = dict(finding(score), priority=priority, title=f'[P{priority}] Urgent defect')
             verdict, summary, posted, reasons = assess([item], min_confidence=1)
             self.assertEqual((verdict, len(posted), reasons), ('findings', 1, []))
             body = cr.review_body(HEAD, verdict, summary, posted)
             inline = cr.inline_comments(posted, {'src/app.py': {1: 0}})[0]['body']
             for text in (body, inline):
                 self.assertIn('置信度 ' + (str(score) if cr.valid_confidence(score) else '缺失或无效'), text)
-        for priority in (0, 2, 3):
+        for priority in (2, 3):
             self.assertEqual(assess([dict(finding(0.8), priority=priority, title=f'[P{priority}] Other')])[2], [])
             self.assertEqual(assess([dict(finding(0.81), priority=priority, title=f'[P{priority}] Other')])[0], 'findings')
-        missing = dict(finding(), priority=1, title='[P1] Missing score')
-        del missing['confidence_score']
-        self.assertEqual(assess([missing])[0], 'findings')
+        for priority in (0, 1):
+            missing = dict(finding(), priority=priority, title=f'[P{priority}] Missing score')
+            del missing['confidence_score']
+            self.assertEqual(assess([missing], min_confidence=1)[0], 'findings')
+            missing['priority'] = None
+            self.assertEqual(assess([missing], min_confidence=1)[0], 'findings')
+            del missing['priority']
+            self.assertEqual(assess([missing], min_confidence=1)[0], 'findings')
 
     def test_optional_priority_uses_title_and_rejects_ambiguity(self):
         for priority in (None, 'absent'):
@@ -133,6 +189,21 @@ class ConfidenceTests(unittest.TestCase):
         item = finding()
         item['code_location']['absolute_file_path'] = WORKTREE + '/source dir/app file.py'
         self.assertEqual(assess([item])[0], 'findings')
+
+    def test_dashed_titles_reconcile(self):
+        for title in ('Retry loop never stops — leaks threads', 'Handle None - crashes on empty input',
+                      '重试一直继续 — 泄漏线程', '处理空值 - 输入为空时崩溃',
+                      'Retry – fails -- leaks - threads — again'):
+            for score, separator in product((0.3, 0.9), ('—', '-', '–', '--')):
+                with self.subTest(title=title, score=score, separator=separator):
+                    item = finding(score, title)
+                    item['code_location']['absolute_file_path'] = WORKTREE + '/source dir/应用 file.py'
+                    final = message([item]).replace(' — ' + WORKTREE, ' ' + separator + ' ' + WORKTREE)
+                    verdict, _, posted, reasons = cr.assess(0, stream([item]), final, (WORKTREE,))
+                    self.assertEqual(verdict, 'findings' if score > 0.8 else 'clean')
+                    self.assertEqual(reasons, [])
+                    if posted:
+                        self.assertEqual((posted[0].title, posted[0].path), (title, 'source dir/应用 file.py'))
 
     def test_body_heading_is_not_an_extra_finding(self):
         item = finding()
@@ -178,7 +249,7 @@ class ConfidenceTests(unittest.TestCase):
     def test_all_withheld_is_clean_with_count_and_no_details(self):
         verdict, summary, posted, reasons = assess([finding(0.8)])
         self.assertEqual((verdict, posted, reasons), ('clean', [], []))
-        self.assertIn('另有 1 条置信度不高于 0.80 的非 P1 发现未发布', summary)
+        self.assertIn('另有 1 条置信度不高于 0.80 的 P2/P3 发现未发布', summary)
         self.assertNotIn('Private', summary)
         self.assertNotIn('Secret', summary)
 

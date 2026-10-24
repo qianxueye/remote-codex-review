@@ -81,7 +81,7 @@ ISSUE_LINK_RE = re.compile(r'github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issue
 GOVERNANCE_LIMIT = 20
 PRIORITY_RE = re.compile(r'\[P[0-3]\]')
 GITHUB_TIME_RE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z')
-FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+?)\s+(?:—|–|--|-)\s+(.+?):(\d+)(?:-(\d+))?\s*$')
+FINDING_RE = re.compile(r'^\s*[-*]\s*\[(P[0-3])\]\s*(.+)\s+(?:—|–|--|-)\s+(.+?):(\d+)(?:-(\d+))?\s*$')
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 BODY_LIMIT = 60000
 SELF_CHECK_FAILED = 3
@@ -643,7 +643,7 @@ def structured_findings(events, message, worktree_roots):
         title, body, priority = raw.get('title'), raw.get('body'), raw.get('priority')
         prefix = re.match(r'^\[P([0-3])\]\s*', title) if isinstance(title, str) else None
         # Codex permits omitted/null priority. The explicit title tag can supply it;
-        # without either source there is no safe way to apply the P1 exemption.
+        # without either source there is no safe way to apply the P0/P1 exemption.
         if priority is None and prefix:
             priority = int(prefix[1])
         location = raw.get('code_location')
@@ -677,7 +677,10 @@ def structured_findings(events, message, worktree_roots):
 
 
 def assess(rc, events, message, worktree_roots=(), min_confidence=0.80, audit=None):
-    """Return (verdict, public summary, passing findings, reasons); compare raw scores strictly."""
+    """Clean requires every run/structure check and either an explicit, consistent empty
+    review (CLEAN, no [Pn], not incorrect), or nonempty raw findings all withheld.
+    Return (verdict, public summary, passing findings, reasons); compare raw scores strictly.
+    """
     _, summary, _ = parse_review(message, worktree_roots)
     summary = VERDICT_RE.sub('', summary).strip()
     try:
@@ -685,15 +688,24 @@ def assess(rc, events, message, worktree_roots=(), min_confidence=0.80, audit=No
     except ValueError as exc:
         return 'failed', '', [], failure_reasons(rc, events, message) + [str(exc)]
     declared = VERDICT_RE.findall(message)
-    posted = [f for f in findings if f.priority == 'P1'
+    posted = [f for f in findings if f.priority in ('P0', 'P1')
               or (valid_confidence(f.confidence_score) and f.confidence_score > min_confidence)]
     # A passing marker always needs the full clean-run evidence, including all-withheld runs.
     # Preserve main's non-passing positive-findings path when something is actually published.
     if not (rc == 0 and message and posted):
         reasons = failure_reasons(rc, events, message)
-        if declared not in (['CLEAN'], ['FINDINGS']):
-            reasons.append('the final message carries no single `VERDICT: CLEAN` or `VERDICT: FINDINGS` line'
+        if declared not in (['CLEAN'], ['FINDINGS']) or (not findings and declared != ['CLEAN']):
+            reasons.append('the final message carries no single `VERDICT: CLEAN`'
+                           + (' or `VERDICT: FINDINGS`' if findings else '') + ' line'
                            + (f' (found {", ".join(declared)})' if declared else ''))
+        if not findings:
+            result = next(e['review_output'] for e in events if e.get('type') == 'review.structured')
+            if VERDICT_RE.findall(result['overall_explanation']) != ['CLEAN']:
+                reasons.append('zero raw findings require a single `VERDICT: CLEAN` in overall_explanation')
+            if PRIORITY_RE.search(result['overall_explanation']) or PRIORITY_RE.search(message):
+                reasons.append('zero raw findings cannot carry a [Pn] tag in the explanation or final message')
+            if result['overall_correctness'] == 'patch is incorrect':
+                reasons.append('zero raw findings contradict overall_correctness: patch is incorrect')
         if reasons:
             return 'failed', '', [], reasons
     withheld = len(findings) - len(posted)
@@ -703,9 +715,9 @@ def assess(rc, events, message, worktree_roots=(), min_confidence=0.80, audit=No
                      withheld=[raw for raw, finding in zip(raw_findings, findings) if finding not in posted])
     if findings:
         # The model's explanation may describe withheld findings; publish only an aggregate sentence.
-        summary = f'已发布 {len(posted)} 条发现（P1 不受置信度门槛限制，其他发现须严格大于阈值）。'
+        summary = f'已发布 {len(posted)} 条发现（P0/P1 不受置信度门槛限制，其他发现须严格大于阈值）。'
     if withheld:
-        summary += f'\n\n另有 {withheld} 条置信度不高于 {confidence_text(min_confidence)} 的非 P1 发现未发布（含缺失或无效分数）。'
+        summary += f'\n\n另有 {withheld} 条置信度不高于 {confidence_text(min_confidence)} 的 P2/P3 发现未发布（含缺失或无效分数）。'
     return ('findings' if posted else 'clean'), summary, posted, []
 
 
