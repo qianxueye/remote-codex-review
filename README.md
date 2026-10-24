@@ -4,7 +4,9 @@ Self-hosted Codex PR reviewer triggered by GitHub App webhooks.
 
 ## English
 
-**Purpose.** A GitHub App delivers `pull_request` events to a small service on your own Linux host. For each new pull request head the service runs `codex exec review` against the PR's base branch and posts one review (summary, every finding in full, inline comments where the line is in the diff) as the App. Issues linked from the repository's `AGENTS.md` are fetched with their comments by the service beforehand and handed to codex as files, because the codex sandbox has no network; an issue that cannot be fetched is named in the review. One review per head, idempotent across restarts; a newer head cancels the review of the older one. A review counts as clean only when codex exited 0, printed a unified diff (a `diff --git a/` line and an `@@ ` hunk) in the output of a successful command, did not say it could not review, and ended with `VERDICT: CLEAN`; anything else is posted as failed. The service refuses to start unless codex can read a file in a scratch repository.
+**Purpose.** A GitHub App delivers `pull_request` events to a small service on your own Linux host. For each new pull request head the service runs `codex exec review` against the PR's base branch and posts one review (summary, each passing finding in full, inline comments where the line is in the diff) as the App. Issues linked from the repository's `AGENTS.md` are fetched with their comments by the service beforehand and handed to codex as files, because the codex sandbox has no network; an issue that cannot be fetched is named in the review. One review per head, idempotent across restarts; a newer head cancels the review of the older one. For a run with no raw findings, a review counts as clean only when codex exited 0, printed a unified diff (a `diff --git a/` line and an `@@ ` hunk) in the output of a successful command, did not say it could not review, and ended with `VERDICT: CLEAN`; anything else is posted as failed. The service refuses to start unless codex can read a file in a scratch repository.
+
+**Confidence policy.** Findings and scores come from the same run's rollout `ExitedReviewMode.review_output`, matched by exec thread ID and session worktree. Missing, malformed, ambiguous or conflicting structured results fail closed. Only raw `confidence_score > CODEX_REVIEW_MIN_CONFIDENCE` is published (default `0.80`; finite number in `[0, 1]`; comparison happens before display rounding). Exactly `0.80`, missing, nonnumeric, nonfinite and out-of-range scores are withheld. Each published finding shows its score. Withheld findings appear publicly only as a count; their full structured list and threshold are saved in `CODEX_REVIEW_STATE_DIR/output/<job id>.log` (0600). The model's overall explanation is replaced with counts when there are raw findings, so it cannot disclose withheld details. At least one passing finding means `findings`; all withheld means `clean`. The existing head/verdict marker and failure/invalidation handling remain in use.
 
 **How it works.** GitHub App webhook → Cloudflare Tunnel (`cloudflared`, outbound-only; the host opens no inbound port) → `codex_review.py` listening on `127.0.0.1:8787` → SQLite job queue → worker: bare mirror fetch → detached worktree → `codex exec review` → review posted via the GitHub REST API. Missed deliveries are recovered hourly through `GET /app/hook/deliveries`.
 
@@ -22,7 +24,9 @@ Self-hosted Codex PR reviewer triggered by GitHub App webhooks.
 
 ## 中文
 
-**用途。** 一个 GitHub App 把 `pull_request` 事件投递到自己的 Linux 主机上的小服务。每个新的 PR head 到达后，服务对 PR 的 base 分支运行一次 `codex exec review`，并以 App 身份发一条 review：结论摘要、每条发现的完整内容、能对应到 diff 行的发现另加行内评论。被审仓库 `AGENTS.md` 中链接的 issue 及其评论由服务预先读取，以文件形式交给 codex，因为 codex 的沙箱不能联网；读取失败的 issue 会在 review 中写明。每个 head 只发一条，重启后不重复；新 head 到达会终止旧 head 的审查。只有 codex 退出码为 0、某条成功命令的输出中有统一 diff（`diff --git a/` 行和 `@@ ` hunk 头）、没有说明自己未能完成审查，并以 `VERDICT: CLEAN` 结尾时才判为无发现，其余情况一律发 failed。服务启动时先让 codex 读取临时仓库中的一个文件，读不到就拒绝启动。
+**用途。** 一个 GitHub App 把 `pull_request` 事件投递到自己的 Linux 主机上的小服务。每个新的 PR head 到达后，服务对 PR 的 base 分支运行一次 `codex exec review`，并以 App 身份发一条 review：结论摘要、通过置信度阈值的每条发现全文、能对应到 diff 行的发现另加行内评论。被审仓库 `AGENTS.md` 中链接的 issue 及其评论由服务预先读取，以文件形式交给 codex，因为 codex 的沙箱不能联网；读取失败的 issue 会在 review 中写明。每个 head 只发一条，重启后不重复；新 head 到达会终止旧 head 的审查。原始结果没有发现时，只有 codex 退出码为 0、某条成功命令的输出中有统一 diff（`diff --git a/` 行和 `@@ ` hunk 头）、没有说明自己未能完成审查，并以 `VERDICT: CLEAN` 结尾时才判为无发现，其余情况一律发 failed。服务启动时先让 codex 读取临时仓库中的一个文件，读不到就拒绝启动。
+
+**置信度约束。** 发现及分数取自本次 rollout 的 `ExitedReviewMode.review_output`，按 exec thread ID 和 session 工作树核对；结构化输出缺失、格式错误、归属不唯一或与最终发现冲突时发 `failed`。只发布原始 `confidence_score > CODEX_REVIEW_MIN_CONFIDENCE` 的发现，默认 `0.80`，配置须为 `[0, 1]` 内有限数，严格大于且先比较后显示。恰好 `0.80`、缺失、非数值、非有限或越界分数均扣留；每条发布项显示分数。扣留项公开只写数量，完整结构化列表和阈值保存在 `CODEX_REVIEW_STATE_DIR/output/<任务 id>.log`（0600）。存在原始发现时，用数量说明替代模型总评，避免泄露扣留内容。至少发布一条为 `findings`，全部扣留为 `clean`；head/verdict 标记以及失败、作废处理沿用原约定。
 
 **工作方式。** GitHub App webhook → Cloudflare Tunnel（`cloudflared`，只有出站连接，主机不开放入站端口）→ 监听 `127.0.0.1:8787` 的 `codex_review.py` → SQLite 任务队列 → worker：bare 镜像 fetch → detached 工作树 → `codex exec review` → 通过 GitHub REST API 发 review。每小时通过 `GET /app/hook/deliveries` 补救漏投。
 
@@ -43,7 +47,7 @@ Self-hosted Codex PR reviewer triggered by GitHub App webhooks.
 | Path | Content |
 |---|---|
 | `codex_review.py` | webhook receiver, SQLite queue, review workers, redelivery recovery |
-| `tests/` | offline `unittest` suite; `tests/fixtures/` holds recorded `codex exec --json` output |
+| `tests/` | offline `unittest` suite; `tests/fixtures/` holds recorded `codex exec --json` output; tests explicitly add synthetic structured companions (recordings contain no scores) |
 | `deploy/install.sh` | idempotent installer |
 | `deploy/*.service` | systemd units for the service and the tunnel |
 | `deploy/codex-review.env.example` | every configuration key with its default; no secrets |

@@ -73,15 +73,18 @@ fetch、档位选择和 codex 一律使用审查开始时 PR 的实时 base 分�
 - 发 review 前，先查 GitHub 上是否已有本 App 针对同一 head 的标记。有标记就只记账，不重复发。服务重启后重跑中断的任务时，也靠这一步避免重复。`verdict=invalid` 的标记不算，所以作废后重新入队的 head 会再审一次。
 - 结论判定（§2.4.1）默认为 `failed`。最终消息优先取 `-o` 输出文件，取不到时取 `--json` 事件流中最后一条 `agent_message`。
 - codex 因上游临时故障失败时先按 §2.4.2 重试，不发 review。超时（默认 40 分钟）或判定为 `failed` 时，发 `verdict=failed`，正文写明「This is not a pass」，并逐条列出未通过的检查。`failed` 是终态，不会自动重试；需要重审时用 §7 的 `--enqueue`。
-- 结论为 `failed`，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
+- 结论为 `failed`、有扣留发现，或正文超过 60000 字符被截断时，codex 的完整输出（含最终消息）写入 `/var/lib/codex-review/output/<任务 id>.log`（目录 0700，文件 0600）。正文中写明该文件，以 `$CODEX_REVIEW_STATE_DIR/output/<任务 id>.log` 表示，不写主机上的实际路径。服务不会自动清理这些文件。
 - GitHub 或 git 出错（不是 codex 本身失败）时，任务重新排队，等待 5 分钟乘以已失败次数后再试。累计 `CODEX_REVIEW_MAX_ATTEMPTS`（默认 3）次仍失败时，发 `failed` 标记。
 
 #### 2.4.1 结论判定
 
 codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独保存。事件格式见 §9。
 
-- codex 退出码为 0、有最终消息，并且最终消息含 `[P0]` 到 `[P3]` 的发现或 `VERDICT: FINDINGS` 行时，判为 `findings`。
-- 同时满足以下全部条件时，判为 `clean`：
+- 先核验本次结构化结果：从 `--json` 的唯一 `thread.started.thread_id` 定位 `$CODEX_HOME/sessions/**/rollout-*-<thread_id>.jsonl`（未设置 `CODEX_HOME` 时用 `~/.codex`）。必须只有一个匹配文件，且 `session_meta` 的 id、cwd 与本次 thread、工作树一致；文件中必须只有一个 `item_completed` / `ExitedReviewMode`，其 `review_output` 格式有效。不能改取最新的 rollout。缺失、损坏、不唯一或发现与最终消息无法对应，均发 `failed`，不公开原始发现。允许最终发现顺序或空白不同，优先级、标题、正文和位置必须对应。
+- 发现分数只取结构化 `confidence_score`，不从 Markdown 猜测，也不使用 `overall_confidence_score` 替代。`CODEX_REVIEW_MIN_CONFIDENCE` 默认 `0.80`，必须为 `[0, 1]` 内有限数；只发布原始分数**严格大于**阈值的发现，先比较再显示。因此 `0.80` 扣留，`0.8000001` 和 `0.81` 发布。缺失、字符串、布尔值、NaN、无穷和越界分数均扣留，不使任务崩溃。
+- 原始结构化发现非空且 codex 退出码为 0、有最终消息时，沿用原有发现路径；筛选后至少发布一条为 `findings`，全部扣留为 `clean`。两者仍使用 `<!-- remote-codex-review head=<sha> verdict=… -->` 标记（含已有 effort/tests 扩展字段），不改变 merge gate 和 `invalid` 行为。
+- 每条公开发现（正文与行内评论）显示 `置信度 0.87` 一类分数。存在原始发现时，总评改为数量说明，不转发可能描述扣留内容的模型总评；扣留项只写「另有 N 条置信度不高于 0.80 的发现未发布（含缺失或无效分数）」。完整扣留列表、阈值、结构化输出和最终消息在发布前写入 §2.4 的本地 0600 日志；写入失败不能先发 review。日志不自动清理，需按主机容量管理。
+- 原始发现为空时，仍须同时满足以下全部条件才判为 `clean`：
   1. codex 退出码为 0；
   2. 事件流中有 `turn.completed`，没有 `turn.failed`、`error` 条目和顶层 `error` 事件。例外：回合正常完成时，内容属于临时故障的顶层 `error` 事件（例如 `Reconnecting... 2/5 (unexpected status 503 …)`）只是 codex 自动重连的通知，不计；
   3. 至少有一条 `command_execution` 条目以 `status=completed`、`exit_code=0` 结束，并且它的 `aggregated_output` 含有统一 diff 的结构：一行以 `diff --git a/` 或 `diff --git "a/` 开头（后者是 git 默认 `core.quotePath=true` 时非 ASCII 路径的写法），另有至少一行以 `@@ ` 开头的 hunk 头。合并提交的组合 diff（`diff --cc`、`diff --combined`，hunk 头为 `@@@ `）不算，因为它只含合并时的冲突处理，不是 PR 相对 base 的改动。这一条只看命令的输出，不分析命令怎么写；输出被截断时，只要剩下的部分仍有这两种行就算。只跑过 `git status`、`ls`、`git -v`、`echo`、`git diff --stat` 的不算。与 base 没有任何差别的 PR，`git diff` 输出为空，也按这一条判 `failed`，原因中写明这种情况；服务目前没有单独的「无改动」处理。只改二进制文件或只改名的 PR 没有 hunk 头，同样判 `failed`；
@@ -89,7 +92,7 @@ codex 以 `--json` 运行，标准输出是 JSONL 事件流，标准错误单独
   5. 最终消息中恰好有一行 `VERDICT: CLEAN`。
 - 其余情况一律判为 `failed`。
 
-第 5 条的结论行来自提示词：提示要求 codex 在 `overall_explanation` 末尾写 `VERDICT: CLEAN`、`VERDICT: FINDINGS` 或 `VERDICT: BLOCKED`。`--json` 事件流不包含 review 模式的结构化字段 `overall_correctness`，而且工具失败时 codex 仍可能把该字段填成占位值，所以不用它判定。结论行写在 `overall_explanation` 内，因为 codex 只取模型输出中的 JSON 对象，对象之外的文字会被丢弃。
+第 5 条的结论行来自提示词：提示要求 codex 在 `overall_explanation` 末尾写 `VERDICT: CLEAN`、`VERDICT: FINDINGS` 或 `VERDICT: BLOCKED`。`--json` 的 exec 事件流不包含 review 模式的结构化字段；结构化结果从同次 rollout 读取。工具失败时 codex 仍可能把 `overall_correctness` 填成占位值，所以不单靠它判定 clean。结论行写在 `overall_explanation` 内，因为 codex 只取模型输出中的 JSON 对象，对象之外的文字会被丢弃。
 
 原因：审查主机缺少 `codex-code-mode-host` 时，codex 的每次工具调用都失败，模型仍然输出没有 `[P*]` 的说明。旧规则把这种输出判为 `clean`。现在缺任何一条证据都发 `failed`。
 
